@@ -1,0 +1,16 @@
+# Rust
+target/
+**/*.rs.bk
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Application Config
+config.yaml

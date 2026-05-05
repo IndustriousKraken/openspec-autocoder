@@ -1,0 +1,18 @@
+repositories:
+  # Example 1: A backend service on a fast polling loop
+  - url: "git@github.com:my-org/auth-service.git"
+    poll_interval_sec: 300        # Poll every 5 minutes
+    base_branch: "main"           # Base branch for production
+    agent_branch: "agent-queue"   # The branch agents use to build features
+
+  # Example 2: A frontend application
+  - url: "git@github.com:my-org/web-dashboard.git"
+    poll_interval_sec: 3600       # Poll once an hour
+    base_branch: "dev"            # Active development branch
+    agent_branch: "agent-q"       # Default orchestrator branch
+
+  # Example 3: The orchestrator project itself (self-hosted updates!)
+  - url: "git@github.com:my-org/cicd-impl-agents.git"
+    poll_interval_sec: 7200       # Poll every two hours
+    base_branch: "new-specs"      # Watch a specific branch for new OpenSpec proposals
+    agent_branch: "auto-updates"  # A unique branch for agent modifications
