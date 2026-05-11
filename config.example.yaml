@@ -29,6 +29,17 @@ github:
   # Name of the env var holding the GitHub PAT. The token is read once
   # per PR creation; never logged.
   token_env: GITHUB_TOKEN
+  # Optional: route per-owner PATs by GitHub owner name. Fine-grained PATs
+  # can only be issued by the owner of a resource (personal account or org
+  # admin), so multi-account operators need one PAT per owner. Each value
+  # names an environment variable; the resolver picks the matching entry
+  # case-insensitively. Any repository whose owner has no entry falls back
+  # to `token_env`. See README's "Multiple GitHub Tokens" section.
+  #
+  # owner_tokens:
+  #   your-personal-handle: PERSONAL_GH_TOKEN
+  #   my-org-a: ORG_A_GH_TOKEN
+  #   my-org-b: ORG_B_GH_TOKEN
 
 # -------------------------------------------------------------------------
 # Optional capabilities — disabled by default. Uncomment to enable.

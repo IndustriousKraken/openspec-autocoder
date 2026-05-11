@@ -507,13 +507,8 @@ async fn open_pull_request(
     review_report: Option<&ReviewReport>,
     draft: bool,
 ) -> Result<()> {
-    let token = std::env::var(&github_cfg.token_env).map_err(|_| {
-        anyhow!(
-            "github token environment variable `{}` is not set",
-            github_cfg.token_env
-        )
-    })?;
     let (owner, repo_name) = github::parse_repo_url(&repo.url)?;
+    let token = crate::github_credentials::resolve_token(github_cfg, &owner)?;
     let title = format!("agent: {} change(s) in pass", changes.len());
     let body = build_pr_body(changes);
 
@@ -544,6 +539,71 @@ fn build_pr_body(changes: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Routing test: when `owner_tokens` maps the parsed URL owner to an
+    /// env var, the PR-creation HTTP call MUST carry that env var's value
+    /// in the `Authorization: Bearer` header — not `token_env`'s value.
+    /// This exercises the same composition `open_pull_request` does:
+    /// `parse_repo_url → resolve_token → create_pull_request_at`.
+    #[tokio::test]
+    async fn pr_creation_uses_owner_specific_token() {
+        let var = "AUTOCODER_TEST_PR_ROUTING_TOKEN";
+        let fallback = "AUTOCODER_TEST_PR_ROUTING_FALLBACK";
+        // SAFETY: this test relies on a unique env-var name so it does not
+        // collide with parallel tests; no cross-test mutation lock required.
+        unsafe {
+            std::env::set_var(var, "owner-specific-token-xyz");
+            std::env::set_var(fallback, "should-not-be-used");
+        }
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/repos/fixture-owner/fixture-repo/pulls")
+            .match_header("authorization", "Bearer owner-specific-token-xyz")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"html_url":"https://github.com/fixture-owner/fixture-repo/pull/1","number":1}"#,
+            )
+            .create_async()
+            .await;
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("fixture-owner".into(), var.into());
+        let github_cfg = GithubConfig {
+            token_env: fallback.into(),
+            owner_tokens: Some(map),
+        };
+
+        // Mirror open_pull_request's internal sequence.
+        let (owner, repo_name) =
+            crate::github::parse_repo_url("git@github.com:fixture-owner/fixture-repo.git")
+                .expect("parse");
+        let token = crate::github_credentials::resolve_token(&github_cfg, &owner)
+            .expect("owner_tokens entry should resolve");
+
+        crate::github::create_pull_request_at_for_test(
+            &server.url(),
+            &owner,
+            &repo_name,
+            "agent-q",
+            "main",
+            "t",
+            "b",
+            &token,
+            None,
+            false,
+        )
+        .await
+        .expect("PR creation should succeed against mockito");
+
+        mock.assert_async().await;
+
+        unsafe {
+            std::env::remove_var(var);
+            std::env::remove_var(fallback);
+        }
+    }
 
     #[test]
     fn first_line_of_why_section() {
@@ -1519,6 +1579,7 @@ mod tests {
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
+            owner_tokens: None,
         };
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
@@ -1580,6 +1641,7 @@ mod tests {
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
+            owner_tokens: None,
         };
         let cancel = CancellationToken::new();
         let executor: Arc<dyn Executor> = Arc::new(AlwaysFails);

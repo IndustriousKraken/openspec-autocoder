@@ -48,6 +48,38 @@ pub async fn create_pull_request(
     .await
 }
 
+/// Test-only re-export of the internal `create_pull_request_at`. Lets
+/// sibling-module tests (e.g. polling_loop's routing test) exercise the
+/// PR HTTP path against a mockito server.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_pull_request_at_for_test(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    head: &str,
+    base: &str,
+    title: &str,
+    body: &str,
+    token: &str,
+    review_report: Option<&ReviewReport>,
+    draft: bool,
+) -> Result<String> {
+    create_pull_request_at(
+        api_base,
+        owner,
+        repo,
+        head,
+        base,
+        title,
+        body,
+        token,
+        review_report,
+        draft,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn create_pull_request_at(
     api_base: &str,

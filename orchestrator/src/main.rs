@@ -8,6 +8,7 @@ mod config;
 mod executor;
 mod git;
 mod github;
+mod github_credentials;
 mod llm;
 mod mcp_askuser_server;
 mod polling_loop;

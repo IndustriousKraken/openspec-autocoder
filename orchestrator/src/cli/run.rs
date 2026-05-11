@@ -4,17 +4,20 @@
 
 use crate::chatops::ChatOps;
 use crate::code_reviewer::CodeReviewer;
-use crate::config::{Config, ExecutorKind, RepositoryConfig};
+use crate::config::{Config, ExecutorKind, GithubConfig, RepositoryConfig};
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
+use crate::github::parse_repo_url;
+use crate::github_credentials::resolve_token;
 use crate::polling_loop::ChatOpsContext;
 use crate::{git, polling_loop, workspace};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 pub async fn execute(cfg: Config) -> Result<()> {
     workspace::detect_collisions(&cfg.repositories)?;
+    validate_github_token_routes(&cfg.github, &cfg.repositories)?;
 
     let executor: Arc<dyn Executor> = match cfg.executor.kind {
         ExecutorKind::ClaudeCli => Arc::new(ClaudeCliExecutor::new(
@@ -118,6 +121,61 @@ pub async fn execute(cfg: Config) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a GitHub PAT route for every configured repository before any
+/// polling task spawns. Returns `Err` aggregating every failure when one
+/// or more repos have no routable token; on success, emits one info log
+/// per repo naming the env var (never the token value) that will be used.
+pub fn validate_github_token_routes(
+    github: &GithubConfig,
+    repos: &[RepositoryConfig],
+) -> Result<()> {
+    let mut failures: Vec<String> = Vec::new();
+    for repo in repos {
+        let owner = match parse_repo_url(&repo.url) {
+            Ok((o, _r)) => o,
+            Err(e) => {
+                failures.push(format!("repo `{}`: {e:#}", repo.url));
+                continue;
+            }
+        };
+        match resolve_token(github, &owner) {
+            Ok(_) => {
+                let env_var = pick_env_var_name(github, &owner);
+                tracing::info!(
+                    "repository {} will use GitHub token from env var {}",
+                    repo.url,
+                    env_var
+                );
+            }
+            Err(e) => {
+                failures.push(format!("repo `{}`: {e:#}", repo.url));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        return Err(anyhow!(
+            "GitHub token routing failed for {} repository(ies):\n  - {}",
+            failures.len(),
+            failures.join("\n  - ")
+        ));
+    }
+    Ok(())
+}
+
+/// Return the env-var NAME (not value) that `resolve_token` will read for
+/// this owner. Used only for the startup log line.
+fn pick_env_var_name(github: &GithubConfig, owner: &str) -> String {
+    if let Some(map) = github.owner_tokens.as_ref() {
+        if let Some((_k, env_name)) = map
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(owner))
+        {
+            return env_name.clone();
+        }
+    }
+    github.token_env.clone()
+}
+
 /// Initialize the workspace and check for a dirty working tree. Returns
 /// `true` if the repository is healthy and a polling task should be spawned;
 /// `false` (with a logged error) if the workspace is dirty or cannot be
@@ -213,6 +271,99 @@ mod tests {
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
             slack_channel_id: None,
+        }
+    }
+
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// Env-var mutation is global; serialize the startup-validation tests
+    /// that touch real env vars.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn repo(url: &str) -> RepositoryConfig {
+        RepositoryConfig {
+            url: url.into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            slack_channel_id: None,
+        }
+    }
+
+    #[test]
+    fn startup_fails_when_no_token_route() {
+        // Two repos: one has a matching owner_tokens entry whose env var
+        // is set; the other has no entry AND `token_env`'s named env var
+        // is unset. The aggregated error must name the unmappable repo.
+        let _g = ENV_LOCK.lock().unwrap();
+        let covered_var = "AUTOCODER_TEST_STARTUP_COVERED";
+        let fallback_var = "AUTOCODER_TEST_STARTUP_FALLBACK_UNSET";
+        unsafe {
+            std::env::set_var(covered_var, "ok");
+            std::env::remove_var(fallback_var);
+        }
+
+        let mut map = HashMap::new();
+        map.insert("covered-org".into(), covered_var.into());
+        let github = GithubConfig {
+            token_env: fallback_var.into(),
+            owner_tokens: Some(map),
+        };
+
+        let repos = vec![
+            repo("git@github.com:covered-org/repo-a.git"),
+            repo("git@github.com:other-org/repo-b.git"),
+        ];
+
+        let err = validate_github_token_routes(&github, &repos)
+            .expect_err("must fail when a repo has no route");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("other-org/repo-b.git"),
+            "error must name the unmappable repo URL; got: {msg}"
+        );
+        assert!(
+            msg.contains(fallback_var),
+            "error must name the unset fallback env var; got: {msg}"
+        );
+        assert!(
+            !msg.contains("covered-org/repo-a.git"),
+            "error must not include the successfully-routed repo; got: {msg}"
+        );
+
+        unsafe { std::env::remove_var(covered_var) };
+    }
+
+    #[test]
+    fn startup_passes_when_every_repo_has_a_route() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let personal_var = "AUTOCODER_TEST_STARTUP_PERSONAL";
+        let fallback_var = "AUTOCODER_TEST_STARTUP_FALLBACK_SET";
+        unsafe {
+            std::env::set_var(personal_var, "personal-secret");
+            std::env::set_var(fallback_var, "fallback-secret");
+        }
+
+        let mut map = HashMap::new();
+        map.insert("rabbeverly".into(), personal_var.into());
+        let github = GithubConfig {
+            token_env: fallback_var.into(),
+            owner_tokens: Some(map),
+        };
+
+        let repos = vec![
+            repo("git@github.com:rabbeverly/personal-repo.git"),
+            repo("git@github.com:some-org/work-repo.git"),
+        ];
+
+        validate_github_token_routes(&github, &repos)
+            .expect("both repos should resolve: one via owner_tokens, one via fallback");
+
+        unsafe {
+            std::env::remove_var(personal_var);
+            std::env::remove_var(fallback_var);
         }
     }
 

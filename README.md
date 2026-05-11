@@ -19,7 +19,7 @@ On the machine where the daemon will run:
   - **`Contents: read & write`** — needed ONLY if your `config.yaml` uses HTTPS URLs (`https://github.com/...`); when you use SSH URLs (`git@github.com:...`), git authenticates via your SSH key and `Contents` is not required.
   - **`Issues: read & write`** — needed ONLY in the rare case that your host rejects draft PRs and triggers the `do-not-merge` label fallback. GitHub.com supports drafts on every repo type, so this is essentially never needed there; only relevant for some private GHE configurations.
 
-  Export the token as `GITHUB_TOKEN` in the environment that will launch the daemon. Note: fine-grained PATs are scoped to a single account or organization. If your `config.yaml` has repos across multiple owners (e.g. your personal account + an org you contribute to), you currently need one of: a classic PAT broad enough to cover all of them; one autocoder instance per owner; or SSH-only URLs with the PAT only used for PR creation against one owner. Multi-token routing is on the roadmap (see `openspec/changes/multi-token-github-credentials/`).
+  Export the token as `GITHUB_TOKEN` in the environment that will launch the daemon. Note: fine-grained PATs are scoped to a single account or organization. If your `config.yaml` has repos across multiple owners (personal + one or more orgs), see the [Multiple GitHub Tokens](#multiple-github-tokens) section below — one autocoder instance can route a different PAT per owner via the optional `github.owner_tokens:` config map.
 - **`git` configured.** Either a registered SSH key for the configured repository URLs (recommended), or HTTPS credentials in a credential helper.
 
 ### 2. Clone and configure
@@ -92,9 +92,10 @@ A list of one or more repositories to manage. Each entry:
 
 ### `github:` (required)
 
-| Field        | Required | Default          | Description |
-|--------------|----------|------------------|-------------|
-| `token_env`  | no       | `GITHUB_TOKEN`   | Name of the env var holding the PAT. |
+| Field          | Required | Default          | Description |
+|----------------|----------|------------------|-------------|
+| `token_env`    | no       | `GITHUB_TOKEN`   | Name of the env var holding the fallback PAT. |
+| `owner_tokens` | no       | _absent_         | Optional map of GitHub owner → env var name, for multi-owner setups. See [Multiple GitHub Tokens](#multiple-github-tokens). |
 
 ### `reviewer:` (optional)
 
@@ -103,6 +104,83 @@ See [Code Review](#code-review). Absent block disables the reviewer step.
 ### `slack:` (optional)
 
 See [ChatOps Escalation](#chatops-escalation). Absent block disables Slack escalation; an executor `AskUser` outcome falls back to "log and exit the iteration" behavior.
+
+---
+
+## Multiple GitHub Tokens
+
+GitHub fine-grained PATs are scoped to a single account or organization — only the owner of a resource can mint one for it. A contributor who runs autocoder against, say, a personal repo plus repos in two work orgs cannot cover all three with a single fine-grained PAT.
+
+autocoder resolves this by routing PATs per **repository owner** (the segment before the repo name in the URL: `<owner>/<repo>`). Configure the `github.owner_tokens:` map and export one env var per owner; autocoder parses each repo's URL at startup, picks the matching env var case-insensitively, and uses it for that repo's PR-creation HTTP calls.
+
+### Example: personal + two orgs
+
+`config.yaml`:
+
+```yaml
+github:
+  token_env: GITHUB_TOKEN              # fallback for any owner not in the map below
+  owner_tokens:
+    rabbeverly:  PERSONAL_GH_TOKEN     # owner → env var name (not the token value)
+    my-org-a:    ORG_A_GH_TOKEN
+    my-org-b:    ORG_B_GH_TOKEN
+
+repositories:
+  - url: "git@github.com:rabbeverly/personal-repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 300
+  - url: "git@github.com:my-org-a/work-repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 300
+  - url: "git@github.com:my-org-b/another-repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 300
+```
+
+Environment when launching the daemon:
+
+```bash
+export PERSONAL_GH_TOKEN=github_pat_xxx_personal
+export ORG_A_GH_TOKEN=github_pat_xxx_org_a
+export ORG_B_GH_TOKEN=github_pat_xxx_org_b
+# GITHUB_TOKEN need not be set, because every configured owner has a route.
+RUST_LOG=info ./target/release/autocoder run --config config.yaml
+```
+
+### Startup behavior
+
+Before spawning any polling task, autocoder iterates every configured repository and resolves a token route for each. If any repo's owner has no matching `owner_tokens` entry AND its fallback (`token_env`'s named env var) is unset, the daemon exits non-zero immediately, naming the unmappable repo. This catches typos and missing env vars at boot, not five minutes later on the first PR attempt.
+
+On success, autocoder emits one log line per repo naming the env var (never the token value):
+
+```
+INFO repository git@github.com:rabbeverly/personal-repo.git will use GitHub token from env var PERSONAL_GH_TOKEN
+INFO repository git@github.com:my-org-a/work-repo.git will use GitHub token from env var ORG_A_GH_TOKEN
+INFO repository git@github.com:my-org-b/another-repo.git will use GitHub token from env var ORG_B_GH_TOKEN
+```
+
+### Matching rules
+
+- Map keys are matched against URL owners **case-insensitively** (`My-Org` matches `my-org` and vice versa). GitHub owner names are case-insensitive at the platform level.
+- The first matching entry wins. If you have duplicate keys differing only in case, fix the YAML — there is no defined priority.
+- An owner with no `owner_tokens` entry falls back to `token_env`. A repository with neither route is a startup error.
+
+### Backward compatibility
+
+A config with only `token_env: GITHUB_TOKEN` and no `owner_tokens` works exactly as before. The field is purely additive.
+
+### git operations are separate
+
+This routing affects only HTTP calls to GitHub's REST API (PR creation, optional label fallback). Git operations (`clone`, `fetch`, `push`) go through whichever authentication `git` itself uses — your SSH key, an HTTPS credential helper, etc.
+
+**Recommendation for multi-owner setups:** use SSH URLs (`git@github.com:owner/repo.git`) in `config.yaml`. A single SSH key registered against each account/org covers the git side without per-owner credential-helper trickery, while autocoder's `owner_tokens` covers the API side. HTTPS URLs work but require a git credential helper that can map URLs to different PATs, which autocoder does not configure for you.
+
+### Non-goal: per-repository overrides
+
+If two repos under the same owner need different tokens (rare), this design does not support it. Open an issue if you hit that case; the natural extension is a `github_token_env` field on each `repositories[]` entry, but it's not in this implementation.
 
 ---
 
@@ -333,7 +411,17 @@ WantedBy=multi-user.target
 Create `/etc/autocoder.env` with the secrets (mode `0600`, owned by root):
 
 ```
+# Single-owner setups: a single PAT named by `github.token_env` in config.yaml.
 GITHUB_TOKEN=ghp_yourtokenhere
+
+# Multi-owner setups (see "Multiple GitHub Tokens" above): one PAT per owner.
+# Uncomment and adjust to match the env var names referenced from
+# `github.owner_tokens:` in config.yaml. GITHUB_TOKEN can be omitted if
+# every configured repository's owner has an explicit route.
+# PERSONAL_GH_TOKEN=github_pat_xxx_personal
+# ORG_A_GH_TOKEN=github_pat_xxx_org_a
+# ORG_B_GH_TOKEN=github_pat_xxx_org_b
+
 # Optional:
 # ANTHROPIC_API_KEY=...
 # SLACK_BOT_TOKEN=xoxb-...

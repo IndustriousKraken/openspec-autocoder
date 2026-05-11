@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +57,8 @@ fn default_executor_timeout() -> u64 {
 pub struct GithubConfig {
     #[serde(default = "default_github_token_env")]
     pub token_env: String,
+    #[serde(default)]
+    pub owner_tokens: Option<HashMap<String, String>>,
 }
 
 fn default_github_token_env() -> String {
@@ -378,6 +381,51 @@ github: {}
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
         assert!(cfg.slack.is_none());
+    }
+
+    #[test]
+    fn loads_with_owner_tokens() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+  owner_tokens:
+    rabbeverly: PERSONAL_GH_TOKEN
+    my-org-a: ORG_A_GH_TOKEN
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config with owner_tokens should parse");
+        let map = cfg
+            .github
+            .owner_tokens
+            .expect("owner_tokens block should be present");
+        assert_eq!(map.get("rabbeverly").map(String::as_str), Some("PERSONAL_GH_TOKEN"));
+        assert_eq!(map.get("my-org-a").map(String::as_str), Some("ORG_A_GH_TOKEN"));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn owner_tokens_optional() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config without owner_tokens should parse");
+        assert!(cfg.github.owner_tokens.is_none());
     }
 
     #[test]
