@@ -63,7 +63,6 @@ The orchestrator-foundation milestone provides the polling daemon, queue engine,
 
 - **ChatOps escalation** (change: `chatops-escalation`): when an executor cannot proceed without human input, post the question to a chat channel, persist the resume handle, unblock the queue (with a strict same-repo block on dependent changes), and resume on reply.
 - **Reviewer integration** (change: `reviewer-integration`): an automated post-commit code-quality review step before the human PR review.
-- **`--repo` selector for `rewind`** (change: `rewind-and-recovery`): until this lands, `orchestrator rewind` operates on the FIRST configured repository only and emits a warning if more than one repo is configured. `--hard` is accepted but local + remote agent-branch deletion is also part of `rewind-and-recovery`; until it lands, you must delete the agent branch by hand.
 
 ---
 
@@ -83,15 +82,54 @@ cargo run -- run --config /path/to/my-config.yaml
 ```
 
 ### `rewind`
-A recovery command to use when an agent fails or a PR is rejected. It resets the workspace and unarchives changes so the agent can try again.
+A recovery command to use when an agent has produced bad work or you want to throw away the in-flight agent branch and re-run one or more archived changes. Rewind:
+
+1. Deletes the local agent branch (always).
+2. Deletes the remote agent branch (only with `--hard`).
+3. Unarchives each named change so the polling daemon picks it up again.
 
 ```bash
-# Safely rewind a specific change (with a y/N prompt for branch deletion)
-cargo run -- rewind my-broken-change --config config.yaml
+# Soft rewind (single-repo config): prompt for confirmation, then delete
+# the local agent branch and unarchive one change.
+orchestrator rewind my-broken-change --config config.yaml
 
-# Hard rewind multiple changes (bypasses branch deletion prompt)
-cargo run -- rewind change-A change-B --hard
+# Hard rewind: skip the prompt, delete local AND remote agent branch,
+# then unarchive two changes.
+orchestrator rewind change-A change-B --config config.yaml --hard
+
+# Multi-repo config: --repo is REQUIRED. The selector matches either the
+# full URL or the short-name (basename minus .git).
+orchestrator rewind my-change --config config.yaml --repo my-repo
 ```
+
+**Soft vs hard semantics:**
+
+| Mode   | Confirmation prompt | Local agent branch | Remote agent branch                       |
+|--------|--------------------|--------------------|-------------------------------------------|
+| soft   | y/N, defaults no   | deleted            | left intact                                |
+| `--hard` | skipped          | deleted            | deleted (failures logged but non-blocking) |
+
+The confirmation prompt for soft rewind looks like:
+
+```
+This will delete branch 'agent-q' (local) and unarchive 1 change(s) (my-broken-change). Proceed? [y/N]
+```
+
+Bare Enter, `n`, or any input other than `y`/`Y` declines and exits without modifying any state.
+
+**`--repo` selector:**
+
+With **one** configured repository, `--repo` is optional and defaults to that repo.
+
+With **two or more** configured repositories, `--repo` is required. The orchestrator matches the selector against each repository's full URL (exact equality) AND against the URL's short-name (basename with any trailing `.git` stripped). Zero matches or multiple matches exit non-zero with a clear error listing the available selectors.
+
+**Unarchiving multiple changes:**
+
+If you pass multiple change names and one of them fails to unarchive (typo, no matching archive entry, destination collision), the remaining names are still attempted. The process exits non-zero at the end with a summary naming both the succeeded and failed changes.
+
+**"I rewound the wrong change":**
+
+Archived directories are **not** deleted by archive — they are renamed under `openspec/changes/archive/<YYYY-MM-DD>-<name>/`. If you accidentally rewind a change and want to put it back, you can move the directory back into the archive yourself (the canonical date-prefix format is preserved by the orchestrator's `archive` step, so a manual `mv` restores the queue's view of state).
 
 ---
 

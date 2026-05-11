@@ -88,6 +88,55 @@ pub fn push_force_with_lease(workspace: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// `git branch -D <branch>` — force-delete a local branch. Idempotent: if the
+/// branch does not exist locally, this logs at debug and returns Ok. Any
+/// other git failure propagates as `Err`.
+pub fn delete_branch_local(workspace: &Path, branch: &str) -> Result<()> {
+    // Probe for existence first rather than relying on git's stderr string,
+    // which is not stable across versions.
+    let probe = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(workspace)
+        .output()
+        .with_context(|| format!("spawning `git rev-parse` to probe branch {branch}"))?;
+    if !probe.status.success() {
+        tracing::debug!("local branch `{branch}` already absent; nothing to delete");
+        return Ok(());
+    }
+    run_git(workspace, "branch -D", &["branch", "-D", branch])?;
+    Ok(())
+}
+
+/// `git push origin --delete <branch>` — delete a branch on the remote.
+/// Idempotent for the "remote branch does not exist" case (logs at debug
+/// and returns Ok). Other failures (auth, network, etc.) propagate as `Err`.
+pub fn delete_branch_remote(workspace: &Path, branch: &str) -> Result<()> {
+    let probe = Command::new("git")
+        .args(["ls-remote", "--heads", "origin", branch])
+        .current_dir(workspace)
+        .output()
+        .with_context(|| format!("spawning `git ls-remote` to probe remote branch {branch}"))?;
+    if !probe.status.success() {
+        let stderr = String::from_utf8_lossy(&probe.stderr).trim().to_string();
+        return Err(anyhow!("git ls-remote failed: {stderr}"));
+    }
+    if probe.stdout.is_empty() {
+        tracing::debug!("remote branch `{branch}` already absent; nothing to delete");
+        return Ok(());
+    }
+    run_git(
+        workspace,
+        "push --delete",
+        &["push", "origin", "--delete", branch],
+    )?;
+    Ok(())
+}
+
 /// Return the trimmed stdout of `git status --porcelain`. Empty string ⇒
 /// clean working tree.
 pub fn status_porcelain(workspace: &Path) -> Result<String> {
@@ -192,5 +241,99 @@ mod tests {
             .expect_err("checkout to a missing branch must fail");
         let msg = format!("{err:#}");
         assert!(msg.starts_with("git checkout failed"), "got: {msg}");
+    }
+
+    #[test]
+    fn delete_branch_local_idempotent() {
+        let (_dir, path) = fixture_repo();
+        recreate_branch(&path, "doomed").unwrap();
+        // Switch off the branch we're about to delete.
+        checkout(&path, "main").unwrap();
+
+        // First delete succeeds and removes the branch.
+        delete_branch_local(&path, "doomed").unwrap();
+        let listed = Command::new("git")
+            .args(["branch", "--list", "doomed"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(
+            listed.status.success() && listed.stdout.is_empty(),
+            "branch should be gone after delete_branch_local"
+        );
+
+        // Second delete on the already-absent branch must NOT error.
+        delete_branch_local(&path, "doomed").unwrap();
+
+        // Deleting a branch that never existed is also Ok.
+        delete_branch_local(&path, "never-existed").unwrap();
+    }
+
+    /// Build a bare remote alongside a working clone so we can exercise
+    /// `git push origin --delete` against a real writable remote.
+    fn fixture_clone_with_bare_remote() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let remote = dir.path().join("remote.git");
+        let workspace = dir.path().join("workspace");
+
+        let st = Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+        assert!(st.success(), "bare init failed");
+
+        let st = Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                remote.to_string_lossy().as_ref(),
+                workspace.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .unwrap();
+        assert!(st.success(), "clone failed");
+        run_init(&workspace, &["config", "user.email", "test@example.com"]);
+        run_init(&workspace, &["config", "user.name", "test"]);
+        // Need an initial commit on main so we can checkout / push.
+        std::fs::write(workspace.join("README.md"), "hi\n").unwrap();
+        run_init(&workspace, &["add", "README.md"]);
+        run_init(&workspace, &["commit", "-q", "-m", "initial"]);
+        run_init(&workspace, &["push", "-q", "-u", "origin", "main"]);
+
+        (dir, workspace, remote)
+    }
+
+    #[test]
+    fn delete_branch_remote_deletes_and_is_idempotent() {
+        let (_dir, ws, _remote) = fixture_clone_with_bare_remote();
+
+        // Push a branch we can then delete remotely.
+        recreate_branch(&ws, "doomed").unwrap();
+        std::fs::write(ws.join("ON_DOOMED.md"), "x").unwrap();
+        run_init(&ws, &["add", "ON_DOOMED.md"]);
+        run_init(&ws, &["commit", "-q", "-m", "doomed work"]);
+        run_init(&ws, &["push", "-q", "origin", "doomed"]);
+
+        // Confirm remote has the branch, then delete it.
+        let probe = Command::new("git")
+            .args(["ls-remote", "--heads", "origin", "doomed"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(!probe.stdout.is_empty(), "remote should have doomed before delete");
+
+        delete_branch_remote(&ws, "doomed").unwrap();
+
+        let probe = Command::new("git")
+            .args(["ls-remote", "--heads", "origin", "doomed"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(probe.stdout.is_empty(), "remote should be gone after delete");
+
+        // Idempotent: second call against an absent remote branch is Ok.
+        delete_branch_remote(&ws, "doomed").unwrap();
+        delete_branch_remote(&ws, "never-existed-remote").unwrap();
     }
 }

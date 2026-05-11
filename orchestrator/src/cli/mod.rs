@@ -42,6 +42,11 @@ pub enum Command {
         /// locally and remotely.
         #[arg(long, default_value_t = false)]
         hard: bool,
+
+        /// Repository URL or short-name (basename without .git). Required
+        /// when config has multiple repositories.
+        #[arg(long)]
+        repo: Option<String>,
     },
 }
 
@@ -55,9 +60,18 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             changes,
             config: config_path,
             hard,
+            repo,
         } => {
             let cfg = config::Config::load_from(&config_path)?;
-            rewind::execute(cfg, changes, hard).await
+            rewind::execute(
+                cfg.repositories,
+                rewind::RewindArgs {
+                    changes,
+                    hard,
+                    repo,
+                },
+            )
+            .await
         }
     }
 }
