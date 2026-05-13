@@ -400,7 +400,34 @@ exit                       # back to your admin shell
 
 The Claude credentials now live at `/home/autocoder/.claude/`. They survive restarts as long as the systemd unit runs as the same user.
 
-### 3. Stage the working directory
+### 3. Set up SSH for the autocoder user
+
+Required for `config.yaml` repositories using SSH URLs (`git@github.com:...`), which is the recommended form for multi-owner setups. The autocoder user needs its own SSH key registered with GitHub, plus github.com's host key pre-accepted so the daemon never hits an interactive `yes/no` prompt.
+
+```bash
+# Generate a passphrase-less key for the autocoder user (-N "" skips the prompt).
+sudo -iu autocoder ssh-keygen -t ed25519 -C "autocoder@$(hostname)" -f ~/.ssh/id_ed25519 -N ""
+
+# Pre-accept github.com's host key so the daemon never hits an interactive prompt.
+sudo -iu autocoder bash -c 'ssh-keyscan github.com >> ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts'
+
+# Print the public key to register with GitHub.
+sudo -u autocoder cat /home/autocoder/.ssh/id_ed25519.pub
+```
+
+Register the public key with each GitHub account or organization that owns a configured repository:
+
+- **Personal account repos:** add the key under *Settings → SSH and GPG keys → New SSH key*.
+- **Organization repos you don't own:** add the key as a *deploy key* on each repo (*Repo settings → Deploy keys → Add deploy key*; check "Allow write access" so autocoder can push the agent branch). Deploy keys are per-repo; if you have many repos in one org, prefer adding the key to a machine user the org has granted collaborator access.
+
+Verify before continuing:
+
+```bash
+sudo -u autocoder ssh -T git@github.com
+# Expected: "Hi <user>! You've successfully authenticated, but GitHub does not provide shell access."
+```
+
+### 4. Stage the working directory
 
 ```bash
 sudo mkdir -p /home/autocoder/autocoder
@@ -410,7 +437,7 @@ sudo -u autocoder $EDITOR /home/autocoder/autocoder/config.yaml   # edit repo UR
 sudo chmod 600 /home/autocoder/autocoder/config.yaml              # restrictive perms regardless of secret path
 ```
 
-### 4. Set up the systemd service
+### 5. Set up the systemd service
 
 Pick one of the two secret-delivery paths below depending on what you put in your `config.yaml` (see [Secrets in `config.yaml`](#5-secrets-in-configyaml-inline-vs-env-var)).
 
@@ -481,7 +508,7 @@ GITHUB_TOKEN=ghp_yourtokenhere
 
 You can also mix the two paths per-secret — e.g. inline `github.token` but `reviewer.api_key_env: ANTHROPIC_API_KEY` — in which case the unit needs `EnvironmentFile=` and the env file only carries the env-var-sourced secrets.
 
-### 5. Start it
+### 6. Start it
 
 ```bash
 sudo systemctl daemon-reload

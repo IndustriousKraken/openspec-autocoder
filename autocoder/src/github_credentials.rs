@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::{GithubConfig, SecretSource};
 
@@ -36,12 +36,16 @@ pub fn resolve_token_with_source(
     }
     if let Some(source) = cfg.token.as_ref() {
         let field = "github.token";
-        let value = source.resolve(field)?;
+        let value = source
+            .resolve(field)
+            .with_context(|| format!("no `owner_tokens` route for owner `{owner}`"))?;
         return Ok((value, source.describe(field)));
     }
     let fallback = SecretSource::EnvVar(cfg.token_env.clone());
     let field = format!("github.token_env={}", cfg.token_env);
-    let value = fallback.resolve(&field)?;
+    let value = fallback
+        .resolve(&field)
+        .with_context(|| format!("no `owner_tokens` route for owner `{owner}`"))?;
     Ok((value, fallback.describe(&field)))
 }
 
