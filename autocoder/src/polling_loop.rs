@@ -294,12 +294,21 @@ async fn process_one_waiting(
             Ok(None)
         }
         Ok(ExecutorOutcome::Completed) => {
+            // The porcelain output here will include the .question.json
+            // deletion (and possibly an .answer.json transient) that
+            // autocoder itself just performed above. Those are
+            // bookkeeping, not executor output, so they must not count
+            // as "the executor modified the workspace."
             let dirty = git::status_porcelain(workspace)?;
-            if dirty.is_empty() {
+            if !has_executor_changes(&dirty, change) {
                 tracing::warn!(
-                    "resume of `{change}` returned Completed but workspace is clean; archiving anyway per spec"
+                    "resume of `{change}` returned Completed without modifying the workspace; marking Failed"
                 );
-                queue::archive(workspace, change)?;
+                // The question/answer file shuffle is left in the working
+                // tree for now; the next pass's startup dirty-check will
+                // either auto-recover or skip. The .in-progress lock was
+                // removed when the question was first posted, so the
+                // change is already in pending state for retry.
                 Ok(None)
             } else {
                 let subject = build_commit_subject(workspace, change)?;
@@ -460,8 +469,9 @@ async fn handle_outcome(
             let dirty = git::status_porcelain(workspace)?;
             if dirty.is_empty() {
                 tracing::warn!(
-                    "executor reported Completed for `{change}` but workspace is clean; archiving anyway per spec"
+                    "agent reported Completed for `{change}` without modifying the workspace; marking Failed"
                 );
+                return Ok(QueueStep::Failed);
             } else if is_lazy_archive(&dirty) {
                 tracing::warn!(
                     "agent appears to have archived `{change}` without implementing the change; reverting and marking Failed"
@@ -517,6 +527,54 @@ fn is_lazy_archive(status: &str) -> bool {
         any = true;
     }
     any
+}
+
+/// Decide whether a `git status --porcelain` block (taken after a resume
+/// returned `Completed`) contains any change attributable to the executor,
+/// as opposed to autocoder's own bookkeeping. In the resume path autocoder
+/// itself writes/deletes `.question.json` and `.answer.json` inside the
+/// change directory; those entries are NOT executor output and must not
+/// be counted when deciding whether the executor produced an artifact.
+///
+/// Returns true iff at least one porcelain entry references a path that
+/// is NOT one of the meta-files for `change`.
+fn has_executor_changes(status: &str, change: &str) -> bool {
+    let q = format!("openspec/changes/{change}/.question.json");
+    let a = format!("openspec/changes/{change}/.answer.json");
+    let is_meta = |path: &str| path == q || path == a;
+    for raw_line in status.lines() {
+        // `git::status_porcelain` trims the entire blob, which strips the
+        // leading column-1 space on the first/last line of unstaged
+        // changes (e.g. ` D path` -> `D path`). Re-normalize per line by
+        // skipping the leading status block and the whitespace that
+        // separates it from the path, rather than fixed `line[3..]`.
+        let line = raw_line.trim_start();
+        if line.is_empty() {
+            continue;
+        }
+        let path_start = match line.find(char::is_whitespace) {
+            Some(i) => i,
+            None => continue, // malformed; skip rather than misclassify
+        };
+        let payload = line[path_start..].trim_start();
+        if payload.is_empty() {
+            continue;
+        }
+        // Rename: `<old> -> <new>` — both sides must be meta to skip.
+        let (left, right) = match payload.split_once(" -> ") {
+            Some((l, r)) => (l, Some(r)),
+            None => (payload, None),
+        };
+        if !is_meta(left) {
+            return true;
+        }
+        if let Some(r) = right {
+            if !is_meta(r) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Build a commit subject from the change name and the first non-empty line of
@@ -757,6 +815,45 @@ mod tests {
         // moving files around as part of implementation.
         let status = "R  old/path.rs -> new/path.rs\n";
         assert!(!is_lazy_archive(status));
+    }
+
+    // ============================================================
+    // has_executor_changes (resume-path no-op detection)
+    // ============================================================
+
+    #[test]
+    fn has_executor_changes_false_when_only_question_file_deletion() {
+        // Real-world porcelain from a no-diff resume: autocoder itself
+        // deleted .question.json before calling resume; the leading
+        // column-1 space is trimmed by `status_porcelain`, leaving the
+        // line starting with the second status column.
+        let status = "D openspec/changes/foo/.question.json";
+        assert!(!has_executor_changes(status, "foo"));
+    }
+
+    #[test]
+    fn has_executor_changes_false_when_only_answer_and_question_metafiles() {
+        let status = " D openspec/changes/foo/.question.json\n?? openspec/changes/foo/.answer.json";
+        assert!(!has_executor_changes(status, "foo"));
+    }
+
+    #[test]
+    fn has_executor_changes_true_when_resume_wrote_artifact() {
+        // The executor created an artifact alongside the meta-file
+        // deletion → real work happened.
+        let status = " D openspec/changes/foo/.question.json\n?? src/new_thing.rs";
+        assert!(has_executor_changes(status, "foo"));
+    }
+
+    #[test]
+    fn has_executor_changes_false_on_empty_status() {
+        assert!(!has_executor_changes("", "foo"));
+    }
+
+    #[test]
+    fn has_executor_changes_true_for_rename_with_non_meta_path() {
+        let status = "R  old/path.rs -> new/path.rs";
+        assert!(has_executor_changes(status, "foo"));
     }
 
     #[test]
@@ -1040,10 +1137,12 @@ mod tests {
         );
     }
 
-    /// 13.4.4 / git-workflow-manager baseline: `Completed` with empty diff
-    /// archives the change but does NOT create an empty commit.
+    /// git-workflow-manager / orchestrator-cli: an executor that returns
+    /// `Completed` without modifying the workspace is treated as Failed.
+    /// The change is NOT archived, no commit is made, and the change is
+    /// unlocked so the next polling pass retries it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn completed_no_diff_archives_without_commit() {
+    async fn completed_with_empty_workspace_is_failed() {
         let (_dir, ws) = fixture_workspace_with_remote();
         add_committed_change(&ws, "no-op-change", "intentionally a no-op");
 
@@ -1052,20 +1151,33 @@ mod tests {
         let executor = CompletingExecutorNoDiff;
         run_one_pass_no_push(&ws, &executor).await.expect("pass succeeds");
 
-        // Change is archived (active dir gone, dated archive entry exists).
-        assert!(!ws.join("openspec/changes/no-op-change").exists());
+        // Change is NOT archived: active directory must still exist and
+        // the archive directory must NOT contain it.
+        assert!(
+            ws.join("openspec/changes/no-op-change").exists(),
+            "no-op change must remain in active changes for retry"
+        );
         let archive_root = ws.join("openspec/changes/archive");
-        let mut found = false;
         if archive_root.exists() {
             for entry in std::fs::read_dir(&archive_root).unwrap() {
                 let name = entry.unwrap().file_name().into_string().unwrap();
-                if name.ends_with("-no-op-change") {
-                    found = true;
-                    break;
-                }
+                assert!(
+                    !name.ends_with("-no-op-change"),
+                    "no-op Completed must not produce an archive entry, found {name}"
+                );
             }
         }
-        assert!(found, "change must be archived under archive/ with date prefix");
+
+        // Lock removed → change is back in pending for the next pass.
+        assert!(
+            !ws.join("openspec/changes/no-op-change/.in-progress").exists(),
+            ".in-progress lock must be cleared so the change retries"
+        );
+        assert_eq!(
+            queue::list_pending(&ws).unwrap(),
+            vec!["no-op-change".to_string()],
+            "change must be back in pending after a no-op Completed"
+        );
 
         // No commit was made: agent-q must still equal main's pre-pass SHA.
         let agent_sha = crate::git::rev_parse(&ws, "agent-q").unwrap();
@@ -1322,6 +1434,141 @@ mod tests {
         assert!(
             names.iter().any(|n| n.ends_with("-ambig-change")),
             "expected archived ambig-change in {names:?}"
+        );
+    }
+
+    /// orchestrator-cli: when a resume returns `Completed` but the
+    /// executor did not modify the workspace, the change is NOT archived.
+    /// The question/answer files are cleared so the change leaves
+    /// "waiting" state, but it must come back as pending for the next
+    /// pass to retry rather than being silently completed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_with_empty_workspace_is_failed() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "ambig-change", "ambiguous fixture");
+
+        // Pre-populate .question.json as if escalated in a prior iteration.
+        let q = QuestionPayload {
+            thread_ts: "2222222222.222222".into(),
+            channel: "C_TEST".into(),
+            resume_handle: serde_json::json!({"change": "ambig-change"}),
+            asked_at: chrono::Utc::now(),
+        };
+        chatops::write_question_file(&ws, "ambig-change", &q).unwrap();
+        let run_git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&ws)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        };
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-q", "-m", "persist question marker"]);
+
+        let pre_main = crate::git::rev_parse(&ws, "main").unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let _replies = server
+            .mock("GET", "/conversations.replies?channel=C_TEST&ts=2222222222.222222")
+            .with_status(200)
+            .with_body(
+                r#"{"ok":true,"messages":[
+                    {"user":"U_BOT","text":"❓ ...","ts":"2222222222.222222"},
+                    {"user":"U_HUMAN","text":"some reply","ts":"2222222223.0"}
+                ]}"#,
+            )
+            .create_async()
+            .await;
+
+        // Executor whose resume returns Completed without touching the
+        // workspace, then refuses to do work if `run()` is later called
+        // (which the same pass will do, since the no-diff resume puts
+        // the change back into pending state — that retry is production-
+        // correct, we just don't want it to mask what the resume path
+        // did in this test).
+        struct ResumeReturnsCompletedNoDiff;
+        #[async_trait::async_trait]
+        impl Executor for ResumeReturnsCompletedNoDiff {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                Ok(ExecutorOutcome::Failed {
+                    reason: "retry after no-diff resume; not implementing in this fixture".into(),
+                })
+            }
+            async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+                Ok(ExecutorOutcome::Completed)
+            }
+        }
+        let executor = ResumeReturnsCompletedNoDiff;
+        let chatops_ctx = ChatOpsContext {
+            chatops: chatops.clone(),
+            channel: "C_TEST".to_string(),
+        };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let processed = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &test_github,
+            &executor,
+            Some(&chatops_ctx),
+        )
+        .await
+        .expect("pass succeeds");
+
+        // No commits this pass — the resume produced no diff.
+        assert!(
+            processed.is_empty(),
+            "no-diff resume must not be reported as committed"
+        );
+
+        // Change is NOT archived: active dir still present, archive
+        // (if it exists) does not contain it.
+        assert!(
+            ws.join("openspec/changes/ambig-change").exists(),
+            "change must remain in active changes after no-diff resume"
+        );
+        let archive = ws.join("openspec/changes/archive");
+        if archive.exists() {
+            for entry in std::fs::read_dir(&archive).unwrap() {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                assert!(
+                    !name.ends_with("-ambig-change"),
+                    "no-diff resume must not produce an archive entry, found {name}"
+                );
+            }
+        }
+
+        // Question + answer files cleared; change is back in pending,
+        // not waiting.
+        assert!(
+            !ws.join("openspec/changes/ambig-change/.question.json").exists(),
+            ".question.json must be deleted after resume"
+        );
+        assert!(
+            !ws.join("openspec/changes/ambig-change/.answer.json").exists(),
+            ".answer.json must be deleted after resume"
+        );
+        assert!(
+            !queue::list_waiting(&ws).unwrap().contains(&"ambig-change".to_string()),
+            "change must leave waiting state after resume"
+        );
+        assert!(
+            queue::list_pending(&ws).unwrap().contains(&"ambig-change".to_string()),
+            "change must return to pending for retry"
+        );
+
+        // No commit was made on agent-q (it should equal main's pre-pass
+        // SHA after branch init).
+        let agent_sha = crate::git::rev_parse(&ws, "agent-q").unwrap();
+        assert_eq!(
+            agent_sha, pre_main,
+            "no-diff resume must not create a commit"
         );
     }
 

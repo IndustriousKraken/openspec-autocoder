@@ -384,7 +384,7 @@ autocoder SHALL attempt automatic recovery before falling back to the existing "
   to prior behavior
 
 ### Requirement: Reject archive-only iterations as Failed
-autocoder SHALL treat an iteration as Failed (not Completed), revert the staged moves via `git reset --hard`, and leave the change pending for retry when the executor returns Completed AND the resulting working-tree changes consist *only* of file moves whose destination paths start with `openspec/changes/archive/`. The detection is structural — pattern-matching on rename destinations — and does not depend on which command produced the moves.
+autocoder SHALL treat an iteration as Failed (not Completed), revert the staged moves via `git reset --hard`, and leave the change pending for retry when the executor returns Completed AND the resulting working-tree changes consist *only* of file moves whose destination paths start with `openspec/changes/archive/`. The detection is structural — pattern-matching on rename destinations — and does not depend on which command produced the moves. autocoder SHALL also treat Completed-with-clean-workspace as Failed and leave the change pending for retry; the prior "archive without commit" handling is removed.
 
 #### Scenario: Agent archives the change instead of implementing it
 - **WHEN** the executor returns `Completed` for a change AND
@@ -413,9 +413,14 @@ autocoder SHALL treat an iteration as Failed (not Completed), revert the staged 
 #### Scenario: Workspace is clean (no changes at all)
 - **WHEN** the executor returns `Completed` AND `git status
   --porcelain` is empty
-- **THEN** autocoder uses the existing "completed but no diff"
-  handling (logs a warning, archives the change without an empty
-  commit)
+- **THEN** autocoder treats the outcome as
+  `Failed { reason: "agent reported Completed without modifying the workspace" }`
+- **AND** autocoder logs a `warn`-level line naming the change
+- **AND** autocoder does NOT commit, does NOT archive, and does
+  NOT push
+- **AND** the change's `.in-progress` lock is removed via the
+  existing Failed-handling code path so the next iteration
+  retries
 - **AND** the lazy-archive detection does NOT fire (no staged
   moves to revert)
 

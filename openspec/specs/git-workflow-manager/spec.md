@@ -35,7 +35,7 @@ branch is never consulted.
   verbatim
 
 ### Requirement: Serial commit per change
-The git workflow manager SHALL produce one commit per successfully implemented change, on the agent branch, in queue order.
+The git workflow manager SHALL produce one commit per successfully implemented change, on the agent branch, in queue order. A change is "successfully implemented" only when the executor returns `Completed` AND `git status --porcelain` returns a non-empty result. If the workspace is clean after a `Completed` outcome, the manager SHALL NOT commit or archive the change; the iteration SHALL be marked Failed and the change SHALL remain pending for retry.
 
 #### Scenario: Committing a change with modifications
 - **WHEN** the executor returns `Completed` for `<change>` AND `git status --porcelain` returns a non-empty result inside the workspace
@@ -44,8 +44,10 @@ The git workflow manager SHALL produce one commit per successfully implemented c
 
 #### Scenario: Executor reported Completed but produced no diff
 - **WHEN** the executor returns `Completed` for `<change>` AND `git status --porcelain` returns empty
-- **THEN** the manager logs a warning naming `<change>` and does NOT create an empty commit
-- **AND** the change is still archived by the queue engine, since the executor explicitly signaled completion
+- **THEN** the manager logs a warning naming `<change>` ("agent reported Completed without modifying the workspace; marking Failed")
+- **AND** the manager does NOT create an empty commit
+- **AND** the manager does NOT archive the change
+- **AND** the iteration outcome is reported as Failed so the queue engine unlocks `<change>` and the next polling pass retries it
 
 ### Requirement: Monolithic PR at end of pass
 The git workflow manager SHALL push the agent branch and create a
