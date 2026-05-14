@@ -2,6 +2,7 @@
 //! init → queue walk → push + PR if commits were produced. Failures inside
 //! one iteration are logged and the loop continues to the next sleep.
 
+use crate::busy_marker;
 use crate::chatops::{self, AnswerPayload, ChatOps, QuestionPayload};
 use crate::code_reviewer::{CodeReviewer, ReviewReport, ReviewVerdict};
 use crate::config::{GithubConfig, RepositoryConfig};
@@ -31,6 +32,7 @@ pub async fn run(
     github: GithubConfig,
     reviewer: Option<Arc<CodeReviewer>>,
     chatops_ctx: Option<Arc<ChatOpsContext>>,
+    stuck_threshold_secs: u64,
     cancel: CancellationToken,
 ) {
     let workspace = workspace::resolve_path(&repo);
@@ -53,6 +55,7 @@ pub async fn run(
             &github,
             reviewer.as_deref(),
             chatops_ctx.as_deref(),
+            stuck_threshold_secs,
         )
         .await
         {
@@ -83,7 +86,39 @@ pub async fn execute_one_pass(
     github_cfg: &GithubConfig,
     reviewer: Option<&CodeReviewer>,
     chatops_ctx: Option<&ChatOpsContext>,
+    stuck_threshold_secs: u64,
 ) -> Result<()> {
+    // Acquire the per-repo busy marker. Held across the entire pass
+    // (executor → review → push → PR); released by Drop on every return.
+    // A crash that bypasses Drop leaves the marker for the next pass to
+    // detect and (depending on age + PID liveness) auto-recover from.
+    let mut guard = match busy_marker::try_acquire(workspace, &repo.url, stuck_threshold_secs) {
+        Ok(busy_marker::AcquireOutcome::Acquired(g)) => g,
+        Ok(busy_marker::AcquireOutcome::SkipFreshInProgress(m)) => {
+            tracing::info!(
+                url = %repo.url,
+                pid = m.pid,
+                stage = %m.stage.as_str(),
+                "busy marker present; another pass is in progress — skipping iteration"
+            );
+            return Ok(());
+        }
+        Ok(busy_marker::AcquireOutcome::SkipAmbiguous(m)) => {
+            tracing::error!(
+                url = %repo.url,
+                pid = m.pid,
+                recorded_comm = %m.comm,
+                "busy marker is stuck with ambiguous PID state; skipping iteration — investigate manually"
+            );
+            post_stuck_alert(chatops_ctx, repo, &m, true).await;
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::error!(url = %repo.url, "busy marker acquire failed: {e:#}");
+            return Err(e);
+        }
+    };
+
     // Before doing any iteration work, check whether an open PR already
     // exists on the agent branch. If yes, this iteration would burn
     // tokens re-implementing, force-update the PR's commits under any
@@ -112,6 +147,7 @@ pub async fn execute_one_pass(
     let (review_report, draft) = match reviewer {
         None => (None, false),
         Some(r) => {
+            let _ = guard.set_stage(busy_marker::Stage::Review);
             let ctx = build_review_context(workspace, repo, &processed)?;
             match r.review(&ctx).await {
                 Ok(report) => {
@@ -135,9 +171,46 @@ pub async fn execute_one_pass(
     } else {
         "origin"
     };
+    let _ = guard.set_stage(busy_marker::Stage::Push);
     git::push_force_with_lease(workspace, &repo.agent_branch, push_remote)?;
+    let _ = guard.set_stage(busy_marker::Stage::Pr);
     open_pull_request(repo, github_cfg, &processed, review_report.as_ref(), draft).await?;
     Ok(())
+}
+
+/// Best-effort chatops alert for stuck busy-marker states. Posts a
+/// notification via `post_notification` if a chatops backend is
+/// configured; otherwise the ERROR log line is the operator's only
+/// signal. Returns immediately on any post failure (logged at WARN).
+async fn post_stuck_alert(
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo: &RepositoryConfig,
+    marker: &busy_marker::BusyMarker,
+    ambiguous: bool,
+) {
+    let ctx = match chatops_ctx {
+        Some(c) => c,
+        None => return,
+    };
+    let kind = if ambiguous {
+        "stuck (ambiguous — investigate)"
+    } else {
+        "recovered from stuck state"
+    };
+    let text = format!(
+        ":rotating_light: autocoder {kind}\nrepo: `{}`\npid: {} (recorded comm: `{}`)\nstage: `{}`\nstarted: {}",
+        repo.url,
+        marker.pid,
+        marker.comm,
+        marker.stage.as_str(),
+        marker.started_at,
+    );
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            "busy_marker: failed to post stuck-state chatops alert: {e:#}"
+        );
+    }
 }
 
 /// Assemble the `ReviewContext` for the reviewer: archived-change briefs
@@ -2290,7 +2363,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
         let handle = tokio::spawn(async move {
-            run(repo, executor_dyn, github, None, None, cancel_for_task).await;
+            run(repo, executor_dyn, github, None, None, 2400, cancel_for_task).await;
         });
 
         // Let several iterations run, then cancel. The git operations are
@@ -2356,7 +2429,7 @@ mod tests {
 
         let cancel_for_task = cancel.clone();
         let handle = tokio::spawn(async move {
-            run(repo, executor, github, None, None, cancel_for_task).await;
+            run(repo, executor, github, None, None, 2400, cancel_for_task).await;
         });
 
         // Give the loop time to enter its sleep, then cancel.

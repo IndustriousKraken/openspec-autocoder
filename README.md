@@ -403,6 +403,37 @@ At startup, `autocoder run` invokes `openspec --version` once. If the binary is 
 
 If you see `openspec preflight failed: binary not found on PATH`, add the install directory to the systemd unit's `Environment="PATH=..."` line (see [Deployment](#deployment)).
 
+### Busy marker
+
+At the start of each polling iteration, autocoder writes a per-repo JSON marker at `/tmp/autocoder/busy/<workspace-basename>.json` and holds it through every stage of the pass (executor → review → push → PR). The marker is removed when the pass returns normally. A daemon crash that bypasses normal cleanup (SIGKILL, segfault, host power loss) intentionally leaves the marker for the next pass to discover.
+
+Marker contents: `repo_url`, `pid`, `pgid` (Linux process group for `killpg` recovery), `comm` (process name from `/proc/<pid>/comm` at acquire time), `started_at`, and `stage` (one of `executor`, `commit`, `review`, `push`, `pr`).
+
+On the next iteration's startup, autocoder classifies any pre-existing marker:
+
+| Marker state | Action |
+|---|---|
+| File absent | Acquire, run iteration |
+| Age < `executor.timeout_secs` + 10 min | Skip iteration with INFO log — another pass is working |
+| Age over threshold, PID dead | Auto-recover: clear marker, WARN log, proceed |
+| Age over threshold, PID alive + `comm` matches | Stuck: `SIGTERM` the process group, wait 5s, `SIGKILL` if still alive, clear marker, post chatops alert, proceed |
+| Age over threshold, PID alive + `comm` differs | Ambiguous (PID reuse suspected) — ERROR log, post chatops alert, SKIP iteration, leave marker for human inspection |
+| Malformed JSON | Treat as stale: WARN log, clear marker, proceed |
+
+Operators inspecting the file:
+```bash
+sudo -u autocoder cat /tmp/autocoder/busy/<basename>.json
+```
+
+To force a recovery from a stuck state, stop the systemd unit, delete the marker file, and start the unit again:
+```bash
+sudo systemctl stop autocoder
+sudo -u autocoder rm /tmp/autocoder/busy/<basename>.json
+sudo systemctl start autocoder
+```
+
+The per-change run logs (`/tmp/autocoder/logs/<basename>/<change>.log`) and the busy markers share the same `/tmp/autocoder/` root.
+
 ### Skipping iterations while a PR is open
 
 Before each polling iteration begins its work, autocoder queries GitHub for open PRs whose `head` matches the configured agent branch (`<fork_owner>:<agent_branch>` in fork-PR mode, `<repo_owner>:<agent_branch>` in direct mode, base = the configured base branch). If an open PR is found, the iteration is skipped: no executor invocation, no commits, no push, no PR creation attempt. The skip persists until the open PR is closed or merged. This prevents the daemon from re-implementing the same changes on every poll while a PR sits awaiting review, which would otherwise force-push new commits over the PR's branch and burn agent tokens redundantly.
@@ -563,7 +594,7 @@ RestartSec=60
 WantedBy=multi-user.target
 ```
 
-`openspec` must be on autocoder's PATH. The daemon runs `openspec --version` at startup and exits non-zero with a clear stderr message if the binary is missing. Confirm with `sudo -u autocoder which openspec`. The per-change run log at `/tmp/autocoder-logs/<workspace>/<change>.log` records the prompt sent to Claude under a `=== PROMPT (n bytes) ===` header for inspection.
+`openspec` must be on autocoder's PATH. The daemon runs `openspec --version` at startup and exits non-zero with a clear stderr message if the binary is missing. Confirm with `sudo -u autocoder which openspec`. The per-change run log at `/tmp/autocoder/logs/<workspace>/<change>.log` records the prompt sent to Claude under a `=== PROMPT (n bytes) ===` header for inspection.
 
 #### Path B — env-var secrets (multi-user hosts, classical production pattern)
 

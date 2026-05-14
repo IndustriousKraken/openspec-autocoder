@@ -218,7 +218,7 @@ The `ClaudeCliExecutor` SHALL persist every subprocess invocation's prompt, capt
   (any outcome: success, non-zero, or timeout)
 - **THEN** the prompt sent to the subprocess, the captured stdout, and
   the captured stderr are written to
-  `<system-temp>/autocoder-logs/<workspace-basename>/<change>.log`
+  `<system-temp>/autocoder/logs/<workspace-basename>/<change>.log`
   where `<workspace-basename>` is the last path component of the
   workspace and `<change>` is the change name
 - **AND** the file format is plain text consisting of a
@@ -261,6 +261,19 @@ The `ClaudeCliExecutor` SHALL persist every subprocess invocation's prompt, capt
 - **AND** `build_prompt` then proceeds with raw-markdown
   concatenation as before, returning a non-empty prompt or an Err
   if no change material exists
+
+#### Scenario: Spawned child runs in its own process group
+- **WHEN** `run_subprocess` spawns the wrapped CLI as a child
+  process
+- **THEN** the child is launched as the leader of a new process
+  group via `pre_exec` calling `setsid()` (Unix), so the per-repo
+  busy marker can record the child's PGID and the daemon can use
+  `killpg(pgid, signal)` to terminate the entire subprocess tree
+  (including any MCP servers spawned by the agent) if a stuck
+  state is detected
+- **AND** this has no effect on the executor's normal
+  exit-mapping behavior; it only enables process-group signaling
+  during stuck-state recovery
 
 ### Requirement: Implementer prompt template loading
 The executor SHALL load an implementer prompt template at construction. The template wraps the openspec change content with a role-establishing imperative so the wrapped CLI knows it is acting as an autonomous implementer and not a chat assistant. The default template is compiled into the binary; deployments may override it by setting `executor.implementer_prompt_path` in `config.yaml` to a readable file path.

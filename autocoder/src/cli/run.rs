@@ -97,6 +97,12 @@ pub async fn execute(cfg: Config) -> Result<()> {
 
     let cancel = CancellationToken::new();
 
+    // Busy-marker stuck threshold: how long an in-flight iteration is
+    // allowed to hold the marker before the next pass treats it as
+    // potentially crashed. Sized as the executor's wall-clock budget
+    // plus a 10-minute buffer for review/push/PR steps.
+    let stuck_threshold_secs: u64 = cfg.executor.timeout_secs.saturating_add(600);
+
     let mut tasks: JoinSet<()> = JoinSet::new();
     for repo in cfg.repositories.iter().cloned() {
         if !repo_passes_startup_check(&repo, &cfg.github) {
@@ -123,7 +129,16 @@ pub async fn execute(cfg: Config) -> Result<()> {
         };
 
         tasks.spawn(async move {
-            polling_loop::run(repo, executor, github, reviewer, chatops_ctx, cancel).await
+            polling_loop::run(
+                repo,
+                executor,
+                github,
+                reviewer,
+                chatops_ctx,
+                stuck_threshold_secs,
+                cancel,
+            )
+            .await
         });
     }
 

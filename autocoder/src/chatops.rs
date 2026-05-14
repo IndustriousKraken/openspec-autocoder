@@ -141,6 +141,46 @@ impl ChatOps {
             .ok_or_else(|| anyhow!("slack post response missing ts"))
     }
 
+    /// Post a non-question notification to a Slack channel. Used for
+    /// fire-and-forget operational alerts (e.g. "repo recovered from
+    /// stuck state"). Unlike `post_question` this does not format the
+    /// text and does not return the thread timestamp — the caller does
+    /// not poll for replies.
+    pub async fn post_notification(&self, channel: &str, text: &str) -> Result<()> {
+        let url = format!(
+            "{}/chat.postMessage",
+            self.api_base.trim_end_matches('/')
+        );
+        let payload = serde_json::json!({
+            "channel": channel,
+            "text": text,
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| anyhow!("slack post_notification request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow!("slack post_notification http {status}"));
+        }
+        let parsed: PostMessageResponse = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("slack post_notification decode failed: {e}"))?;
+        if !parsed.ok {
+            return Err(anyhow!(
+                "slack post_notification failed: {}",
+                parsed.error.unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        Ok(())
+    }
+
     /// Poll the tracked thread for the earliest human reply. Returns
     /// `Some(reply)` for the first message that lacks a `bot_id` field AND
     /// whose `user` field differs from the cached bot user id. Otherwise
