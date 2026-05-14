@@ -85,17 +85,54 @@ impl ClaudeCliExecutor {
     /// when available, falling back to concatenating the change's
     /// `proposal.md`, `design.md`, and `tasks.md` files.
     fn build_prompt(workspace: &Path, change: &str) -> Result<String> {
-        if let Ok(out) = std::process::Command::new("openspec")
+        // Try `openspec instructions apply` first. Each failure mode logs
+        // a structured WARN so operators can root-cause the silent
+        // fallback that triggered chat-style responses in production.
+        match std::process::Command::new("openspec")
             .args(["instructions", "apply", "--change", change])
             .current_dir(workspace)
             .output()
-            && out.status.success()
         {
-            let s = String::from_utf8_lossy(&out.stdout).to_string();
-            if !s.trim().is_empty() {
-                return Ok(s);
+            Ok(out) if out.status.success() => {
+                let s = String::from_utf8_lossy(&out.stdout).to_string();
+                if s.trim().is_empty() {
+                    tracing::warn!(
+                        change = change,
+                        reason = "openspec_empty_stdout",
+                        "openspec instructions apply produced empty stdout; falling back to raw markdown"
+                    );
+                } else {
+                    return Ok(s);
+                }
+            }
+            Ok(out) => {
+                let stderr_tail: String =
+                    String::from_utf8_lossy(&out.stderr).chars().take(200).collect();
+                tracing::warn!(
+                    change = change,
+                    reason = "openspec_exited_nonzero",
+                    code = ?out.status.code(),
+                    stderr_tail = %stderr_tail,
+                    "openspec instructions apply exited non-zero; falling back to raw markdown"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    change = change,
+                    reason = "openspec_not_found",
+                    "could not spawn `openspec`; binary not on autocoder's PATH. Set Environment=\"PATH=...\" in the systemd unit. Falling back to raw markdown."
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    change = change,
+                    reason = "openspec_spawn_error",
+                    error = %e,
+                    "spawning `openspec` failed; falling back to raw markdown"
+                );
             }
         }
+
         let change_dir = workspace.join("openspec/changes").join(change);
         let mut prompt = String::new();
         for file in ["proposal.md", "design.md", "tasks.md"] {
@@ -442,7 +479,7 @@ impl Executor for ClaudeCliExecutor {
         let outcome = self.run_subprocess(workspace, &prompt).await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
-        persist_run_log(workspace, change, &outcome);
+        persist_run_log(workspace, change, &prompt, &outcome);
         self.classify_outcome(workspace, change, outcome).await
     }
 
@@ -466,7 +503,7 @@ impl Executor for ClaudeCliExecutor {
         let outcome = self.run_subprocess(workspace, &prompt).await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
-        persist_run_log(workspace, change, &outcome);
+        persist_run_log(workspace, change, &prompt, &outcome);
         self.classify_outcome(workspace, change, outcome).await
     }
 }
@@ -484,10 +521,11 @@ pub(crate) fn run_log_path(workspace: &Path, change: &str) -> PathBuf {
         .join(format!("{change}.log"))
 }
 
-/// Best-effort: write the subprocess's captured stdout and stderr to the
-/// per-change log file. Errors are logged at WARN but never propagated;
-/// the executor outcome must not depend on diagnostic side-effects.
-fn persist_run_log(workspace: &Path, change: &str, outcome: &SubprocessOutcome) {
+/// Best-effort: write the subprocess's prompt, captured stdout, and
+/// captured stderr to the per-change log file. Errors are logged at WARN
+/// but never propagated; the executor outcome must not depend on
+/// diagnostic side-effects.
+fn persist_run_log(workspace: &Path, change: &str, prompt: &str, outcome: &SubprocessOutcome) {
     let path = run_log_path(workspace, change);
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -499,7 +537,8 @@ fn persist_run_log(workspace: &Path, change: &str, outcome: &SubprocessOutcome) 
         return;
     }
     let body = format!(
-        "=== STDOUT ({n} bytes) ===\n{stdout}\n=== STDERR ({m} bytes) ===\n{stderr}\n",
+        "=== PROMPT ({p} bytes) ===\n{prompt}\n=== STDOUT ({n} bytes) ===\n{stdout}\n=== STDERR ({m} bytes) ===\n{stderr}\n",
+        p = prompt.len(),
         n = outcome.stdout.len(),
         m = outcome.stderr.len(),
         stdout = outcome.stdout,
@@ -955,5 +994,62 @@ mod tests {
     #[test]
     fn tail_handles_empty_input() {
         assert_eq!(tail("", 100), "");
+    }
+
+    /// `persist_run_log` writes a PROMPT section ahead of STDOUT and
+    /// STDERR. Operators rely on this to see exactly what Claude was
+    /// sent on a `Completed-without-modifying-the-workspace` outcome.
+    #[test]
+    fn persist_run_log_writes_prompt_section_first() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("github_com_owner_repo");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: None,
+            stdout: "STDOUT_SENTINEL".to_string(),
+            stderr: "STDERR_SENTINEL".to_string(),
+        };
+        persist_run_log(&ws, "my-change", "PROMPT_SENTINEL", &outcome);
+
+        let log = run_log_path(&ws, "my-change");
+        let body = std::fs::read_to_string(&log).expect("log file written");
+        // Ordering and labels.
+        let prompt_idx = body.find("=== PROMPT (").expect("PROMPT header");
+        let stdout_idx = body.find("=== STDOUT (").expect("STDOUT header");
+        let stderr_idx = body.find("=== STDERR (").expect("STDERR header");
+        assert!(prompt_idx < stdout_idx && stdout_idx < stderr_idx,
+            "sections must appear in PROMPT → STDOUT → STDERR order:\n{body}");
+        // Content presence.
+        assert!(body.contains("PROMPT_SENTINEL"));
+        assert!(body.contains("STDOUT_SENTINEL"));
+        assert!(body.contains("STDERR_SENTINEL"));
+    }
+
+    /// End-to-end: after a `run`, the persisted log contains a PROMPT
+    /// section (whether the prompt came from openspec or from the raw-
+    /// markdown fallback). This is the diagnostic that lets an operator
+    /// see exactly what Claude was sent.
+    #[tokio::test]
+    async fn run_log_contains_prompt_section() {
+        let (_dir, ws) = fixture_workspace_with_git();
+        let script = write_script(&ws, "noop.sh", "#!/bin/sh\nexit 0\n");
+        let executor = ClaudeCliExecutor::new(script.to_string_lossy().into(), 30);
+        let _ = executor.run(&ws, "x").await.unwrap();
+
+        let log = run_log_path(&ws, "x");
+        let body = std::fs::read_to_string(&log).expect("log file written");
+        assert!(body.contains("=== PROMPT ("), "missing PROMPT header in:\n{body}");
+        // The recorded prompt must be non-empty. Different envs may
+        // hit the openspec path or the raw-markdown fallback — both
+        // identify the change by name, so assert on that.
+        assert!(
+            body.contains("x"),
+            "prompt content missing change identifier:\n{body}"
+        );
+        assert!(
+            !body.contains("=== PROMPT (0 bytes)"),
+            "prompt was empty:\n{body}"
+        );
     }
 }

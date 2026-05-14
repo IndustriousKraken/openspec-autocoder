@@ -520,6 +520,12 @@ After=network.target
 Type=simple
 User=autocoder
 WorkingDirectory=/home/autocoder/autocoder
+
+# PATH must include the directories containing `claude` and `openspec` — both
+# are invoked by name. systemd does not inherit the operator's interactive
+# PATH. `which openspec claude` as the deploy user is the authoritative check.
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+
 ExecStart=/usr/local/bin/autocoder run --config /home/autocoder/autocoder/config.yaml
 Restart=on-failure
 RestartSec=60
@@ -527,6 +533,8 @@ RestartSec=60
 [Install]
 WantedBy=multi-user.target
 ```
+
+> **PATH gotcha.** A common silent failure: `openspec` is installed but not on autocoder's PATH, so `build_prompt` falls back to raw-markdown concatenation and Claude responds with chat-style clarification instead of implementing. The daemon now logs WARN with `reason=openspec_not_found` when this happens — check `journalctl -u autocoder -e | grep reason=openspec` after the first iteration. The per-change run log at `/tmp/autocoder-logs/<workspace>/<change>.log` also persists the actual prompt sent to Claude, with a `=== PROMPT (n bytes) ===` header you can inspect.
 
 #### Path B — env-var secrets (multi-user hosts, classical production pattern)
 
@@ -541,6 +549,10 @@ After=network.target
 Type=simple
 User=autocoder
 WorkingDirectory=/home/autocoder/autocoder
+
+# PATH must include the directories containing `claude` and `openspec`.
+# See Path A above for the rationale.
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
 
 # Required only if your config.yaml uses *_env fields (env-var secret path).
 EnvironmentFile=/etc/autocoder.env
