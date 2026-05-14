@@ -2,9 +2,9 @@
 //! configured repository and waits for shutdown signal (SIGINT/SIGTERM) or
 //! all tasks to finish.
 
-use crate::chatops::ChatOps;
+use crate::chatops::{self, ChatOpsBackend};
 use crate::code_reviewer::CodeReviewer;
-use crate::config::{Config, ExecutorKind, GithubConfig, RepositoryConfig};
+use crate::config::{Config, ExecutorKind, GithubConfig, NotificationsConfig, RepositoryConfig};
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
 use crate::github::parse_repo_url;
 use crate::github_credentials::resolve_token_with_source;
@@ -45,42 +45,16 @@ pub async fn execute(cfg: Config) -> Result<()> {
         }
     };
 
-    let chatops: Option<Arc<ChatOps>> = match cfg.slack.as_ref() {
-        Some(s) => {
-            let token = match (s.bot_token.as_ref(), s.bot_token_env.as_ref()) {
-                (Some(inline), env_name_opt) => {
-                    let resolved = inline.resolve("slack.bot_token")?;
-                    if inline.is_inline() {
-                        if let Some(env_name) = env_name_opt {
-                            if std::env::var(env_name).is_ok() {
-                                tracing::warn!(
-                                    "slack.bot_token (inline) takes precedence; env var `{env_name}` is being ignored for the Slack bot token"
-                                );
-                            }
-                        }
-                    }
-                    resolved
-                }
-                (None, Some(env_name)) => crate::config::SecretSource::EnvVar(env_name.clone())
-                    .resolve(&format!("slack.bot_token_env={env_name}"))?,
-                (None, None) => {
-                    return Err(anyhow::anyhow!(
-                        "slack config has neither `bot_token` (inline) nor `bot_token_env` (env var name) set"
-                    ));
-                }
-            };
-            let client = ChatOps::new(token)
+    let chatops: Option<Arc<dyn ChatOpsBackend>> = match cfg.chatops.as_ref() {
+        Some(co) => {
+            let backend = chatops::from_config(co)
                 .await
-                .context("initializing Slack ChatOps from config")?;
-            tracing::info!(
-                bot_user_id = client.bot_user_id(),
-                default_channel = s.default_channel_id.as_str(),
-                "ChatOps escalation enabled"
-            );
-            Some(Arc::new(client))
+                .context("initializing chatops backend from config")?;
+            emit_chatops_startup_log(backend.provider_name(), backend.is_experimental());
+            Some(backend)
         }
         None => {
-            tracing::info!("ChatOps escalation disabled (no `slack:` config block)");
+            tracing::info!("ChatOps escalation disabled (no chatops: config block)");
             None
         }
     };
@@ -117,13 +91,20 @@ pub async fn execute(cfg: Config) -> Result<()> {
         let cancel = cancel.clone();
 
         // Build the per-repo ChatOps context: resolve the channel via the
-        // per-repo override or the global default.
-        let chatops_ctx: Option<Arc<ChatOpsContext>> = match (chatops.clone(), cfg.slack.as_ref()) {
-            (Some(co), Some(slack_cfg)) => {
+        // per-repo override or the global default. Notification flags
+        // default to `true` when the operator did not configure
+        // `chatops.notifications`.
+        let chatops_ctx: Option<Arc<ChatOpsContext>> = match (chatops.clone(), cfg.chatops.as_ref()) {
+            (Some(backend), Some(chatops_cfg)) => {
                 let channel = repo
-                    .slack_channel(&slack_cfg.default_channel_id)
+                    .chatops_channel(&chatops_cfg.default_channel_id)
                     .to_string();
-                Some(Arc::new(ChatOpsContext { chatops: co, channel }))
+                Some(Arc::new(ChatOpsContext {
+                    chatops: backend,
+                    channel,
+                    start_work_enabled: NotificationsConfig::start_work_enabled(Some(chatops_cfg)),
+                    failure_alerts_enabled: NotificationsConfig::failure_alerts_enabled(Some(chatops_cfg)),
+                }))
             }
             _ => None,
         };
@@ -152,6 +133,20 @@ pub async fn execute(cfg: Config) -> Result<()> {
 
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Emit the one-shot startup log line for the active ChatOps backend.
+/// Experimental backends get a `warn`-level line containing `"EXPERIMENTAL"`
+/// and `"best-effort"`; Slack (and any future official backend) gets an
+/// `info`-level line without those markers.
+pub fn emit_chatops_startup_log(provider: &str, experimental: bool) {
+    if experimental {
+        tracing::warn!(
+            "EXPERIMENTAL: ChatOps escalation enabled via {provider} — best-effort support, may break without notice, no API-stability guarantees"
+        );
+    } else {
+        tracing::info!("ChatOps escalation enabled via {provider} (officially supported)");
+    }
 }
 
 /// Verify the `openspec` binary is reachable before the polling loop
@@ -501,7 +496,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: None,
+            chatops_channel_id: None,
         }
     }
 
@@ -519,7 +514,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: None,
+            chatops_channel_id: None,
         }
     }
 
@@ -699,6 +694,25 @@ mod tests {
         // After recovery the workspace is clean.
         let after = git::status_porcelain(&dirty_path).unwrap();
         assert!(after.is_empty(), "workspace must be clean after recovery, got: {after}");
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn startup_logs_info_for_slack() {
+        emit_chatops_startup_log("slack", false);
+        assert!(logs_contain("ChatOps escalation enabled via slack"));
+        assert!(logs_contain("officially supported"));
+        assert!(!logs_contain("EXPERIMENTAL"));
+        assert!(!logs_contain("best-effort"));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn startup_logs_experimental_warning_for_discord() {
+        emit_chatops_startup_log("discord", true);
+        assert!(logs_contain("EXPERIMENTAL"));
+        assert!(logs_contain("best-effort"));
+        assert!(logs_contain("discord"));
     }
 
     #[test]

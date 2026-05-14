@@ -96,7 +96,7 @@ A list of one or more repositories to manage. Each entry:
 | `agent_branch`       | yes      | —       | The branch the daemon pushes work to (typically `agent-q`). |
 | `poll_interval_sec`  | yes      | —       | Seconds between iterations on this repo. |
 | `local_path`         | no       | derived | See [Workspace path derivation](#workspace-path-derivation). |
-| `slack_channel_id`   | no       | falls back to `slack.default_channel_id` | See [ChatOps Escalation](#chatops-escalation). |
+| `chatops_channel_id` | no       | falls back to `chatops.default_channel_id` | See [ChatOps Escalation](#chatops-escalation). |
 
 ### `executor:` (required)
 
@@ -121,9 +121,9 @@ A list of one or more repositories to manage. Each entry:
 
 See [Code Review](#code-review). Absent block disables the reviewer step.
 
-### `slack:` (optional)
+### `chatops:` (optional)
 
-See [ChatOps Escalation](#chatops-escalation). Absent block disables Slack escalation; an executor `AskUser` outcome falls back to "log and exit the iteration" behavior.
+See [ChatOps Escalation](#chatops-escalation). The block carries a required `provider:` field (`slack` officially supported; `discord`, `teams`, `mattermost`, `matrix` are [EXPERIMENTAL](#experimental-chatops-backends)) plus a `default_channel_id:` and a per-provider sub-block. Absent block disables ChatOps escalation; an executor `AskUser` outcome falls back to "log and exit the iteration" behavior.
 
 ---
 
@@ -225,7 +225,7 @@ Built capabilities (each is a baseline spec under `openspec/specs/`):
 3. **openspec-queue-engine** — enumerate (pending + waiting), lock/unlock via `.in-progress` markers, stale-lock cleanup at startup, archive on completion with `YYYY-MM-DD-<change>` date prefix, unarchive on rewind.
 4. **executor** — backend-agnostic `Executor` trait with `Completed` / `AskUser` / `Failed` outcomes plus a `resume()` entry point. First concrete backend is `ClaudeCliExecutor`, which wraps the `claude` CLI as a subprocess with a configurable timeout and two-layer `AskUser` detection (an MCP-tool marker file plus a stdout-regex backstop).
 5. **git-workflow-manager** — branch init (`fetch → checkout base → pull --ff-only → checkout -B agent`), per-change commits with `<change>: <first line of ## Why>` subject truncated to 72 chars, monolithic PR creation via the GitHub REST API with `--force-with-lease` push.
-6. **chatops-manager** — Slack escalation. On `AskUser`, the daemon posts a question to a configured channel and persists `.question.json` to disk. On the next iteration it polls the Slack thread; when the first non-bot reply arrives it writes `.answer.json` and resumes the executor. Same-repo serial-queue invariant is preserved: any waiting change in a repository blocks all pending-change processing for that repo until resolved.
+6. **chatops-manager** — chat-platform escalation behind a `ChatOpsBackend` trait. Slack is the officially-supported provider; Discord, Teams, Mattermost, and Matrix are [experimental backends](#experimental-chatops-backends) with no API-stability guarantees. On `AskUser`, the daemon posts a question to a configured channel and persists `.question.json` to disk. On the next iteration it polls the thread; when the first non-bot reply arrives it writes `.answer.json` and resumes the executor. Same-repo serial-queue invariant is preserved: any waiting change in a repository blocks all pending-change processing for that repo until resolved.
 7. **code-reviewer** — opt-in AI code-quality review of the diff between base and agent branches. Configurable LLM provider (Anthropic or any OpenAI-compatible endpoint, including Grok, OpenRouter, local Ollama). A `Block` verdict creates the PR as a draft (with a `do-not-merge` label fallback on hosts that reject drafts).
 
 The default executor backend wraps `claude` as a subprocess. The daemon writes a per-workspace `.mcp.json` pointing at itself as an MCP server exposing the `ask_user` tool; when the agent calls it, a marker file is written and the daemon picks it up after the child exits. The MCP server is hosted as a hidden subcommand of the autocoder binary, so deployment is a single-binary install.
@@ -234,17 +234,19 @@ The default executor backend wraps `claude` as a subprocess. The daemon writes a
 
 ## ChatOps Escalation
 
-When the optional `slack:` config block is present, autocoder routes ambiguous agent outcomes (executor returning `AskUser`) to a human via Slack thread replies, persists the conversation state to disk, and resumes implementation on the next iteration when an answer arrives.
+When the optional `chatops:` config block is present, autocoder routes ambiguous agent outcomes (executor returning `AskUser`) to a human via chat-thread replies, persists the conversation state to disk, and resumes implementation on the next iteration when an answer arrives. **Slack is the officially-supported provider**; Discord, Teams, Mattermost, and Matrix are available as [experimental backends](#experimental-chatops-backends) with no API-stability guarantees.
 
-### Configuring Slack
+### Configuring Slack (officially supported)
 
 ```yaml
-slack:
-  bot_token_env: SLACK_BOT_TOKEN        # env var containing your xoxb-... bot token
-  # OR — inline alternative; when `bot_token` is set, `bot_token_env` is ignored.
-  # bot_token:
-  #   value: "xoxb-yourtokenhere"
+chatops:
+  provider: slack
   default_channel_id: C0123456789       # fallback channel id (use the Slack channel ID, not the name)
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN      # env var containing your xoxb-... bot token
+    # OR — inline alternative; when `bot_token` is set, `bot_token_env` is ignored.
+    # bot_token:
+    #   value: "xoxb-yourtokenhere"
 ```
 
 The inline form follows the same dual-source pattern as `github.token` and `reviewer.api_key`; see [Secrets in `config.yaml`](#5-secrets-in-configyaml-inline-vs-env-var) for the security tradeoff.
@@ -255,8 +257,44 @@ Per-repo override:
 repositories:
   - url: "git@github.com:my-org/auth-service.git"
     # ...
-    slack_channel_id: C0AUTH_CHANNEL    # this repo posts to a different channel
+    chatops_channel_id: C0AUTH_CHANNEL  # this repo posts to a different channel
 ```
+
+### Progress notifications
+
+In addition to escalation, autocoder posts two **operator-facing** notification streams to the same chatops channel — a low-volume activity feed so a channel-watching operator can tell at a glance whether the daemon is alive and what it is doing.
+
+**Start-of-work** — one line per change pickup:
+
+```
+🚀 `<repo-url>`: starting work on `<change-name>` — <first line of ## Why>
+```
+
+Fires immediately after the change's `.in-progress` lock is created and BEFORE the executor is invoked.
+
+**Throttled failure alerts** — emitted at most once every 24 hours per (repository, failure category) for three categories of *predictable* infrastructure failure: workspace init / clone failure, branch push rejection, and PR creation 4xx from GitHub. Format:
+
+```
+⚠️ `<repo-url>`: <category-label> for the past 24h. Latest: <error excerpt>
+```
+
+The 24h throttle state lives in a per-workspace `.alert-state.json` file. On the next successful iteration the file is removed, so a transient outage followed by recovery does not leave the next failure (whenever it occurs) silenced.
+
+Other failure surfaces — executor returning `Failed`, reviewer LLM call errors, the chatops post itself failing — are deliberately out of scope and never produce a categorized alert.
+
+Configure independently under `chatops.notifications`:
+
+```yaml
+chatops:
+  # existing fields...
+  notifications:
+    start_work: true       # default true; one message per change pickup
+    failure_alerts: true   # default true; throttled per (repo, category)
+```
+
+Both keys are optional. An absent `notifications:` block parses to "both true" — first-time deployments see useful chatops traffic without further configuration. Set a key to `false` to suppress that stream without affecting the other.
+
+If `post_notification` itself fails (network blip, channel renamed, scope revoked), the failure is logged to stderr but is NEVER re-routed back through chatops — there is no recursive alert cascade.
 
 ### Required Slack bot scopes
 
@@ -300,9 +338,102 @@ If a Slack reply never arrives, autocoder does not time out — it waits indefin
 2. **Manually delete `.question.json`** — reverts the change to pending state. The next iteration re-runs it from scratch (without the answer). Useful when the question was a false positive or the change should restart.
 3. **`autocoder rewind <change>`** — full reset: deletes the agent branch, unarchives if needed, clears all `.question.json` / `.answer.json` markers via the rewind path.
 
-### `.question.json` and `.answer.json` as workspace artifacts
+### `.question.json`, `.answer.json`, and `.alert-state.json` as workspace artifacts
 
-These files are written by autocoder into the workspace alongside the change's `proposal.md`. They are safe to inspect (plain JSON) but unsafe to modify by hand — atomic writes via temp-file-then-rename mean they're consistent on disk, but the daemon's state machine assumes it owns their lifecycle. When a change is archived, the directory move takes the marker files with it; they're not deleted separately.
+These files are written by autocoder into the workspace as bookkeeping. `.question.json` and `.answer.json` live alongside the change's `proposal.md`; `.alert-state.json` lives at the workspace root and tracks the per-(repo, category) 24h-alert throttle for [progress notifications](#progress-notifications).
+
+All three are safe to inspect (plain JSON) but unsafe to modify by hand — atomic writes via temp-file-then-rename mean they're consistent on disk, but the daemon's state machine assumes it owns their lifecycle. When a change is archived, the directory move takes the change-scoped marker files with it; `.alert-state.json` is cleared whenever the polling pass completes without hitting any of the three predictable-failure sites.
+
+Deleting `.alert-state.json` by hand is harmless: it just resets the alert throttle window for that repository, so the next predictable failure will alert immediately rather than wait out the 24h window.
+
+---
+
+## Experimental ChatOps Backends
+
+> **No API-stability guarantees.** Discord, Microsoft Teams, Mattermost, and Matrix are implemented behind the same `ChatOpsBackend` trait as Slack but are explicitly marked experimental: their unit tests pin only the request shape against recorded fixture responses (not live services), so an upstream API change can break them silently. Each emits a loud `warn`-level startup log line stating "EXPERIMENTAL — best-effort support, may break without notice." If you select one and it stops working, **please file a bug**; that is how the experimental backends move toward official support.
+>
+> Slack remains the only officially-supported provider. Single-process autocoder runs against exactly one chat backend at a time; if you live on multiple platforms, pick the most-used one.
+
+### Discord (representative walkthrough)
+
+1. Create a Discord application at https://discord.com/developers/applications. Open the **Bot** tab and reveal the bot token (this is the value you'll export as an env var).
+2. Under **OAuth2 → URL Generator**, check `bot` and the per-channel scopes (`Send Messages`, `Read Message History`). Use the generated URL to invite the bot to your server.
+3. Get the **channel id** for the channel that should receive escalations (Discord → Settings → Advanced → enable Developer Mode → right-click the channel → Copy Channel ID).
+4. Configure autocoder:
+
+   ```yaml
+   chatops:
+     provider: discord
+     default_channel_id: "123456789012345678"  # Discord channel snowflake
+     discord:
+       bot_token_env: DISCORD_BOT_TOKEN
+   ```
+
+5. Export the bot token at launch:
+
+   ```bash
+   export DISCORD_BOT_TOKEN="..."
+   ./target/release/autocoder run --config config.yaml
+   ```
+
+   At startup you'll see:
+
+   ```
+   WARN EXPERIMENTAL: ChatOps escalation enabled via discord — best-effort support, may break without notice, no API-stability guarantees
+   ```
+
+When the executor returns `AskUser`, the bot posts `❓ \`<change>\`: <question>` to the channel. Replies are detected via Discord's `message_reference.message_id` field: any subsequent message in the channel that references the bot's original post and is authored by a non-bot user is treated as the human answer.
+
+### Teams
+
+Microsoft Graph + OAuth `client_credentials`. Register an app in Azure AD; grant it the `ChannelMessage.Send` and `ChannelMessage.ReadAll` application permissions; mint a client secret. Get the tenant id, application (client) id, and team id from Azure / Teams admin.
+
+```yaml
+chatops:
+  provider: teams
+  default_channel_id: "19:abc@thread.tacv2"   # Teams channel id (URL-encoded `:` and `@`)
+  teams:
+    tenant_id: "11111111-2222-3333-4444-555555555555"
+    client_id: "66666666-7777-8888-9999-aaaaaaaaaaaa"
+    client_secret_env: TEAMS_CLIENT_SECRET
+    team_id: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+```
+
+Reply threading uses `/messages/{id}/replies`. The OAuth token is cached in-process and re-acquired on 401 / expiry.
+
+### Mattermost
+
+Personal Access Token auth against the Mattermost v4 REST API. In Mattermost: System Console → Integrations → enable Personal Access Tokens; in your account, generate a PAT. Channel id is the alphanumeric segment in the URL.
+
+```yaml
+chatops:
+  provider: mattermost
+  default_channel_id: c1abcd...
+  mattermost:
+    server_url: "https://mattermost.example.com"
+    access_token_env: MATTERMOST_TOKEN
+```
+
+Reply threading uses `root_id` on the post objects.
+
+### Matrix
+
+Bearer-token auth against the Matrix Client-Server API. In Element (or any Matrix client) get an access token via Settings → Help & About → Access Token, or log in via the API. Room id is the `!abc:server.tld`-style identifier (use the "Settings → Advanced" panel for an invited room).
+
+```yaml
+chatops:
+  provider: matrix
+  default_channel_id: "!abc:server.tld"
+  matrix:
+    homeserver_url: "https://matrix.example.com"
+    access_token_env: MATRIX_ACCESS_TOKEN
+```
+
+Reply threading uses `m.relates_to.m.in_reply_to.event_id`. Initial sync establishes a `next_batch` token at startup so subsequent message reads only return newly-arrived events.
+
+### IRC?
+
+Out of scope. IRC has no stable, persistent message id (a `PRIVMSG` is fire-and-forget; reply correlation is heuristic), and the protocol assumes a long-lived TCP connection rather than HTTP request/response. Operators on IRC are pointed at the Matrix-IRC bridge run by most networks.
 
 ---
 
@@ -382,7 +513,7 @@ If a repository entry omits `local_path`, the workspace path is derived determin
 
 ### Multi-repo setup
 
-`repositories:` accepts any number of entries. autocoder spawns one polling task per entry, each on its own `poll_interval_sec`. Per-repo state is fully independent: an iteration failure on repo A does not affect repo B; a Slack escalation on repo A blocks A's pending queue but does not touch B.
+`repositories:` accepts any number of entries. autocoder spawns one polling task per entry, each on its own `poll_interval_sec`. Per-repo state is fully independent: an iteration failure on repo A does not affect repo B; a ChatOps escalation on repo A blocks A's pending queue but does not touch B.
 
 ```yaml
 repositories:
@@ -569,7 +700,7 @@ Pick one of the two secret-delivery paths below depending on what you put in you
 
 #### Path A — inline secrets (recommended for single-host deployments)
 
-With secrets inline in `config.yaml` (`github.token`, `reviewer.api_key`, `slack.bot_token`), the unit needs no env vars. Create `/etc/systemd/system/autocoder.service`:
+With secrets inline in `config.yaml` (`github.token`, `reviewer.api_key`, `chatops.slack.bot_token`), the unit needs no env vars. Create `/etc/systemd/system/autocoder.service`:
 
 ```ini
 [Unit]
@@ -641,7 +772,11 @@ GITHUB_TOKEN=ghp_yourtokenhere
 
 # Optional, only if the matching config block is enabled and uses *_env:
 # ANTHROPIC_API_KEY=...
-# SLACK_BOT_TOKEN=xoxb-...
+# SLACK_BOT_TOKEN=xoxb-...        # chatops.provider: slack
+# DISCORD_BOT_TOKEN=...           # chatops.provider: discord (EXPERIMENTAL)
+# TEAMS_CLIENT_SECRET=...         # chatops.provider: teams (EXPERIMENTAL)
+# MATTERMOST_TOKEN=...            # chatops.provider: mattermost (EXPERIMENTAL)
+# MATRIX_ACCESS_TOKEN=...         # chatops.provider: matrix (EXPERIMENTAL)
 ```
 
 The two paths can be mixed per-secret — e.g. inline `github.token` alongside `reviewer.api_key_env: ANTHROPIC_API_KEY` — in which case the unit needs `EnvironmentFile=` and the env file carries only the env-var-sourced secrets.
@@ -877,7 +1012,7 @@ Archived directories are **not** deleted by archive — they are renamed under `
 
 ## Status & Roadmap
 
-The seven capabilities listed under [Architecture](#architecture) are all **implemented and tested**. autocoder runs end-to-end against real GitHub repositories with the Claude CLI as executor and (optionally) Slack as the escalation channel.
+The seven capabilities listed under [Architecture](#architecture) are all **implemented and tested**. autocoder runs end-to-end against real GitHub repositories with the Claude CLI as executor and (optionally) Slack as the officially-supported escalation channel. The four experimental ChatOps backends (Discord, Teams, Mattermost, Matrix) compile and have unit-test coverage against recorded fixtures but no live-service validation; operators who deliberately select one are the ones surfacing bugs.
 
 The following capabilities are **explicitly aspirational** — referenced in design documents but not built:
 

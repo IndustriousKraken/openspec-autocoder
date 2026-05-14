@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
 
+mod alert_state;
+mod alerts;
 mod busy_marker;
 mod chatops;
 mod cli;

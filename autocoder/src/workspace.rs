@@ -108,7 +108,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: None,
+            chatops_channel_id: None,
         }
     }
 
@@ -119,7 +119,7 @@ mod tests {
             base_branch: "main".into(),
             agent_branch: "agent-q".into(),
             poll_interval_sec: 60,
-            slack_channel_id: None,
+            chatops_channel_id: None,
         }
     }
 
