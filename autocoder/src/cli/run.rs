@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 pub async fn execute(cfg: Config) -> Result<()> {
     workspace::detect_collisions(&cfg.repositories)?;
     validate_github_token_routes(&cfg.github, &cfg.repositories)?;
-    validate_fork_existence(&cfg.github, &cfg.repositories)?;
+    ensure_forks_exist(&cfg.github, &cfg.repositories).await?;
 
     let sandbox = crate::config::ResolvedSandbox::resolve(cfg.executor.sandbox.as_ref());
     let executor: Arc<dyn Executor> = match cfg.executor.kind {
@@ -195,10 +195,11 @@ pub fn validate_github_token_routes(
     Ok(())
 }
 
-/// When fork-PR mode is active, verify that each configured repository
-/// has a reachable fork at the derived URL. Aggregates failures into a
-/// single error before any polling task is spawned.
-pub fn validate_fork_existence(
+/// When fork-PR mode is active, ensure each configured repository has a
+/// reachable fork at the derived URL. Missing forks are created via the
+/// GitHub REST API, then probed via `git ls-remote` with a 60-second
+/// timeout. Aggregates failures into a single startup error.
+pub async fn ensure_forks_exist(
     github: &GithubConfig,
     repos: &[RepositoryConfig],
 ) -> Result<()> {
@@ -214,16 +215,66 @@ pub fn validate_fork_existence(
                 continue;
             }
         };
-        if let Err(e) = crate::git::ls_remote_head(&fork_url) {
+        // Quick probe: if the fork is already there, do nothing.
+        if crate::git::ls_remote_head(&fork_url).is_ok() {
+            continue;
+        }
+        // Missing fork → POST to GitHub.
+        let (upstream_owner, upstream_repo) = match parse_repo_url(&repo.url) {
+            Ok(t) => t,
+            Err(e) => {
+                failures.push(format!("repo `{}`: {e:#}", repo.url));
+                continue;
+            }
+        };
+        let token = match resolve_token_with_source(github, &upstream_owner) {
+            Ok((tok, _src)) => tok,
+            Err(e) => {
+                failures.push(format!("repo `{}`: cannot resolve PAT for fork creation: {e:#}", repo.url));
+                continue;
+            }
+        };
+        tracing::info!(
+            "creating fork for {} → {fork_url}",
+            repo.url
+        );
+        if let Err(e) =
+            crate::github::create_fork(&upstream_owner, &upstream_repo, &token).await
+        {
             failures.push(format!(
-                "repo `{}`: expected fork at `{fork_url}` is unreachable: {e:#}",
+                "repo `{}`: fork creation POST failed: {e:#}",
+                repo.url
+            ));
+            continue;
+        }
+        // Poll until reachable, up to 60 seconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut reachable = false;
+        tracing::info!(
+            "waiting for fork `{fork_url}` to become reachable (up to 60s)"
+        );
+        while std::time::Instant::now() < deadline {
+            if crate::git::ls_remote_head(&fork_url).is_ok() {
+                reachable = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        if reachable {
+            tracing::info!(
+                "created fork {fork_url} from upstream {}",
+                repo.url
+            );
+        } else {
+            failures.push(format!(
+                "repo `{}`: fork creation succeeded but `{fork_url}` was not reachable within 60s",
                 repo.url
             ));
         }
     }
     if !failures.is_empty() {
         return Err(anyhow!(
-            "fork-PR mode enabled but {} repository(ies) have missing or unreachable forks under `{fork_owner}`:\n  - {}\nVerify each fork exists and the autocoder user has SSH access to it.",
+            "fork-PR mode: {} repository(ies) could not be set up under `{fork_owner}`:\n  - {}",
             failures.len(),
             failures.join("\n  - ")
         ));
@@ -360,8 +411,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fork_existence_validation_skipped_in_direct_push_mode() {
+    #[tokio::test]
+    async fn ensure_forks_exist_skipped_in_direct_push_mode() {
         let github = GithubConfig {
             token_env: "X".into(),
             token: None,
@@ -371,11 +422,13 @@ mod tests {
         // No repos to validate; no fork_owner means the function returns Ok
         // without probing anything.
         let repos = vec![repo("git@github.com:any/repo.git")];
-        validate_fork_existence(&github, &repos).expect("direct-push mode skips fork probing");
+        ensure_forks_exist(&github, &repos)
+            .await
+            .expect("direct-push mode skips fork probing");
     }
 
-    #[test]
-    fn fork_existence_validation_errors_on_unsupported_url_scheme() {
+    #[tokio::test]
+    async fn ensure_forks_exist_errors_on_unsupported_url_scheme() {
         // Non-github URL combined with fork-PR mode → derive_fork_url
         // rejects → validation aggregates the failure.
         let github = GithubConfig {
@@ -385,7 +438,8 @@ mod tests {
             fork_owner: Some("machine-user".into()),
         };
         let repos = vec![repo("ssh://git@github.com/upstream/repo.git")];
-        let err = validate_fork_existence(&github, &repos)
+        let err = ensure_forks_exist(&github, &repos)
+            .await
             .expect_err("unsupported URL scheme must error in fork mode");
         let msg = format!("{err:#}");
         assert!(

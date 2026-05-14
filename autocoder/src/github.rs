@@ -13,6 +13,57 @@ struct PullResponse {
     number: u64,
 }
 
+/// Create a fork of the upstream repo via the GitHub REST API. The fork's
+/// destination is implicit from the PAT's owner — GitHub forks to the
+/// authenticated user's account by default. Returns Ok on 2xx (including
+/// the idempotent case where the fork already exists).
+pub async fn create_fork(upstream_owner: &str, upstream_repo: &str, token: &str) -> Result<()> {
+    create_fork_at(DEFAULT_API_BASE, upstream_owner, upstream_repo, token).await
+}
+
+/// Test-only re-export of the internal `create_fork_at`. Lets sibling-module
+/// tests (e.g. polling_loop's routing test) exercise the fork-creation HTTP
+/// path against a mockito server.
+#[cfg(test)]
+pub(crate) async fn create_fork_at_for_test(
+    api_base: &str,
+    upstream_owner: &str,
+    upstream_repo: &str,
+    token: &str,
+) -> Result<()> {
+    create_fork_at(api_base, upstream_owner, upstream_repo, token).await
+}
+
+async fn create_fork_at(
+    api_base: &str,
+    upstream_owner: &str,
+    upstream_repo: &str,
+    token: &str,
+) -> Result<()> {
+    let url = format!("{api_base}/repos/{upstream_owner}/{upstream_repo}/forks");
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .send()
+        .await
+        .map_err(|e| anyhow!("github fork POST failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_snippet = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(200).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github fork POST {upstream_owner}/{upstream_repo} returned {status}: {body_snippet}"
+        ));
+    }
+    Ok(())
+}
+
 /// Open a pull request via the GitHub REST API. Returns the `html_url` of
 /// the created PR on success.
 ///
@@ -373,6 +424,41 @@ mod tests {
 
     /// `mockito` smoke test: verify the request shape (path, headers, JSON
     /// body) and decoding of the `html_url` from a 201 response.
+    #[tokio::test]
+    async fn create_fork_posts_to_forks_endpoint() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/repos/upstream-org/repo/forks")
+            .match_header("authorization", "Bearer testtoken")
+            .with_status(202)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"full_name":"machine-user/repo"}"#)
+            .create_async()
+            .await;
+
+        create_fork_at_for_test(&server.url(), "upstream-org", "repo", "testtoken")
+            .await
+            .expect("fork POST succeeds on 202");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn create_fork_errors_on_non_2xx() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/repos/upstream-org/repo/forks")
+            .with_status(403)
+            .with_body(r#"{"message":"Resource not accessible by personal access token"}"#)
+            .create_async()
+            .await;
+
+        let err = create_fork_at_for_test(&server.url(), "upstream-org", "repo", "x")
+            .await
+            .expect_err("non-2xx must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("403"), "error must name the HTTP status; got: {msg}");
+    }
+
     #[tokio::test]
     async fn create_pull_request_posts_expected_request() {
         let mut server = mockito::Server::new_async().await;

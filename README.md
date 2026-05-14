@@ -18,6 +18,7 @@ On the machine where the daemon will run:
 
   - **Fine-grained PAT** (recommended for personal-account-owned repos). Required permissions:
     - **`Pull requests: read & write`** — needed for PR creation.
+    - **`Administration: write`** — needed ONLY if you use `github.fork_owner` (fork-PR mode) AND not all forks already exist; autocoder calls `POST /forks` for missing ones.
     - **`Contents: read & write`** — needed ONLY if your `config.yaml` uses HTTPS URLs (`https://github.com/...`); when you use SSH URLs (`git@github.com:...`), git authenticates via your SSH key and `Contents` is not required.
     - **`Issues: read & write`** — needed ONLY in the rare case that your host rejects draft PRs and triggers the `do-not-merge` label fallback. GitHub.com supports drafts on every repo type, so this is not needed there; only relevant for some private GHE configurations.
 
@@ -670,11 +671,11 @@ In this mode autocoder:
 
 **One-time setup per repo:**
 
-1. The machine user must have **Read** access to the upstream repo (collaborator invitation, team membership, or — for public repos — no setup required). Read is enough on github.com because the only API calls the bot makes against upstream are `POST /pulls` (Read can do this) and — only if the host rejects drafts — `POST /labels` (this needs **Triage**, but github.com supports drafts everywhere so the label fallback never fires there). Grant Triage only if you deploy against a GitHub Enterprise host that rejects draft PRs.
-2. The machine user must fork the upstream repo on github.com (web UI or `gh repo fork`). Forks of private repos inherit private visibility automatically.
-3. PATs in `github.owner_tokens` should be minted by the machine user. Fine-grained: scope to "Pull requests: read & write" on the upstream repo — no `Contents: write` needed (the API only opens the PR; SSH handles the git side). Classic: `repo` scope is fine since the machine user's account-level access is already restricted to the autocoder-managed repos via team membership.
+1. The machine user must have **Read** access to the upstream repo (collaborator invitation, team membership, or — for public repos — no setup required). Read is enough on github.com because the only API calls the bot makes against upstream are `POST /pulls` (Read can do this), `POST /forks` (creates a fork to the bot's own account; the bot's PAT owns the destination), and — only if the host rejects drafts — `POST /labels` (this needs **Triage**, but github.com supports drafts everywhere so the label fallback never fires there). Grant Triage only if you deploy against a GitHub Enterprise host that rejects draft PRs.
+2. **Forks are created automatically.** On first startup, autocoder probes each configured repo's fork URL and, when missing, calls `POST /repos/<upstream>/<repo>/forks` to create it under `fork_owner`, then polls (up to 60s) for the fork to become reachable before proceeding. Adding a new repo to `config.yaml` and restarting the daemon is a complete workflow — no manual fork step.
+3. PATs in `github.owner_tokens` (or `github.token`) should be minted by the machine user. Fine-grained: scope to "Pull requests: read & write" + "Administration: write" (the latter is required to fork) on the upstream repo — no `Contents: write` needed. Classic: `repo` scope covers PR creation AND fork creation. The machine user's account-level access provides the actual repo scoping.
 
-**Startup check:** autocoder probes each fork with `git ls-remote` before spawning any polling task. A missing fork produces a startup error naming both the upstream URL and the expected fork URL.
+**Startup check:** autocoder probes each fork with `git ls-remote` before spawning any polling task. Missing forks are created automatically via the GitHub API and then polled (up to 60s) for reachability. A creation failure (e.g. PAT lacks fork permission, or upstream is inaccessible) produces an aggregated startup error naming every repo that failed.
 
 **Rewind in fork mode:** `autocoder rewind --hard` deletes the agent branch from the fork (not upstream), since that's where it lived.
 
