@@ -174,6 +174,15 @@ pub async fn run_pass_through_commits(
     git::pull_ff_only(workspace, &repo.base_branch)?;
     git::recreate_branch(workspace, &repo.agent_branch)?;
 
+    let pending_at_start = queue::list_pending(workspace)?;
+    let waiting_at_start = queue::list_waiting(workspace)?;
+    tracing::info!(
+        url = %repo.url,
+        pending = pending_at_start.len(),
+        waiting = waiting_at_start.len(),
+        "polling pass starting"
+    );
+
     // Process waiting (escalated) changes BEFORE pending. Each resumes if
     // a human reply has arrived. Any change that comes back as Completed
     // with a diff goes into the `processed` list and will get pushed/PR'd
@@ -195,15 +204,25 @@ pub async fn run_pass_through_commits(
             still_waiting.len(),
             still_waiting.join(", ")
         );
+        tracing::info!(
+            url = %repo.url,
+            committed = processed.len(),
+            waiting = still_waiting.len(),
+            "polling pass complete"
+        );
         return Ok(processed);
     }
 
     let pending_processed = walk_queue(workspace, repo, executor, chatops_ctx).await?;
     processed.extend(pending_processed);
 
-    if processed.is_empty() {
-        tracing::info!(url = repo.url.as_str(), "polling pass produced no changes");
-    }
+    let waiting_after = queue::list_waiting(workspace)?.len();
+    tracing::info!(
+        url = %repo.url,
+        committed = processed.len(),
+        waiting = waiting_after,
+        "polling pass complete"
+    );
     Ok(processed)
 }
 
@@ -282,16 +301,21 @@ async fn process_one_waiting(
     chatops::delete_question_file(workspace, change)?;
 
     let handle = ResumeHandle(question.resume_handle.clone());
+    tracing::info!(
+        url = %repo.url,
+        change = %change,
+        "starting work on change (resume)"
+    );
     let outcome = executor.resume(handle, &reply.text).await;
 
     // After resume returns (any outcome), delete .answer.json so the
     // change reverts to a clean state regardless of the outcome.
     let _ = chatops::delete_answer_file(workspace, change);
 
-    match outcome {
+    let result = match outcome {
         Err(e) => {
             tracing::error!("executor.resume errored on `{change}`: {e:#}");
-            Ok(None)
+            ResumeDisposition::Errored
         }
         Ok(ExecutorOutcome::Completed) => {
             // The porcelain output here will include the .question.json
@@ -309,13 +333,13 @@ async fn process_one_waiting(
                 // either auto-recover or skip. The .in-progress lock was
                 // removed when the question was first posted, so the
                 // change is already in pending state for retry.
-                Ok(None)
+                ResumeDisposition::CompletedNoDiff
             } else {
                 let subject = build_commit_subject(workspace, change)?;
                 git::add_all(workspace)?;
                 git::commit(workspace, &subject)?;
                 queue::archive(workspace, change)?;
-                Ok(Some(change.to_string()))
+                ResumeDisposition::Archived
             }
         }
         Ok(ExecutorOutcome::AskUser {
@@ -325,14 +349,46 @@ async fn process_one_waiting(
             // Agent asked another question. Post it and rotate the
             // question file. The change stays in the waiting set.
             escalate_to_chatops(workspace, repo, ctx, change, &q2, rh2.0).await?;
-            Ok(None)
+            ResumeDisposition::EscalatedAgain
         }
         Ok(ExecutorOutcome::Failed { reason }) => {
             tracing::error!("resume of `{change}` returned Failed: {reason}");
             // .answer.json already deleted above. .question.json was
             // deleted before the resume call. The change reverts cleanly
             // to pending state for the next iteration.
-            Ok(None)
+            ResumeDisposition::Failed
+        }
+    };
+
+    tracing::info!(
+        url = %repo.url,
+        change = %change,
+        outcome = result.label(),
+        "change finished (resume)"
+    );
+
+    Ok(match result {
+        ResumeDisposition::Archived => Some(change.to_string()),
+        _ => None,
+    })
+}
+
+enum ResumeDisposition {
+    Archived,
+    CompletedNoDiff,
+    EscalatedAgain,
+    Failed,
+    Errored,
+}
+
+impl ResumeDisposition {
+    fn label(&self) -> &'static str {
+        match self {
+            ResumeDisposition::Archived => "archived",
+            ResumeDisposition::CompletedNoDiff => "failed_no_diff",
+            ResumeDisposition::EscalatedAgain => "escalated",
+            ResumeDisposition::Failed => "failed",
+            ResumeDisposition::Errored => "errored",
         }
     }
 }
@@ -390,11 +446,31 @@ async fn walk_queue(
         queue::lock(workspace, &change)
             .with_context(|| format!("locking change `{change}`"))?;
 
+        tracing::info!(
+            url = %repo.url,
+            change = %change,
+            "starting work on change"
+        );
+
         let outcome = executor.run(workspace, &change).await;
         let result = handle_outcome(workspace, repo, chatops_ctx, &change, outcome).await;
         // Always unlock, even after a Completed → archive (archive moved the
         // dir, so the lock is gone, but `queue::unlock` is idempotent).
         let _ = queue::unlock(workspace, &change);
+
+        let outcome_label = match &result {
+            Ok(QueueStep::Archived) => "archived",
+            Ok(QueueStep::Failed) => "failed",
+            Ok(QueueStep::Escalated) => "escalated",
+            Ok(QueueStep::AskUserExitEarly) => "ask_user_exit_early",
+            Err(_) => "error",
+        };
+        tracing::info!(
+            url = %repo.url,
+            change = %change,
+            outcome = outcome_label,
+            "change finished"
+        );
 
         match result {
             Ok(QueueStep::Archived) => archived.push(change),
