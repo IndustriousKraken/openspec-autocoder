@@ -1,7 +1,7 @@
-//! AI-driven code-quality reviewer. Sends a unified diff + change summary to
-//! a configured LLM and parses the response into a structured
-//! `ReviewReport`. Scope is deliberately code-quality only; spec compliance
-//! is a separate verification concern handled by a future change.
+//! AI-driven code-quality reviewer. Sends a structured `ReviewContext`
+//! (changed-file contents + change-spec context + diff) to a configured LLM
+//! and parses the response into a `ReviewReport`. Scope is deliberately
+//! code-quality only; spec compliance is a separate verification concern.
 
 use crate::config::ReviewerConfig;
 use crate::llm::{self, LlmClient};
@@ -13,10 +13,12 @@ use std::sync::OnceLock;
 /// runs without requiring `prompts/` on the filesystem.
 const DEFAULT_TEMPLATE: &str = include_str!("../../prompts/code-review-default.md");
 
-/// Cap on diff length before substitution into the prompt. Reviewing more
-/// than this within typical model context windows risks truncation by the
-/// model; we truncate explicitly so the operator sees it in the report.
-const DIFF_SIZE_BUDGET: usize = 100_000;
+/// Total cap (in chars) on the rendered prompt body — change context +
+/// changed files + diff combined. Sized for modern 1M-token-class models
+/// (Opus, Grok-4) at ~4 chars/token, conservatively halved. Individual
+/// files are NEVER truncated; if a file's contents would push the total
+/// over budget, the file is skipped in full and named in a footer.
+const PROMPT_BUDGET: usize = 2_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewVerdict {
@@ -29,6 +31,33 @@ pub enum ReviewVerdict {
 pub struct ReviewReport {
     pub verdict: ReviewVerdict,
     pub markdown: String,
+}
+
+/// One archived OpenSpec change's source material. Used to give the
+/// reviewer the *intent* of the change, not just the mechanical diff.
+#[derive(Debug, Clone)]
+pub struct ChangeBrief {
+    pub name: String,
+    pub proposal: String,
+    pub design: Option<String>,
+    pub tasks: String,
+}
+
+/// One file modified by the pass, captured at the agent-branch state.
+#[derive(Debug, Clone)]
+pub struct ChangedFile {
+    pub path: String,
+    pub contents: String,
+}
+
+/// All the material the reviewer sees: the change(s) that shipped, the
+/// resulting file state, and the unified diff. Rendering into a prompt
+/// honors `PROMPT_BUDGET` in priority order (context > files > diff).
+#[derive(Debug, Clone, Default)]
+pub struct ReviewContext {
+    pub archived_changes: Vec<ChangeBrief>,
+    pub changed_files: Vec<ChangedFile>,
+    pub diff: String,
 }
 
 pub struct CodeReviewer {
@@ -57,22 +86,132 @@ impl CodeReviewer {
         Ok(Self::new(client, template))
     }
 
-    pub async fn review(&self, diff: &str, change_summary: &str) -> Result<ReviewReport> {
-        let diff_for_prompt = if diff.len() > DIFF_SIZE_BUDGET {
-            // Char-boundary safe truncation: `truncate` panics on non-char
-            // boundary, so build a `String` via chars iteration.
-            let truncated: String = diff.chars().take(DIFF_SIZE_BUDGET).collect();
-            format!("[diff truncated to 100k chars]\n{truncated}")
-        } else {
-            diff.to_string()
-        };
-
+    pub async fn review(&self, context: &ReviewContext) -> Result<ReviewReport> {
+        let rendered = render_sections(context);
         let prompt = self
             .template
-            .replace("{{diff}}", &diff_for_prompt)
-            .replace("{{change_summary}}", change_summary);
+            .replace("{{change_context}}", &rendered.change_context)
+            .replace("{{changed_files}}", &rendered.changed_files)
+            .replace("{{diff}}", &rendered.diff_or_explanation);
+        log_prompt_stats(context, &rendered, prompt.len());
         let raw = self.client.complete(&prompt).await?;
         Ok(parse_response(&raw))
+    }
+}
+
+/// Emit a single INFO log line describing the rendered prompt's shape:
+/// per-section bytes, per-file bytes, total vs. budget, and any files
+/// dropped due to budget exhaustion. Operators rely on this to tell at a
+/// glance whether a review approached the prompt-budget cap.
+fn log_prompt_stats(ctx: &ReviewContext, rendered: &RenderedSections, prompt_bytes: usize) {
+    let file_sizes: String = ctx
+        .changed_files
+        .iter()
+        .map(|f| format!("{}:{}", f.path, f.contents.len()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let file_bytes_total: usize = ctx.changed_files.iter().map(|f| f.contents.len()).sum();
+    let pct = if PROMPT_BUDGET == 0 {
+        0
+    } else {
+        (prompt_bytes.saturating_mul(100) / PROMPT_BUDGET).min(999)
+    };
+    tracing::info!(
+        prompt_bytes = prompt_bytes,
+        budget = PROMPT_BUDGET,
+        pct_of_budget = pct,
+        change_context_bytes = rendered.change_context.len(),
+        changed_files_bytes = rendered.changed_files.len(),
+        diff_section_bytes = rendered.diff_or_explanation.len(),
+        files_included = ctx.changed_files.len().saturating_sub(rendered.skipped_files.len()),
+        files_skipped = rendered.skipped_files.len(),
+        diff_input_bytes = ctx.diff.len(),
+        file_count = ctx.changed_files.len(),
+        file_content_total = file_bytes_total,
+        skipped = %rendered.skipped_files.join(","),
+        files = %file_sizes,
+        "reviewer prompt built"
+    );
+}
+
+/// Rendered substitution values for the three template placeholders, sized
+/// against `PROMPT_BUDGET` in priority order. Pure function for testability.
+struct RenderedSections {
+    change_context: String,
+    changed_files: String,
+    diff_or_explanation: String,
+    /// Files whose contents were dropped to fit the budget. Empty when all
+    /// files fit. Used by `review` to log a structured warning.
+    skipped_files: Vec<String>,
+}
+
+fn render_sections(ctx: &ReviewContext) -> RenderedSections {
+    // 1. Change context — always included in full. Change briefs are
+    //    small (proposal/design/tasks of OpenSpec changes), so the
+    //    worst-case overflow here would be a misuse anyway.
+    let mut change_context = String::new();
+    for brief in &ctx.archived_changes {
+        if !change_context.is_empty() {
+            change_context.push_str("\n\n");
+        }
+        change_context.push_str(&format!("## Change: {}\n\n", brief.name));
+        change_context.push_str(brief.proposal.trim_end());
+        if let Some(design) = brief.design.as_deref() {
+            change_context.push_str("\n\n");
+            change_context.push_str(design.trim_end());
+        }
+        change_context.push_str("\n\n");
+        change_context.push_str(brief.tasks.trim_end());
+    }
+
+    // 2. Changed files — whole-file-or-skip against remaining budget.
+    let mut changed_files = String::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for file in &ctx.changed_files {
+        // Approximate next-segment size: header + blank + body + trailing
+        // separators. We don't need exact accounting; under-counting risks
+        // pushing slightly past budget, over-counting drops files that
+        // would have fit. Use a conservative additive estimate.
+        let segment_len = file.path.len() + file.contents.len() + 64;
+        let projected = change_context.len() + changed_files.len() + segment_len;
+        if projected > PROMPT_BUDGET {
+            skipped.push(file.path.clone());
+            continue;
+        }
+        if !changed_files.is_empty() {
+            changed_files.push_str("\n\n");
+        }
+        changed_files.push_str(&format!("## File: {}\n\n", file.path));
+        changed_files.push_str(&file.contents);
+    }
+    if !skipped.is_empty() {
+        if !changed_files.is_empty() {
+            changed_files.push_str("\n\n");
+        }
+        changed_files.push_str(&format!(
+            "## Skipped (budget exhausted): {}",
+            skipped.join(", ")
+        ));
+    }
+
+    // 3. Diff — all-or-explanation. The diff is dropped if any files
+    //    were skipped (the spec treats skipped files as the budget-
+    //    exhaustion signal), OR if including the diff would push the
+    //    rendered prompt past `PROMPT_BUDGET`.
+    let used = change_context.len() + changed_files.len();
+    let diff_or_explanation = if ctx.diff.is_empty() {
+        String::from("(no diff produced this pass)")
+    } else if !skipped.is_empty() || used + ctx.diff.len() > PROMPT_BUDGET {
+        String::from("(diff omitted: budget exhausted by change context and changed files)")
+    } else {
+        ctx.diff.clone()
+    };
+
+    RenderedSections {
+        change_context,
+        changed_files,
+        diff_or_explanation,
+        skipped_files: skipped,
     }
 }
 
@@ -203,45 +342,176 @@ mod tests {
         assert_eq!(r.verdict, ReviewVerdict::Concerns);
     }
 
-    #[tokio::test]
-    async fn truncates_huge_diff() {
-        let big_diff = "x".repeat(DIFF_SIZE_BUDGET + 5_000);
-        let (client, captured) = stub_with_capture("VERDICT: Pass\n");
-        let reviewer = CodeReviewer::new(client, "diff: {{diff}}".to_string());
-        reviewer.review(&big_diff, "summary").await.unwrap();
-
-        let prompt = captured.lock().unwrap().clone().unwrap();
-        assert!(
-            prompt.contains("[diff truncated to 100k chars]"),
-            "truncation marker must be present in prompt"
-        );
-        let xs_count = prompt.matches('x').count();
-        assert_eq!(
-            xs_count, DIFF_SIZE_BUDGET,
-            "expected exactly {DIFF_SIZE_BUDGET} x chars in prompt; got {xs_count}"
-        );
+    fn ctx_with_diff(diff: &str) -> ReviewContext {
+        ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: Vec::new(),
+            diff: diff.to_string(),
+        }
     }
 
     #[tokio::test]
     async fn substitutes_template_variables() {
         let (client, captured) = stub_with_capture("VERDICT: Pass\n");
-        let template = "summary={{change_summary}}\nDIFF<<<{{diff}}>>>".to_string();
+        let template = "ctx={{change_context}}\nFILES<<<{{changed_files}}>>>\nDIFF<<<{{diff}}>>>"
+            .to_string();
         let reviewer = CodeReviewer::new(client, template);
-        reviewer.review("the diff content", "my summary").await.unwrap();
+        let ctx = ReviewContext {
+            archived_changes: vec![ChangeBrief {
+                name: "demo".into(),
+                proposal: "## Why\nfor reasons".into(),
+                design: None,
+                tasks: "- [x] do thing".into(),
+            }],
+            changed_files: vec![ChangedFile {
+                path: "src/foo.rs".into(),
+                contents: "fn foo() {}".into(),
+            }],
+            diff: "the diff content".into(),
+        };
+        reviewer.review(&ctx).await.unwrap();
 
         let prompt = captured.lock().unwrap().clone().unwrap();
-        assert!(prompt.contains("summary=my summary"), "got: {prompt}");
+        assert!(prompt.contains("ctx=## Change: demo"), "got: {prompt}");
+        assert!(prompt.contains("FILES<<<## File: src/foo.rs"), "got: {prompt}");
+        assert!(prompt.contains("fn foo() {}"));
         assert!(prompt.contains("DIFF<<<the diff content>>>"), "got: {prompt}");
     }
 
     #[tokio::test]
-    async fn under_budget_diff_is_not_truncated() {
+    async fn small_diff_is_passed_through_verbatim() {
         let small_diff = "x".repeat(100);
         let (client, captured) = stub_with_capture("VERDICT: Pass\n");
         let reviewer = CodeReviewer::new(client, "{{diff}}".to_string());
-        reviewer.review(&small_diff, "summary").await.unwrap();
+        reviewer.review(&ctx_with_diff(&small_diff)).await.unwrap();
         let prompt = captured.lock().unwrap().clone().unwrap();
-        assert!(!prompt.contains("[diff truncated"), "small diff must not be truncated");
+        assert_eq!(prompt.matches('x').count(), 100);
+        assert!(!prompt.contains("budget exhausted"));
+    }
+
+    /// Priority order: change context appears before changed files, which
+    /// appear before the diff.
+    #[tokio::test]
+    async fn review_renders_change_context_before_files_before_diff() {
+        let (client, captured) = stub_with_capture("VERDICT: Pass\n");
+        let template = "{{change_context}}|{{changed_files}}|{{diff}}".to_string();
+        let reviewer = CodeReviewer::new(client, template);
+        let ctx = ReviewContext {
+            archived_changes: vec![ChangeBrief {
+                name: "alpha".into(),
+                proposal: "PROP_SENTINEL".into(),
+                design: None,
+                tasks: "TASKS_SENTINEL".into(),
+            }],
+            changed_files: vec![ChangedFile {
+                path: "src/a.rs".into(),
+                contents: "FILE_SENTINEL".into(),
+            }],
+            diff: "DIFF_SENTINEL".into(),
+        };
+        reviewer.review(&ctx).await.unwrap();
+        let prompt = captured.lock().unwrap().clone().unwrap();
+        let prop_i = prompt.find("PROP_SENTINEL").expect("proposal present");
+        let file_i = prompt.find("FILE_SENTINEL").expect("file present");
+        let diff_i = prompt.find("DIFF_SENTINEL").expect("diff present");
+        assert!(prop_i < file_i, "change context must precede files");
+        assert!(file_i < diff_i, "files must precede diff");
+    }
+
+    /// Two files large enough to bust the budget together: the second one
+    /// is skipped, listed in the skip footer, and the diff is replaced by
+    /// the budget-exhausted explanation.
+    #[tokio::test]
+    async fn skips_files_when_budget_exhausts() {
+        let (client, captured) = stub_with_capture("VERDICT: Pass\n");
+        let template = "{{change_context}}|{{changed_files}}|{{diff}}".to_string();
+        let reviewer = CodeReviewer::new(client, template);
+        // Each file ~1.5MB; together they exceed the 2MB budget.
+        let big = "y".repeat(1_500_000);
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![
+                ChangedFile {
+                    path: "first.rs".into(),
+                    contents: big.clone(),
+                },
+                ChangedFile {
+                    path: "second.rs".into(),
+                    contents: big.clone(),
+                },
+            ],
+            diff: "DIFF_SENTINEL".into(),
+        };
+        reviewer.review(&ctx).await.unwrap();
+        let prompt = captured.lock().unwrap().clone().unwrap();
+        assert!(prompt.contains("first.rs"), "first file must be present");
+        assert!(
+            prompt.contains("## Skipped (budget exhausted): second.rs"),
+            "second file must be in skip list; got prompt of {} bytes",
+            prompt.len()
+        );
+        assert!(
+            prompt.contains("(diff omitted: budget exhausted by change context and changed files)"),
+            "diff must be replaced by the budget-exhausted explanation"
+        );
+        assert!(
+            !prompt.contains("DIFF_SENTINEL"),
+            "actual diff must not appear when budget is exhausted"
+        );
+    }
+
+    /// A single file larger than the whole budget: file is skipped in
+    /// full (never partially included).
+    #[tokio::test]
+    async fn never_truncates_individual_file() {
+        let (client, captured) = stub_with_capture("VERDICT: Pass\n");
+        let reviewer = CodeReviewer::new(client, "{{changed_files}}".to_string());
+        let huge = "z".repeat(PROMPT_BUDGET + 100_000);
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "huge.rs".into(),
+                contents: huge,
+            }],
+            diff: String::new(),
+        };
+        reviewer.review(&ctx).await.unwrap();
+        let prompt = captured.lock().unwrap().clone().unwrap();
+        // Either fully present or fully skipped — no partial slice. With
+        // ~2.1MB content vs 2MB budget, we expect "skipped".
+        assert!(
+            prompt.contains("## Skipped (budget exhausted): huge.rs"),
+            "huge file must be wholly skipped"
+        );
+        // The actual content (`zzz...`) must NOT have leaked into the
+        // prompt — if it did, we'd see thousands of 'z' characters.
+        let z_count = prompt.matches('z').count();
+        assert_eq!(z_count, 0, "no partial file contents should leak into prompt");
+    }
+
+    /// Pure-function test for `render_sections`: verifies priority order
+    /// and skip-list behavior without needing a stub LLM client.
+    #[test]
+    fn render_sections_priority_order_pure() {
+        let ctx = ReviewContext {
+            archived_changes: vec![ChangeBrief {
+                name: "x".into(),
+                proposal: "P".into(),
+                design: Some("D".into()),
+                tasks: "T".into(),
+            }],
+            changed_files: vec![ChangedFile {
+                path: "a.rs".into(),
+                contents: "BODY".into(),
+            }],
+            diff: "DELTA".into(),
+        };
+        let r = render_sections(&ctx);
+        assert!(r.change_context.contains("## Change: x"));
+        assert!(r.change_context.contains("P\n\nD\n\nT"));
+        assert!(r.changed_files.contains("## File: a.rs"));
+        assert!(r.changed_files.contains("BODY"));
+        assert_eq!(r.diff_or_explanation, "DELTA");
     }
 
     #[test]

@@ -2,7 +2,7 @@ You are reviewing code quality only. Do NOT assess whether the diff implements t
 
 # Your task
 
-Review the unified diff below for code-quality concerns. Produce a structured review that a human maintainer will read inside the PR body.
+Review the code below for code-quality concerns. The material is structured in priority order: first the OpenSpec change(s) that motivated the work, then the full contents of every file modified, and finally the unified diff. Use the change context to understand the intent; use the full file contents to evaluate the resulting code; use the diff to see exactly what changed.
 
 # Scope
 
@@ -49,11 +49,15 @@ The first non-empty line MUST be `VERDICT:` followed by exactly one of `Pass`, `
 - **Concerns** when issues warrant a discussion or follow-up but the diff is mergeable.
 - **Block** when at least one issue would cause real harm if merged: a security vulnerability, data-loss bug, or breakage of an existing invariant.
 
-If the diff was truncated (you will see a `[diff truncated to 100k chars]` marker), acknowledge truncation in your first bullet under "Possible bugs" and bias toward `Concerns` over `Pass` since you cannot see the full picture.
+If you see a `## Skipped (budget exhausted)` line under "Changed files" or a `(diff omitted: budget exhausted by change context and changed files)` line under "Diff", some context was dropped to fit the prompt budget. Acknowledge the missing context in your first bullet under "Possible bugs" and bias toward `Concerns` over `Pass`.
 
-# Change summary
+# Change context
 
-{{change_summary}}
+{{change_context}}
+
+# Changed files (full contents)
+
+{{changed_files}}
 
 # Diff
 

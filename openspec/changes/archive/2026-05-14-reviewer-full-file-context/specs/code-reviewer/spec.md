@@ -1,8 +1,5 @@
-# code-reviewer Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change reviewer-integration. Update Purpose after archive.
-## Requirements
 ### Requirement: AI-driven code-quality review
 The code-reviewer SHALL accept a structured `ReviewContext` containing the archived-change briefs, full contents of every file modified by the pass, and the unified diff, then send a rendered prompt to a configured LLM API and return a `ReviewReport { verdict, markdown }`. The review SHALL focus on code quality (security, error handling, naming, style, language idioms, obvious bugs) and SHALL NOT assess whether the diff correctly implements any spec — that is a separate verification concern handled in its own change.
 

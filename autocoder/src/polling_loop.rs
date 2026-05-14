@@ -105,9 +105,8 @@ pub async fn execute_one_pass(
     let (review_report, draft) = match reviewer {
         None => (None, false),
         Some(r) => {
-            let diff = git::diff_three_dot(workspace, &repo.base_branch, &repo.agent_branch)?;
-            let summary = build_change_summary(&processed);
-            match r.review(&diff, &summary).await {
+            let ctx = build_review_context(workspace, repo, &processed)?;
+            match r.review(&ctx).await {
                 Ok(report) => {
                     let draft = matches!(report.verdict, ReviewVerdict::Block);
                     (Some(report), draft)
@@ -134,12 +133,94 @@ pub async fn execute_one_pass(
     Ok(())
 }
 
-fn build_change_summary(processed: &[String]) -> String {
-    let mut s = String::from("Changes implemented in this pass:\n");
-    for change in processed {
-        s.push_str(&format!("- {change}\n"));
+/// Assemble the `ReviewContext` for the reviewer: archived-change briefs
+/// (proposal/design/tasks), full contents of every modified file, and the
+/// unified diff. Reviewer enforces the 2M-char prompt budget when
+/// rendering; this builder is unconstrained — it gathers everything and
+/// lets the reviewer drop/include in priority order.
+fn build_review_context(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    processed: &[String],
+) -> Result<crate::code_reviewer::ReviewContext> {
+    let diff = git::diff_three_dot(workspace, &repo.base_branch, &repo.agent_branch)?;
+    let file_list =
+        git::diff_files_changed(workspace, &repo.base_branch, &repo.agent_branch)?;
+
+    let mut changed_files = Vec::with_capacity(file_list.len());
+    for path in &file_list {
+        let abs = workspace.join(path);
+        match std::fs::read_to_string(&abs) {
+            Ok(contents) => changed_files.push(crate::code_reviewer::ChangedFile {
+                path: path.clone(),
+                contents,
+            }),
+            // Deleted files appear in the diff but have no current
+            // content. Their removal is captured by the diff itself.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path,
+                    "skipping changed-file read for reviewer: {e}"
+                );
+                continue;
+            }
+        }
     }
-    s
+
+    let archive_root = workspace.join("openspec/changes/archive");
+    let mut archived_changes = Vec::with_capacity(processed.len());
+    for name in processed {
+        let dir = match locate_archive_dir(&archive_root, name)? {
+            Some(d) => d,
+            None => {
+                tracing::warn!(
+                    change = %name,
+                    "archive directory not found while building review context"
+                );
+                continue;
+            }
+        };
+        let proposal = std::fs::read_to_string(dir.join("proposal.md")).unwrap_or_default();
+        let design = std::fs::read_to_string(dir.join("design.md")).ok();
+        let tasks = std::fs::read_to_string(dir.join("tasks.md")).unwrap_or_default();
+        archived_changes.push(crate::code_reviewer::ChangeBrief {
+            name: name.clone(),
+            proposal,
+            design,
+            tasks,
+        });
+    }
+
+    Ok(crate::code_reviewer::ReviewContext {
+        archived_changes,
+        changed_files,
+        diff,
+    })
+}
+
+/// Find the date-prefixed archive directory matching the given change name
+/// (e.g. `openspec/changes/archive/2026-05-14-foo/` for `foo`). Returns
+/// `Ok(None)` if no matching directory exists.
+fn locate_archive_dir(archive_root: &Path, change: &str) -> Result<Option<std::path::PathBuf>> {
+    if !archive_root.is_dir() {
+        return Ok(None);
+    }
+    let suffix = format!("-{change}");
+    for entry in std::fs::read_dir(archive_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if name.ends_with(&suffix) {
+            return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
 }
 
 /// Run a polling pass up to and including any commits, but stop before push
@@ -1932,9 +2013,9 @@ mod tests {
             // Now exercise the reviewer step's compose path manually,
             // mirroring what execute_one_pass does between
             // `run_pass_through_commits` and `open_pull_request`.
-            let diff = crate::git::diff_three_dot(&ws, "main", "agent-q").unwrap();
-            let summary = build_change_summary(&processed);
-            let (report, draft) = match reviewer.review(&diff, &summary).await {
+            let ctx = build_review_context(&ws, &fixture_repo(&ws), &processed)
+                .expect("build_review_context succeeds");
+            let (report, draft) = match reviewer.review(&ctx).await {
                 Ok(report) => {
                     let draft = matches!(report.verdict, ReviewVerdict::Block);
                     (Some(report), draft)

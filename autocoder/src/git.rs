@@ -234,6 +234,25 @@ pub fn diff_three_dot(workspace: &Path, base: &str, head: &str) -> Result<String
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Return the name-only file list for the three-dot diff between `base`
+/// and `head`. Equivalent to `git diff --name-only <base>...<head>`.
+/// Empty lines are filtered. Each entry is a workspace-relative path.
+pub fn diff_files_changed(workspace: &Path, base: &str, head: &str) -> Result<Vec<String>> {
+    let range = format!("{base}...{head}");
+    let output = run_git(
+        workspace,
+        "diff --name-only",
+        &["diff", "--name-only", &range],
+    )?;
+    let raw = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
