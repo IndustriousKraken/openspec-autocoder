@@ -496,6 +496,14 @@ Override the default with `reviewer.prompt_template_path`. Custom templates are 
 
 The template must include the three substitution variables `{{change_context}}`, `{{changed_files}}`, and `{{diff}}`, and must instruct the model to begin its response with `VERDICT: Pass`, `VERDICT: Concerns`, or `VERDICT: Block`. A template still using the retired `{{change_summary}}` placeholder (pre-`reviewer-full-file-context`) will not substitute — the literal text appears in the rendered prompt. Migrate by replacing `{{change_summary}}` with `{{change_context}}`.
 
+### PR composition
+
+Every PR autocoder opens carries the change list in its body, plus the optional `## Code Review` section described above. Immediately after creation, autocoder posts a single follow-up issue comment titled `## Agent implementation notes` with one `### <change-name>` subsection per change in the pass. Each subsection contains the implementer agent's captured stdout from that change's run — the agent's own narrative of what it did, deviations from the spec, and any meta-observations.
+
+The comment is best-effort: if the POST fails, the PR still ships and the failure is logged at ERROR. Source for each section is `<system-temp>/autocoder/logs/<workspace-basename>/<change>.log` (the same per-change log file written by the executor); a missing or unreadable log is logged at WARN and that change's section is omitted. If every change's log is missing, no comment is posted.
+
+The total comment body is capped at 60,000 characters (under GitHub's 65,535 limit, with headroom for wrapper text). When truncated, the tail is replaced with a marker pointing back at `/tmp/autocoder/logs/<basename>/<change>.log` so reviewers can fetch the full output server-side.
+
 ---
 
 ## Operating Notes

@@ -106,6 +106,69 @@ pub fn marker_path(workspace: &Path) -> PathBuf {
         .join(format!("{basename}.json"))
 }
 
+/// Compute the subprocess-sidecar path for the given workspace.
+/// `<system-temp>/autocoder/busy/<workspace-basename>.subprocess`. The file
+/// holds the spawned subprocess's PID (= PGID, since the executor spawns
+/// with `process_group(0)`) so stuck-state recovery can target the right
+/// process group when the daemon's own pgid does not cover orphaned
+/// children.
+pub fn subprocess_marker_path(workspace: &Path) -> PathBuf {
+    let basename = workspace
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+    std::env::temp_dir()
+        .join("autocoder")
+        .join("busy")
+        .join(format!("{basename}.subprocess"))
+}
+
+/// Atomically record `pid` to the subprocess-sidecar file for `workspace`.
+/// Writes via temp-file-then-rename so concurrent readers never see a
+/// partial value.
+pub fn write_subprocess_marker(workspace: &Path, pid: u32) -> Result<()> {
+    let path = subprocess_marker_path(workspace);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating subprocess-marker dir {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("subprocess.tmp");
+    std::fs::write(&tmp, format!("{pid}\n"))
+        .with_context(|| format!("writing subprocess-marker temp {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| {
+        format!(
+            "renaming subprocess-marker {} -> {}",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Best-effort read of the subprocess-sidecar file. Returns `None` if the
+/// file is absent, unreadable, or fails to parse — recovery never
+/// propagates errors out of this read because the sidecar is diagnostic.
+pub fn read_subprocess_marker(workspace: &Path) -> Option<i32> {
+    let path = subprocess_marker_path(workspace);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let first = raw.split_whitespace().next()?;
+    first.parse::<i32>().ok()
+}
+
+/// Best-effort removal of the subprocess-sidecar file. Silent on
+/// `NotFound`; WARN-logs other errors so recovery can continue.
+pub fn remove_subprocess_marker(workspace: &Path) {
+    let path = subprocess_marker_path(workspace);
+    if let Err(e) = std::fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %path.display(),
+                "busy_marker: failed to remove subprocess marker: {e}"
+            );
+        }
+    }
+}
+
 /// Try to acquire the busy marker for the given workspace.
 ///
 /// `stuck_threshold_secs` is the age above which an existing marker is
@@ -177,6 +240,7 @@ pub fn try_acquire_with(
                             "busy_marker: existing file is malformed ({parse_err:#}); deleting and retrying"
                         );
                         let _ = std::fs::remove_file(&path);
+                        remove_subprocess_marker(workspace);
                         if attempt == 0 {
                             continue;
                         }
@@ -202,6 +266,7 @@ pub fn try_acquire_with(
                         "busy_marker: stale (PID dead); clearing and acquiring"
                     );
                     let _ = std::fs::remove_file(&path);
+                    remove_subprocess_marker(workspace);
                     if attempt == 0 {
                         continue;
                     }
@@ -235,21 +300,43 @@ pub fn try_acquire_with(
                 // PID alive and (comm matches OR comm-check unavailable):
                 // assume it's our own stuck process. Kill the group and
                 // clear the file.
+                //
+                // Precedence: prefer the subprocess sidecar's PGID over
+                // the marker's `pgid` field. The marker records
+                // autocoder's *own* process group (via `getpgrp()` at
+                // acquire time), but the kill target an orphan-cleanup
+                // needs is the spawned subprocess (Claude), which lives
+                // in its own group (= its PID, since the executor
+                // spawns with `process_group(0)`). The sidecar carries
+                // that PID. Fall back to the marker's `pgid` only when
+                // no sidecar exists (older daemon, or the subprocess
+                // never started).
+                let sidecar_pid = read_subprocess_marker(workspace);
+                let target_pgid = sidecar_pid.unwrap_or(existing.pgid);
+                let wait_pid: u32 = match sidecar_pid {
+                    Some(p) if p > 0 => p as u32,
+                    _ => existing.pid,
+                };
                 tracing::warn!(
                     path = %path.display(),
                     pid = existing.pid,
-                    pgid = existing.pgid,
+                    marker_pgid = existing.pgid,
+                    sidecar_pgid = ?sidecar_pid,
+                    target_pgid,
                     age_secs,
                     stage = %existing.stage.as_str(),
                     "busy_marker: stuck (PID alive past threshold); killing process group and clearing"
                 );
-                ops.killpg_terminate(existing.pgid);
-                // SIGKILL fallback after a short grace window.
-                ops.wait_for_exit(existing.pid, Duration::from_secs(5));
-                if ops.pid_alive(existing.pid) {
-                    ops.killpg_kill(existing.pgid);
+                ops.killpg_terminate(target_pgid);
+                // SIGKILL fallback after a short grace window. Wait on
+                // the actual subprocess PID (sidecar) when present so
+                // we observe the orphaned tree's exit, not autocoder's.
+                ops.wait_for_exit(wait_pid, Duration::from_secs(5));
+                if ops.pid_alive(wait_pid) {
+                    ops.killpg_kill(target_pgid);
                 }
                 let _ = std::fs::remove_file(&path);
+                remove_subprocess_marker(workspace);
                 if attempt == 0 {
                     continue;
                 }
@@ -524,8 +611,12 @@ mod tests {
         let ops = MockOps::new().with_alive(99999).with_comm(99999, "claude");
         match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
             Ok(AcquireOutcome::Acquired(guard)) => {
-                // killpg_terminate must have been called on the recorded
-                // pgid (1234 from pre_populate_marker).
+                // Precedence rule: stuck-recovery prefers the subprocess
+                // sidecar's PGID over the marker's `pgid`. This test
+                // pre-populates only the marker (no sidecar), so the
+                // fallback path is exercised — killpg_terminate must
+                // target the marker's pgid (1234 from
+                // pre_populate_marker).
                 let term = ops.killpg_terminate_called.lock().unwrap().clone();
                 assert_eq!(term, vec![1234], "SIGTERM to pgid 1234 expected");
                 drop(guard);
@@ -594,5 +685,132 @@ mod tests {
     fn age_secs_treats_future_started_at_as_zero() {
         let future = chrono::Utc::now() + chrono::Duration::seconds(60);
         assert_eq!(age_secs(&future), 0);
+    }
+
+    /// Pre-populate a sidecar file at `subprocess_marker_path(workspace)`
+    /// containing `pid` so stuck-recovery can read it as the kill target.
+    fn pre_populate_subprocess_marker(workspace: &Path, pid: i32) {
+        let path = subprocess_marker_path(workspace);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{pid}\n")).unwrap();
+    }
+
+    /// When a sidecar is present alongside a stuck marker, the sidecar's
+    /// PGID is the kill target — the marker's `pgid` is ignored. Both
+    /// files must be removed before the new marker is acquired.
+    #[test]
+    fn stuck_recovery_uses_sidecar_pgid_when_present() {
+        let (_dir, ws) = fixture_workspace();
+        pre_populate_marker(&ws, 99999, "claude", 3600); // marker.pgid = 1234
+        pre_populate_subprocess_marker(&ws, 5678);
+        let ops = MockOps::new().with_alive(99999).with_comm(99999, "claude");
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
+            Ok(AcquireOutcome::Acquired(guard)) => {
+                let term = ops.killpg_terminate_called.lock().unwrap().clone();
+                assert_eq!(
+                    term,
+                    vec![5678],
+                    "SIGTERM must go to sidecar's PGID (5678), not marker's pgid (1234)"
+                );
+                // Sidecar was cleared as part of the kill sequence; new
+                // marker (held by `guard`) should not be accompanied by
+                // a stale sidecar.
+                assert!(
+                    !subprocess_marker_path(&ws).exists(),
+                    "sidecar must be removed after stuck-recovery"
+                );
+                drop(guard);
+                assert!(
+                    !marker_path(&ws).exists(),
+                    "marker must be removed when guard is dropped"
+                );
+            }
+            _ => panic!("expected Acquired after killing stuck process"),
+        }
+    }
+
+    /// Backward-compat path: when no sidecar exists, the marker's `pgid`
+    /// is the fallback kill target. Behavior matches the pre-sidecar
+    /// implementation.
+    #[test]
+    fn stuck_recovery_falls_back_to_marker_pgid_when_no_sidecar() {
+        let (_dir, ws) = fixture_workspace();
+        pre_populate_marker(&ws, 99999, "claude", 3600); // marker.pgid = 1234
+        // No sidecar pre-written.
+        let ops = MockOps::new().with_alive(99999).with_comm(99999, "claude");
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
+            Ok(AcquireOutcome::Acquired(guard)) => {
+                let term = ops.killpg_terminate_called.lock().unwrap().clone();
+                assert_eq!(
+                    term,
+                    vec![1234],
+                    "without sidecar, SIGTERM must fall back to marker's pgid"
+                );
+                drop(guard);
+            }
+            _ => panic!("expected Acquired after killing stuck process"),
+        }
+    }
+
+    /// Round-trip: write_subprocess_marker → read_subprocess_marker
+    /// returns the same PID; remove_subprocess_marker → read returns
+    /// None.
+    #[test]
+    fn write_and_read_subprocess_marker_roundtrip() {
+        let (_dir, ws) = fixture_workspace();
+        write_subprocess_marker(&ws, 99).unwrap();
+        assert_eq!(read_subprocess_marker(&ws), Some(99));
+        remove_subprocess_marker(&ws);
+        assert_eq!(read_subprocess_marker(&ws), None);
+    }
+
+    /// A sidecar containing non-numeric content yields None (no panic).
+    /// Recovery is best-effort: garbage is treated the same as absent.
+    #[test]
+    fn read_subprocess_marker_returns_none_on_garbage() {
+        let (_dir, ws) = fixture_workspace();
+        let path = subprocess_marker_path(&ws);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not a number\n").unwrap();
+        assert_eq!(read_subprocess_marker(&ws), None);
+        // Cleanup so subsequent tests don't see the leftover file.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Stale-dead-PID branch must clear the sidecar in addition to the
+    /// marker so the two files stay consistent across iterations.
+    #[test]
+    fn stale_dead_pid_also_removes_sidecar() {
+        let (_dir, ws) = fixture_workspace();
+        pre_populate_marker(&ws, 99999, "claude", 3600);
+        pre_populate_subprocess_marker(&ws, 5678);
+        // MockOps with no alive PIDs → pid_alive(99999) returns false →
+        // stale-dead branch fires.
+        let ops = MockOps::new();
+        match try_acquire_with(&ws, "git@github.com:test/repo.git", 1800, &ops) {
+            Ok(AcquireOutcome::Acquired(guard)) => {
+                assert!(
+                    !subprocess_marker_path(&ws).exists(),
+                    "sidecar must be removed in the stale-dead branch"
+                );
+                drop(guard);
+                assert!(
+                    !marker_path(&ws).exists(),
+                    "marker must be removed when guard is dropped"
+                );
+            }
+            _ => panic!("expected Acquired after clearing stale-dead marker"),
+        }
+    }
+
+    #[test]
+    fn subprocess_marker_path_layout_under_autocoder_busy() {
+        let path = subprocess_marker_path(Path::new(
+            "/tmp/workspaces/github_com_owner_repo",
+        ));
+        let s = path.to_string_lossy();
+        assert!(s.contains("autocoder"));
+        assert!(s.contains("busy"));
+        assert!(s.ends_with("github_com_owner_repo.subprocess"));
     }
 }

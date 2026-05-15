@@ -13,6 +13,15 @@ struct PullResponse {
     number: u64,
 }
 
+/// The fields autocoder cares about from a freshly-created PR. Returned by
+/// `create_pull_request` so the caller can route follow-up work (e.g.
+/// posting an implementer-summary issue comment) to the new PR.
+#[derive(Debug, Clone)]
+pub struct CreatedPr {
+    pub html_url: String,
+    pub number: u64,
+}
+
 /// One element of a `GET /pulls?...` response. Only the fields autocoder
 /// consults are deserialized; everything else in the API payload is
 /// ignored.
@@ -157,7 +166,7 @@ pub async fn create_pull_request(
     token: &str,
     review_report: Option<&ReviewReport>,
     draft: bool,
-) -> Result<String> {
+) -> Result<CreatedPr> {
     create_pull_request_at(
         DEFAULT_API_BASE,
         owner,
@@ -189,7 +198,7 @@ pub(crate) async fn create_pull_request_at_for_test(
     token: &str,
     review_report: Option<&ReviewReport>,
     draft: bool,
-) -> Result<String> {
+) -> Result<CreatedPr> {
     create_pull_request_at(
         api_base,
         owner,
@@ -217,7 +226,7 @@ async fn create_pull_request_at(
     token: &str,
     review_report: Option<&ReviewReport>,
     draft: bool,
-) -> Result<String> {
+) -> Result<CreatedPr> {
     let composed_body = compose_body(body, review_report);
     let client = reqwest::Client::new();
     let url = format!("{api_base}/repos/{owner}/{repo}/pulls");
@@ -251,7 +260,10 @@ async fn create_pull_request_at(
             .json()
             .await
             .map_err(|e| anyhow!("github pr response decode failed: {e}"))?;
-        return Ok(parsed.html_url);
+        return Ok(CreatedPr {
+            html_url: parsed.html_url,
+            number: parsed.number,
+        });
     }
 
     let first_body = first.text().await.unwrap_or_default();
@@ -304,7 +316,71 @@ async fn create_pull_request_at(
         "draft unsupported; applied do-not-merge label as fallback"
     );
 
-    Ok(parsed.html_url)
+    Ok(CreatedPr {
+        html_url: parsed.html_url,
+        number: parsed.number,
+    })
+}
+
+/// Post an issue comment to a PR (issues and PRs share the comments
+/// endpoint on GitHub). Best-effort: returns Ok on 2xx, Err on non-2xx
+/// with the status code and a 500-char body snippet.
+pub async fn create_issue_comment(
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+    body: &str,
+    token: &str,
+) -> Result<()> {
+    create_issue_comment_at(DEFAULT_API_BASE, owner, repo, issue_number, body, token).await
+}
+
+/// Test-only re-export of the internal `create_issue_comment_at`. Lets
+/// sibling-module tests exercise the comment-post HTTP path against a
+/// mockito server.
+#[cfg(test)]
+pub(crate) async fn create_issue_comment_at_for_test(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+    body: &str,
+    token: &str,
+) -> Result<()> {
+    create_issue_comment_at(api_base, owner, repo, issue_number, body, token).await
+}
+
+async fn create_issue_comment_at(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+    body: &str,
+    token: &str,
+) -> Result<()> {
+    let url = format!("{api_base}/repos/{owner}/{repo}/issues/{issue_number}/comments");
+    let payload = serde_json::json!({ "body": body });
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| anyhow!("github issue-comment POST failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let snippet: String = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github issue-comment POST {owner}/{repo}#{issue_number} returned {status}: {snippet}"
+        ));
+    }
+    Ok(())
 }
 
 /// Compose the PR body: the existing body, optionally followed by a
@@ -552,7 +628,7 @@ mod tests {
             .create_async()
             .await;
 
-        let url = create_pull_request_at(
+        let pr = create_pull_request_at(
             &server.url(),
             "owner",
             "repo",
@@ -567,7 +643,8 @@ mod tests {
         .await
         .expect("PR creation should succeed");
 
-        assert_eq!(url, "https://github.com/owner/repo/pull/1");
+        assert_eq!(pr.html_url, "https://github.com/owner/repo/pull/1");
+        assert_eq!(pr.number, 1);
         mock.assert_async().await;
     }
 
@@ -761,7 +838,7 @@ mod tests {
             .create_async()
             .await;
 
-        let url = create_pull_request_at(
+        let pr = create_pull_request_at(
             &server.url(),
             "owner",
             "repo",
@@ -776,7 +853,8 @@ mod tests {
         .await
         .expect("fallback path should succeed");
 
-        assert_eq!(url, "https://github.com/owner/repo/pull/4");
+        assert_eq!(pr.html_url, "https://github.com/owner/repo/pull/4");
+        assert_eq!(pr.number, 4);
         first.assert_async().await;
         second.assert_async().await;
         label.assert_async().await;
@@ -843,6 +921,61 @@ mod tests {
 
         assert!(prs.is_empty());
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn create_issue_comment_posts_to_expected_endpoint() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/repos/owner/repo/issues/42/comments")
+            .match_header("authorization", "Bearer testtoken")
+            .match_header("accept", "application/vnd.github+json")
+            .match_header("user-agent", "openspec-autocoder")
+            .match_body(mockito::Matcher::PartialJsonString(
+                "{\"body\":\"## Agent implementation notes\\n\\nhello\"}".to_string(),
+            ))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body("{\"id\":12345,\"body\":\"## Agent implementation notes\\n\\nhello\"}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        create_issue_comment_at_for_test(
+            &server.url(),
+            "owner",
+            "repo",
+            42,
+            "## Agent implementation notes\n\nhello",
+            "testtoken",
+        )
+        .await
+        .expect("issue-comment POST should succeed on 201");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn create_issue_comment_errors_on_non_2xx() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/repos/owner/repo/issues/42/comments")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+
+        let err = create_issue_comment_at_for_test(
+            &server.url(),
+            "owner",
+            "repo",
+            42,
+            "anything",
+            "testtoken",
+        )
+        .await
+        .expect_err("404 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("404"), "error must name status code; got: {msg}");
     }
 
     #[tokio::test]
