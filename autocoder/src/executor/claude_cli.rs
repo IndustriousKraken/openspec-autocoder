@@ -337,6 +337,28 @@ impl ClaudeCliExecutor {
             .spawn()
             .with_context(|| format!("spawning executor command `{}`", self.command))?;
 
+        // Record the spawned child's PID to a sidecar file so the busy-
+        // marker's stuck-state recovery has a kill target that actually
+        // covers Claude's process group (the marker's own `pgid` records
+        // autocoder's group, not Claude's). The guard cleans the file up
+        // on every exit path of this function.
+        let _subprocess_marker_guard = if let Some(pid) = child.id() {
+            if let Err(e) = crate::busy_marker::write_subprocess_marker(workspace, pid) {
+                tracing::warn!(
+                    workspace = %workspace.display(),
+                    pid,
+                    "failed to write subprocess sidecar marker (run continues): {e:#}"
+                );
+                None
+            } else {
+                Some(SubprocessMarkerGuard {
+                    workspace: workspace.to_path_buf(),
+                })
+            }
+        } else {
+            None
+        };
+
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(prompt.as_bytes()).await;
         }
@@ -479,6 +501,21 @@ impl Drop for TempFileGuard {
                 "failed to remove sandbox settings temp file: {e}"
             );
         }
+    }
+}
+
+/// RAII guard that removes the subprocess-PID sidecar when dropped.
+/// Constructed in `run_subprocess` after the sidecar file is successfully
+/// written; ensures the file is gone on success, error, or panic so the
+/// next iteration's busy-marker recovery only sees a sidecar when an
+/// actual orphan exists (i.e. the daemon crashed before Drop ran).
+struct SubprocessMarkerGuard {
+    workspace: PathBuf,
+}
+
+impl Drop for SubprocessMarkerGuard {
+    fn drop(&mut self) {
+        crate::busy_marker::remove_subprocess_marker(&self.workspace);
     }
 }
 
