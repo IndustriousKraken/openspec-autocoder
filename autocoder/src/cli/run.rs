@@ -2,20 +2,22 @@
 //! configured repository and waits for shutdown signal (SIGINT/SIGTERM) or
 //! all tasks to finish.
 
-use crate::chatops::{self, ChatOpsBackend};
+use crate::chatops;
 use crate::code_reviewer::CodeReviewer;
 use crate::config::{Config, ExecutorKind, GithubConfig, NotificationsConfig, RepositoryConfig};
+use crate::control_socket::{self, ChatOpsHolder, ChatOpsSlot, ControlState, GithubHolder, ReviewerHolder};
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
 use crate::github::parse_repo_url;
 use crate::github_credentials::resolve_token_with_source;
-use crate::polling_loop::ChatOpsContext;
 use crate::{git, polling_loop, workspace};
 use anyhow::{Context, Result, anyhow};
+use arc_swap::ArcSwap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-pub async fn execute(cfg: Config) -> Result<()> {
+pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
     openspec_preflight()?;
     workspace::detect_collisions(&cfg.repositories)?;
     validate_github_token_routes(&cfg.github, &cfg.repositories)?;
@@ -28,7 +30,7 @@ pub async fn execute(cfg: Config) -> Result<()> {
         ),
     };
 
-    let reviewer: Option<Arc<CodeReviewer>> = match cfg.reviewer.as_ref() {
+    let reviewer_initial: Option<Arc<CodeReviewer>> = match cfg.reviewer.as_ref() {
         Some(rcfg) if rcfg.enabled => {
             let r = CodeReviewer::from_config(rcfg)
                 .context("initializing code reviewer from config")?;
@@ -45,19 +47,30 @@ pub async fn execute(cfg: Config) -> Result<()> {
         }
     };
 
-    let chatops: Option<Arc<dyn ChatOpsBackend>> = match cfg.chatops.as_ref() {
+    let chatops_initial: Option<ChatOpsSlot> = match cfg.chatops.as_ref() {
         Some(co) => {
             let backend = chatops::from_config(co)
                 .await
                 .context("initializing chatops backend from config")?;
             emit_chatops_startup_log(backend.provider_name(), backend.is_experimental());
-            Some(backend)
+            Some(ChatOpsSlot {
+                backend,
+                default_channel_id: co.default_channel_id.clone(),
+                start_work_enabled: NotificationsConfig::start_work_enabled(Some(co)),
+                failure_alerts_enabled: NotificationsConfig::failure_alerts_enabled(Some(co)),
+            })
         }
         None => {
             tracing::info!("ChatOps escalation disabled (no chatops: config block)");
             None
         }
     };
+
+    // Hot-swappable holders. The control socket swaps into these on
+    // `autocoder reload`; the polling loops read snapshots once per pass.
+    let github_holder: GithubHolder = Arc::new(ArcSwap::from_pointee(cfg.github.clone()));
+    let reviewer_holder: ReviewerHolder = Arc::new(ArcSwap::from_pointee(reviewer_initial));
+    let chatops_holder: ChatOpsHolder = Arc::new(ArcSwap::from_pointee(chatops_initial));
 
     for repo in &cfg.repositories {
         let derived = workspace::resolve_path(repo);
@@ -114,37 +127,19 @@ pub async fn execute(cfg: Config) -> Result<()> {
             continue;
         }
         let executor = executor.clone();
-        let github = cfg.github.clone();
-        let reviewer = reviewer.clone();
+        let github_holder = github_holder.clone();
+        let reviewer_holder = reviewer_holder.clone();
+        let chatops_holder = chatops_holder.clone();
         let cancel = cancel.clone();
         let max_changes_per_pr = repo.max_changes_per_pr(&cfg.executor);
-
-        // Build the per-repo ChatOps context: resolve the channel via the
-        // per-repo override or the global default. Notification flags
-        // default to `true` when the operator did not configure
-        // `chatops.notifications`.
-        let chatops_ctx: Option<Arc<ChatOpsContext>> = match (chatops.clone(), cfg.chatops.as_ref()) {
-            (Some(backend), Some(chatops_cfg)) => {
-                let channel = repo
-                    .chatops_channel(&chatops_cfg.default_channel_id)
-                    .to_string();
-                Some(Arc::new(ChatOpsContext {
-                    chatops: backend,
-                    channel,
-                    start_work_enabled: NotificationsConfig::start_work_enabled(Some(chatops_cfg)),
-                    failure_alerts_enabled: NotificationsConfig::failure_alerts_enabled(Some(chatops_cfg)),
-                }))
-            }
-            _ => None,
-        };
 
         tasks.spawn(async move {
             polling_loop::run(
                 repo,
                 executor,
-                github,
-                reviewer,
-                chatops_ctx,
+                github_holder,
+                reviewer_holder,
+                chatops_holder,
                 stuck_threshold_secs,
                 perma_stuck_threshold,
                 max_changes_per_pr,
@@ -153,6 +148,22 @@ pub async fn execute(cfg: Config) -> Result<()> {
             .await
         });
     }
+
+    // Spawn the control-socket listener as a sibling task. It shares the
+    // same cancellation token and JoinSet as the polling tasks.
+    let control_state = ControlState {
+        github: github_holder.clone(),
+        reviewer: reviewer_holder.clone(),
+        chatops: chatops_holder.clone(),
+        last_config: Arc::new(ArcSwap::from_pointee(cfg.clone())),
+        config_path,
+    };
+    let listener_cancel = cancel.clone();
+    tasks.spawn(async move {
+        if let Err(e) = control_socket::listen(control_state, listener_cancel).await {
+            tracing::error!("control socket listener exited: {e:#}");
+        }
+    });
 
     spawn_signal_handler(cancel.clone());
 

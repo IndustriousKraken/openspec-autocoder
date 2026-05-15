@@ -8,6 +8,7 @@ use crate::busy_marker;
 use crate::chatops::{self, AnswerPayload, ChatOpsBackend, QuestionPayload};
 use crate::code_reviewer::{CodeReviewer, ReviewReport, ReviewVerdict};
 use crate::config::{GithubConfig, RepositoryConfig};
+use crate::control_socket::{ChatOpsHolder, ChatOpsSlot, GithubHolder, ReviewerHolder};
 use crate::executor::{Executor, ExecutorOutcome, ResumeHandle};
 use crate::{failure_state, git, github, perma_stuck, queue, workspace};
 use anyhow::{Context, Result, anyhow};
@@ -42,12 +43,16 @@ pub struct ChatOpsContext {
 /// Run the polling loop for a single repository. Each iteration is wrapped in
 /// `execute_one_pass`; failures inside a pass are logged and do not break the
 /// loop. Cancellation is checked between iterations and during the sleep.
+///
+/// The `github`, `reviewer`, and `chatops` holders are reloaded at the top
+/// of each pass — see the control socket (`autocoder reload`) for the
+/// mechanism that swaps values into them.
 pub async fn run(
     repo: RepositoryConfig,
     executor: Arc<dyn Executor>,
-    github: GithubConfig,
-    reviewer: Option<Arc<CodeReviewer>>,
-    chatops_ctx: Option<Arc<ChatOpsContext>>,
+    github_holder: GithubHolder,
+    reviewer_holder: ReviewerHolder,
+    chatops_holder: ChatOpsHolder,
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
     max_changes_per_pr: u32,
@@ -66,13 +71,23 @@ pub async fn run(
             break;
         }
 
+        // Snapshot live config once per iteration so a mid-iteration
+        // reload cannot tear it.
+        let github_snap = github_holder.load_full();
+        let reviewer_snap = reviewer_holder.load_full();
+        let chatops_snap = chatops_holder.load_full();
+        let chatops_ctx = chatops_snap
+            .as_ref()
+            .as_ref()
+            .map(|slot| build_chatops_ctx(&repo, slot));
+
         if let Err(error) = execute_one_pass(
             &workspace,
             &repo,
             executor.as_ref(),
-            &github,
-            reviewer.as_deref(),
-            chatops_ctx.as_deref(),
+            &github_snap,
+            reviewer_snap.as_deref(),
+            chatops_ctx.as_ref(),
             stuck_threshold_secs,
             perma_stuck_threshold,
             max_changes_per_pr,
@@ -94,6 +109,21 @@ pub async fn run(
     }
 
     tracing::info!(url = repo.url.as_str(), "polling loop exiting");
+}
+
+/// Build the per-iteration `ChatOpsContext` from the loaded snapshot.
+/// Notification flags + default channel come from the snapshot; per-repo
+/// channel override (immutable, sourced from RepositoryConfig) takes
+/// precedence over the snapshot's default channel.
+fn build_chatops_ctx(repo: &RepositoryConfig, slot: &ChatOpsSlot) -> ChatOpsContext {
+    ChatOpsContext {
+        chatops: slot.backend.clone(),
+        channel: repo
+            .chatops_channel(&slot.default_channel_id)
+            .to_string(),
+        start_work_enabled: slot.start_work_enabled,
+        failure_alerts_enabled: slot.failure_alerts_enabled,
+    }
 }
 
 /// Single-pass workflow: workspace init → stale-lock cleanup → dirty-workspace
@@ -3243,13 +3273,18 @@ mod tests {
         };
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
+        let github_holder: GithubHolder = Arc::new(arc_swap::ArcSwap::from_pointee(github));
+        let reviewer_holder: ReviewerHolder =
+            Arc::new(arc_swap::ArcSwap::from_pointee(None));
+        let chatops_holder: ChatOpsHolder =
+            Arc::new(arc_swap::ArcSwap::from_pointee(None));
         let handle = tokio::spawn(async move {
             run(
                 repo,
                 executor_dyn,
-                github,
-                None,
-                None,
+                github_holder,
+                reviewer_holder,
+                chatops_holder,
                 2400,
                 u32::MAX,
                 u32::MAX,
@@ -3321,13 +3356,18 @@ mod tests {
         let executor: Arc<dyn Executor> = Arc::new(AlwaysFails);
 
         let cancel_for_task = cancel.clone();
+        let github_holder: GithubHolder = Arc::new(arc_swap::ArcSwap::from_pointee(github));
+        let reviewer_holder: ReviewerHolder =
+            Arc::new(arc_swap::ArcSwap::from_pointee(None));
+        let chatops_holder: ChatOpsHolder =
+            Arc::new(arc_swap::ArcSwap::from_pointee(None));
         let handle = tokio::spawn(async move {
             run(
                 repo,
                 executor,
-                github,
-                None,
-                None,
+                github_holder,
+                reviewer_holder,
+                chatops_holder,
                 2400,
                 u32::MAX,
                 u32::MAX,

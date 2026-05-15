@@ -8,6 +8,7 @@ mod chatops;
 mod cli;
 mod code_reviewer;
 mod config;
+mod control_socket;
 mod executor;
 mod failure_state;
 mod git;

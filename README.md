@@ -655,6 +655,36 @@ sudo systemctl stop autocoder
 sudo systemctl start autocoder
 ```
 
+### Runtime control: live config reload
+
+A running daemon exposes a Unix-domain control socket at `<system-temp>/autocoder/control/control.sock` (typically `/tmp/autocoder/control/control.sock` on Linux). The file is created on startup with mode `0600` and owned by the user running the daemon — only that user can connect. The socket file is removed at shutdown.
+
+The `autocoder reload` subcommand connects to the socket, sends `{"action":"reload"}`, and prints the daemon's response. The daemon re-reads the YAML config from the same path it was launched with, validates it (parse + workspace-collision + token-route checks), and either rejects the request or hot-applies the safe subset of changes.
+
+What gets hot-applied:
+
+- `github` — per-owner tokens, default `token_env`, `fork_owner`. Applied at the next iteration boundary for each repository.
+- `reviewer` — provider, model, API key, prompt template. In-flight reviews finish with the previous reviewer; subsequent reviews use the new one.
+- `chatops` — backend selection, default channel, notification flags. In-flight notifications finish with the previous backend; subsequent ones use the new one.
+
+What requires a full restart:
+
+- `repositories` — adding, removing, or modifying the repository list still requires `systemctl restart autocoder`. The reload handler reports this in the response under `requires_restart` so the operator knows the new YAML's repo changes did not take effect.
+- `executor` — only one executor instance exists, shared across tasks. Changes to `executor:` fields are reported under `requires_restart`.
+
+Response shape on success:
+
+```json
+{
+  "ok": true,
+  "applied": ["github", "reviewer"],
+  "requires_restart": ["executor"],
+  "unchanged": ["chatops", "repositories"]
+}
+```
+
+Validation rejection is non-disruptive: if the new YAML fails to parse or fails semantic validation, the daemon continues running with the previous in-memory config. The response is `{"ok": false, "error": "<message>"}` naming the failure, and the CLI exits non-zero. If the daemon is not running (or is running under a different user), the CLI prints an error naming the expected socket path and hinting at the cause.
+
 ---
 
 ## Deployment
@@ -856,6 +886,16 @@ sudo systemctl start autocoder
 sudo journalctl -u autocoder -f      # tail logs
 ```
 
+### Applying config changes without a restart
+
+Edit `config.yaml`, then run:
+
+```bash
+sudo -u autocoder autocoder reload
+```
+
+The `autocoder reload` subcommand connects to the daemon's control socket at `/tmp/autocoder/control/control.sock`. That socket is created on startup with mode `0600` and is owned by the user the daemon runs as (the `autocoder` user in this guide), so any reload command must run as the same user — `sudo -u autocoder` is the standard invocation. The daemon re-reads `config.yaml` from the path it was launched with, validates it, and hot-applies the `github`, `reviewer`, and `chatops` sections at the next iteration boundary for each repo. Changes to `repositories:` or `executor:` are not hot-applied; the response names those under `requires_restart` so you know they still need `systemctl restart autocoder`. See [Runtime control: live config reload](#runtime-control-live-config-reload) above for the full response shape and validation-rejection semantics.
+
 ### Upgrading
 
 Build the new release, copy the binary, restart the unit:
@@ -1028,6 +1068,16 @@ autocoder run --config <path-to-config.yaml>
 ```
 
 The daemon polls every configured repository on its interval, processes ready OpenSpec changes, and opens monolithic PRs. Terminates only on SIGINT, SIGTERM, or a fatal initialization error. Logs go to stderr; control verbosity with `RUST_LOG=info` (default), `RUST_LOG=debug`, etc.
+
+### `reload`
+
+Ask a running daemon to re-read its YAML config and hot-apply the `github`, `reviewer`, and `chatops` sections.
+
+```bash
+sudo -u autocoder autocoder reload
+```
+
+The CLI connects to the daemon's Unix-domain control socket at `/tmp/autocoder/control/control.sock`, sends `{"action":"reload"}`, and prints the daemon's pretty-printed JSON response to stdout (exit 0) or stderr (exit non-zero). The socket file is mode `0600` and owned by the user the daemon runs as, so the CLI must run as the same user — hence `sudo -u autocoder`. If the daemon is not running, the CLI prints an error naming the expected socket path and exits non-zero. See [Runtime control: live config reload](#runtime-control-live-config-reload) for the full behavior.
 
 ### `rewind`
 
