@@ -145,7 +145,7 @@ pub async fn execute_one_pass(
     if open_pr_exists_for_agent_branch(repo, github_cfg).await {
         return Ok(());
     }
-    let processed = run_pass_through_commits(
+    let (processed, includes_self_heal) = run_pass_through_commits(
         workspace,
         repo,
         github_cfg,
@@ -219,7 +219,17 @@ pub async fn execute_one_pass(
         return Err(e);
     }
     let _ = guard.set_stage(busy_marker::Stage::Pr);
-    open_pull_request(repo, github_cfg, &processed, review_report.as_ref(), draft, chatops_ctx, workspace).await?;
+    open_pull_request(
+        repo,
+        github_cfg,
+        &processed,
+        includes_self_heal,
+        review_report.as_ref(),
+        draft,
+        chatops_ctx,
+        workspace,
+    )
+    .await?;
     // End-of-pass success: push and PR creation both succeeded. Clear the
     // entire alert-state map so the next failure (whatever category) re-
     // alerts immediately. Per design.md, this is intentionally coarse —
@@ -370,7 +380,7 @@ pub async fn run_pass_through_commits(
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
     perma_stuck_threshold: u32,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, bool)> {
     let fork_url = match github_cfg.fork_owner.as_deref() {
         Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
         None => None,
@@ -421,6 +431,7 @@ pub async fn run_pass_through_commits(
     // with a diff goes into the `processed` list and will get pushed/PR'd
     // along with anything from the pending pass.
     let mut processed: Vec<String> = Vec::new();
+    let mut includes_self_heal = false;
     if chatops_ctx.is_some() {
         let resumed = process_waiting_changes(
             workspace,
@@ -450,12 +461,15 @@ pub async fn run_pass_through_commits(
             waiting = still_waiting.len(),
             "polling pass complete"
         );
-        return Ok(processed);
+        return Ok((processed, includes_self_heal));
     }
 
-    let pending_processed =
+    let (pending_processed, pending_self_heal) =
         walk_queue(workspace, repo, executor, chatops_ctx, perma_stuck_threshold).await?;
     processed.extend(pending_processed);
+    if pending_self_heal {
+        includes_self_heal = true;
+    }
 
     let waiting_after = queue::list_waiting(workspace)?.len();
     tracing::info!(
@@ -464,7 +478,7 @@ pub async fn run_pass_through_commits(
         waiting = waiting_after,
         "polling pass complete"
     );
-    Ok(processed)
+    Ok((processed, includes_self_heal))
 }
 
 /// Iterate over the workspace's `list_waiting` changes. For each:
@@ -722,9 +736,10 @@ async fn walk_queue(
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
     perma_stuck_threshold: u32,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, bool)> {
     let pending = queue::list_pending(workspace)?;
     let mut archived: Vec<String> = Vec::new();
+    let mut includes_self_heal = false;
 
     for change in pending {
         queue::lock(workspace, &change)
@@ -750,6 +765,7 @@ async fn walk_queue(
 
         let outcome_label = match &result {
             Ok(QueueStep::Archived) => "archived",
+            Ok(QueueStep::ArchivedSelfHeal) => "archived_self_heal",
             Ok(QueueStep::Failed { .. }) => "failed",
             Ok(QueueStep::Escalated) => "escalated",
             Ok(QueueStep::AskUserExitEarly) => "ask_user_exit_early",
@@ -763,7 +779,11 @@ async fn walk_queue(
         );
 
         match result {
-            Ok(QueueStep::Archived) => {
+            Ok(QueueStep::Archived) | Ok(QueueStep::ArchivedSelfHeal) => {
+                let was_self_heal = matches!(&result, Ok(QueueStep::ArchivedSelfHeal));
+                if was_self_heal {
+                    includes_self_heal = true;
+                }
                 // Archived (regular or self-heal) → reset the per-change
                 // consecutive-failure counter so the next failure starts
                 // fresh.
@@ -807,11 +827,17 @@ async fn walk_queue(
         }
     }
 
-    Ok(archived)
+    Ok((archived, includes_self_heal))
 }
 
 enum QueueStep {
     Archived,
+    /// Same archive bookkeeping as `Archived`, but the implementation was
+    /// already on the base branch — autocoder ran the archive move itself
+    /// instead of treating Completed-without-diff as Failed. The walker
+    /// uses this to flip the pass-level `includes_self_heal` flag, which
+    /// adds a disclaimer paragraph to the PR body.
+    ArchivedSelfHeal,
     /// The executor (or post-execution classification) marked this change
     /// as Failed. `reason` is either the executor's explicit Failed
     /// reason or a synthetic one for the no-op / lazy-archive cases.
@@ -1061,6 +1087,53 @@ async fn handle_outcome(
             queue::unlock(workspace, change)?;
             let dirty = git::status_porcelain(workspace)?;
             if dirty.is_empty() {
+                // Self-heal probe: if every task is `[x]` AND
+                // `openspec validate --strict` exits 0, the change's
+                // implementation is already on the base branch and the
+                // only thing missing is the archive move. Run the archive
+                // ourselves rather than burn another iteration on a no-op
+                // Completed.
+                let tasks_complete = tasks_md_all_complete(workspace, change).unwrap_or(false);
+                if tasks_complete && openspec_validate_strict_passes(workspace, change) {
+                    tracing::info!(
+                        url = %repo.url,
+                        change = %change,
+                        "self-heal: implementation already in HEAD, archiving"
+                    );
+                    let subject =
+                        format!("archive: {change}: implementation already in base");
+                    if let Err(e) = queue::archive(workspace, change) {
+                        tracing::error!(
+                            url = %repo.url,
+                            change = %change,
+                            "self-heal: queue::archive failed: {e:#}"
+                        );
+                        return Ok(QueueStep::Failed {
+                            reason: format!("self-heal archive failed: {e:#}"),
+                        });
+                    }
+                    if let Err(e) = git::add_all(workspace) {
+                        tracing::error!(
+                            url = %repo.url,
+                            change = %change,
+                            "self-heal: git add -A failed: {e:#}"
+                        );
+                        return Ok(QueueStep::Failed {
+                            reason: format!("self-heal git add failed: {e:#}"),
+                        });
+                    }
+                    if let Err(e) = git::commit(workspace, &subject) {
+                        tracing::error!(
+                            url = %repo.url,
+                            change = %change,
+                            "self-heal: git commit failed: {e:#}"
+                        );
+                        return Ok(QueueStep::Failed {
+                            reason: format!("self-heal git commit failed: {e:#}"),
+                        });
+                    }
+                    return Ok(QueueStep::ArchivedSelfHeal);
+                }
                 tracing::warn!(
                     "agent reported Completed for `{change}` without modifying the workspace; marking Failed"
                 );
@@ -1215,6 +1288,7 @@ async fn open_pull_request(
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
     changes: &[String],
+    includes_self_heal: bool,
     review_report: Option<&ReviewReport>,
     draft: bool,
     chatops_ctx: Option<&ChatOpsContext>,
@@ -1226,7 +1300,7 @@ async fn open_pull_request(
     // the credential authorizing that call must have access to upstream.
     let token = crate::github_credentials::resolve_token(github_cfg, &owner)?;
     let title = format!("agent: {} change(s) in pass", changes.len());
-    let body = build_pr_body(changes);
+    let body = build_pr_body(changes, includes_self_heal);
 
     // In fork-PR mode the `head` is namespaced `<fork-owner>:<branch>` for
     // GitHub to recognize the cross-repo PR. Direct-push mode uses the bare
@@ -1436,12 +1510,62 @@ fn truncate_to_fit(body: String, max: usize) -> String {
     truncated
 }
 
-fn build_pr_body(changes: &[String]) -> String {
-    let mut s = String::from("Changes implemented in this pass:\n\n");
+fn build_pr_body(changes: &[String], includes_self_heal: bool) -> String {
+    let mut s = String::new();
+    if includes_self_heal {
+        s.push_str(
+            "_This PR archives one or more changes whose implementation was already present on the base branch. No code diff is included; only the openspec archive move._\n\n",
+        );
+    }
+    s.push_str("Changes implemented in this pass:\n\n");
     for change in changes {
         s.push_str(&format!("- {change}\n"));
     }
     s
+}
+
+/// Read `openspec/changes/<change>/tasks.md` and decide whether every task
+/// checkbox is `[x]`. Scans each line for the regex `^\s*-\s*\[([ x])\]`.
+/// Returns `Ok(true)` iff at least one match is present AND every match
+/// captures `x`. Any match capturing ` ` yields `Ok(false)`. An empty
+/// match-set yields `Ok(false)` — a tasks.md with no checkboxes is not
+/// "all complete". Returns `Err(_)` only on file-read failure or
+/// regex-init failure.
+pub fn tasks_md_all_complete(workspace: &Path, change: &str) -> Result<bool> {
+    let tasks_path = workspace
+        .join("openspec/changes")
+        .join(change)
+        .join("tasks.md");
+    let raw = std::fs::read_to_string(&tasks_path)
+        .with_context(|| format!("reading {}", tasks_path.display()))?;
+    let re = regex::Regex::new(r"^\s*-\s*\[([ x])\]")
+        .context("compiling tasks.md checkbox regex")?;
+    let mut any = false;
+    for line in raw.lines() {
+        if let Some(caps) = re.captures(line) {
+            any = true;
+            if &caps[1] != "x" {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(any)
+}
+
+/// Shell out to `openspec validate <change> --strict` in `workspace` and
+/// report whether it exited 0. Any error — binary missing, non-zero exit,
+/// transport problem — returns `false`. The caller falls through to the
+/// existing Failed path when self-heal preconditions are unmet, which is
+/// the conservative behavior.
+pub fn openspec_validate_strict_passes(workspace: &Path, change: &str) -> bool {
+    match std::process::Command::new("openspec")
+        .args(["validate", change, "--strict"])
+        .current_dir(workspace)
+        .output()
+    {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    }
 }
 
 /// Return `true` if any open PR exists on GitHub for the configured agent
@@ -1935,7 +2059,10 @@ mod tests {
         };
         // Use a very high threshold so existing tests' single-fail
         // iterations don't accidentally mark perma-stuck.
-        run_pass_through_commits(workspace, &repo, &github_cfg, executor, None, u32::MAX).await
+        let (processed, _self_heal) =
+            run_pass_through_commits(workspace, &repo, &github_cfg, executor, None, u32::MAX)
+                .await?;
+        Ok(processed)
     }
 
     /// 13.3.2 / executor baseline: when the executor returns `Failed`,
@@ -2198,7 +2325,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
         };
-        let processed = run_pass_through_commits(
+        let (processed, _) = run_pass_through_commits(
             &ws,
             &fixture_repo(&ws),
             &test_github,
@@ -2294,7 +2421,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
         };
-        let processed = run_pass_through_commits(
+        let (processed, _) = run_pass_through_commits(
             &ws,
             &fixture_repo(&ws),
             &test_github,
@@ -2403,7 +2530,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
         };
-        let processed = run_pass_through_commits(
+        let (processed, _) = run_pass_through_commits(
             &ws,
             &fixture_repo(&ws),
             &test_github,
@@ -2533,7 +2660,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
         };
-        let processed = run_pass_through_commits(
+        let (processed, _) = run_pass_through_commits(
             &ws,
             &fixture_repo(&ws),
             &test_github,
@@ -2641,7 +2768,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
         };
-        let processed = run_pass_through_commits(
+        let (processed, _) = run_pass_through_commits(
             &ws,
             &fixture_repo(&ws),
             &test_github,
@@ -2747,7 +2874,7 @@ mod tests {
                 owner_tokens: None,
                 fork_owner: None,
             };
-            let processed = run_pass_through_commits(
+            let (processed, _) = run_pass_through_commits(
                 &ws,
                 &fixture_repo(&ws),
                 &direct_github,
@@ -3204,7 +3331,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
         };
-        let processed = run_pass_through_commits(
+        let (processed, _) = run_pass_through_commits(
             &ws,
             &fixture_repo(&ws),
             &github,
@@ -3249,7 +3376,7 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
         };
-        let processed = run_pass_through_commits(
+        let (processed, _) = run_pass_through_commits(
             &ws,
             &fixture_repo(&ws),
             &github,
@@ -3689,7 +3816,10 @@ mod tests {
             owner_tokens: None,
             fork_owner: None,
         };
-        run_pass_through_commits(workspace, &repo, &github_cfg, executor, None, threshold).await
+        let (processed, _) =
+            run_pass_through_commits(workspace, &repo, &github_cfg, executor, None, threshold)
+                .await?;
+        Ok(processed)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3911,5 +4041,284 @@ mod tests {
             "marker should be written when threshold = 1 and the executor failed once"
         );
         alert_mock.assert_async().await;
+    }
+
+    // ============================================================
+    // Self-heal for already-implemented changes
+    // ============================================================
+
+    /// `tasks_md_all_complete`: every checkbox is `[x]` → true.
+    #[test]
+    fn tasks_md_all_complete_all_checked_returns_true() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path();
+        let tasks = ws.join("openspec/changes/c/tasks.md");
+        std::fs::create_dir_all(tasks.parent().unwrap()).unwrap();
+        std::fs::write(
+            &tasks,
+            "## 1. things\n- [x] 1.1 first\n- [x] 1.2 second\n  - [x] 1.3 nested\n",
+        )
+        .unwrap();
+        assert!(tasks_md_all_complete(ws, "c").unwrap());
+    }
+
+    /// `tasks_md_all_complete`: mixed `[x]` and `[ ]` → false.
+    #[test]
+    fn tasks_md_all_complete_mixed_returns_false() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path();
+        let tasks = ws.join("openspec/changes/c/tasks.md");
+        std::fs::create_dir_all(tasks.parent().unwrap()).unwrap();
+        std::fs::write(&tasks, "- [x] done\n- [ ] still open\n").unwrap();
+        assert!(!tasks_md_all_complete(ws, "c").unwrap());
+    }
+
+    /// `tasks_md_all_complete`: every checkbox is `[ ]` → false.
+    #[test]
+    fn tasks_md_all_complete_all_open_returns_false() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path();
+        let tasks = ws.join("openspec/changes/c/tasks.md");
+        std::fs::create_dir_all(tasks.parent().unwrap()).unwrap();
+        std::fs::write(&tasks, "- [ ] a\n- [ ] b\n").unwrap();
+        assert!(!tasks_md_all_complete(ws, "c").unwrap());
+    }
+
+    /// `tasks_md_all_complete`: no checkbox lines at all → false.
+    /// "no tasks recorded = not complete" is the conservative path.
+    #[test]
+    fn tasks_md_all_complete_empty_returns_false() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path();
+        let tasks = ws.join("openspec/changes/c/tasks.md");
+        std::fs::create_dir_all(tasks.parent().unwrap()).unwrap();
+        std::fs::write(&tasks, "## Heading\nNo checkboxes here.\n").unwrap();
+        assert!(!tasks_md_all_complete(ws, "c").unwrap());
+    }
+
+    /// `tasks_md_all_complete`: missing file → Err.
+    #[test]
+    fn tasks_md_all_complete_missing_file_returns_err() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path();
+        assert!(tasks_md_all_complete(ws, "does-not-exist").is_err());
+    }
+
+    /// Write a self-heal-ready change into the fixture workspace: a proposal,
+    /// a tasks.md with every task `[x]`, and a spec under `specs/<cap>/` that
+    /// `openspec validate --strict` accepts. Commit it so the dirty check
+    /// stays clean.
+    fn add_committed_self_heal_change(workspace: &Path, name: &str, all_done: bool, valid_spec: bool) {
+        let dir = workspace.join("openspec/changes").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("proposal.md"),
+            "## Why\n\nfixture self-heal\n\n## What Changes\n\n- thing\n",
+        )
+        .unwrap();
+        let tasks = if all_done {
+            "- [x] 1.1 done\n- [x] 1.2 also done\n"
+        } else {
+            "- [x] 1.1 done\n- [ ] 1.2 still open\n"
+        };
+        std::fs::write(dir.join("tasks.md"), tasks).unwrap();
+        let spec_dir = dir.join("specs").join("self-heal-fixture-cap");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        let spec_body = if valid_spec {
+            "## ADDED Requirements\n\n### Requirement: Do thing\nThe system SHALL do the thing.\n\n#### Scenario: It works\n- **WHEN** triggered\n- **THEN** does thing\n"
+        } else {
+            // No scenario block → openspec validate --strict fails.
+            "## ADDED Requirements\n\n### Requirement: Do thing\nThe system SHALL do the thing.\n"
+        };
+        std::fs::write(spec_dir.join("spec.md"), spec_body).unwrap();
+        let st = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(workspace)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let st = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", &format!("scaffold {name}")])
+            .current_dir(workspace)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+
+    /// Self-heal succeeds: change with every task `[x]`, valid spec, and a
+    /// Completed-with-empty-workspace executor result. autocoder must
+    /// archive, commit the move, and flag the pass as self-healing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn self_heal_archives_when_preconditions_met() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_self_heal_change(&ws, "already-done", true, true);
+
+        let executor = CompletingExecutorNoDiff;
+        let repo = fixture_repo(&ws);
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let (processed, includes_self_heal) =
+            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX)
+                .await
+                .expect("self-heal pass succeeds");
+        assert_eq!(
+            processed,
+            vec!["already-done".to_string()],
+            "self-healed change must appear in processed list"
+        );
+        assert!(
+            includes_self_heal,
+            "pass should report includes_self_heal = true"
+        );
+
+        // Active change dir is gone; archive entry exists with date prefix.
+        assert!(
+            !ws.join("openspec/changes/already-done").exists(),
+            "active change dir must be moved into archive"
+        );
+        let archive = ws.join("openspec/changes/archive");
+        let archived_names: Vec<String> = std::fs::read_dir(&archive)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            archived_names.iter().any(|n| n.ends_with("-already-done")),
+            "expected archived already-done in {archived_names:?}"
+        );
+
+        // Commit subject matches the spec-mandated form.
+        let out = std::process::Command::new("git")
+            .args(["log", "-1", "--pretty=%s", "agent-q"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let subject = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            subject, "archive: already-done: implementation already in base",
+            "self-heal commit subject must follow the spec-mandated format"
+        );
+
+        // PR body for this pass carries the disclaimer paragraph.
+        let body = build_pr_body(&processed, includes_self_heal);
+        assert!(
+            body.contains("_This PR archives one or more changes whose implementation was already present on the base branch."),
+            "PR body should include the self-heal disclaimer; got: {body}"
+        );
+    }
+
+    /// Self-heal precondition unmet: tasks.md has an unchecked task → the
+    /// pass falls through to the existing Failed path. Change must remain
+    /// in pending; nothing committed; nothing archived.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn self_heal_falls_through_to_failed_when_tasks_incomplete() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // all_done=false → tasks.md contains a `[ ]` line.
+        add_committed_self_heal_change(&ws, "tasks-open", false, true);
+
+        let pre_main = crate::git::rev_parse(&ws, "main").unwrap();
+
+        let executor = CompletingExecutorNoDiff;
+        let repo = fixture_repo(&ws);
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let (processed, includes_self_heal) =
+            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX)
+                .await
+                .expect("pass returns Failed via fall-through, not Err");
+        assert!(
+            processed.is_empty(),
+            "no archived changes expected; got {processed:?}"
+        );
+        assert!(
+            !includes_self_heal,
+            "self-heal flag must remain false when preconditions unmet"
+        );
+
+        // Change is NOT archived; still in pending; no commit on agent-q.
+        assert!(
+            ws.join("openspec/changes/tasks-open").exists(),
+            "change must remain in active changes for retry"
+        );
+        let archive_root = ws.join("openspec/changes/archive");
+        if archive_root.exists() {
+            for entry in std::fs::read_dir(&archive_root).unwrap() {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                assert!(
+                    !name.ends_with("-tasks-open"),
+                    "must not archive tasks-open with an open task"
+                );
+            }
+        }
+        assert_eq!(
+            queue::list_pending(&ws).unwrap(),
+            vec!["tasks-open".to_string()],
+            "change must be back in pending"
+        );
+        let agent_sha = crate::git::rev_parse(&ws, "agent-q").unwrap();
+        assert_eq!(agent_sha, pre_main, "no commit must be made");
+    }
+
+    /// Self-heal precondition unmet: `openspec validate --strict` errors
+    /// because the spec is missing a Scenario block. Same fall-through to
+    /// Failed; no archive, no commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn self_heal_falls_through_when_openspec_validate_fails() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // tasks all done, but spec lacks Scenario → openspec validate fails.
+        add_committed_self_heal_change(&ws, "invalid-spec", true, false);
+
+        let pre_main = crate::git::rev_parse(&ws, "main").unwrap();
+
+        let executor = CompletingExecutorNoDiff;
+        let repo = fixture_repo(&ws);
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let (processed, includes_self_heal) =
+            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX)
+                .await
+                .expect("pass returns Failed via fall-through, not Err");
+        assert!(processed.is_empty());
+        assert!(!includes_self_heal);
+
+        // Change must remain in pending and unarchived.
+        assert!(ws.join("openspec/changes/invalid-spec").exists());
+        let archive_root = ws.join("openspec/changes/archive");
+        if archive_root.exists() {
+            for entry in std::fs::read_dir(&archive_root).unwrap() {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                assert!(!name.ends_with("-invalid-spec"));
+            }
+        }
+        let agent_sha = crate::git::rev_parse(&ws, "agent-q").unwrap();
+        assert_eq!(agent_sha, pre_main);
+    }
+
+    /// A pass with normally-implemented changes only (no self-heal) must
+    /// NOT include the self-heal disclaimer paragraph in the PR body.
+    #[test]
+    fn self_heal_paragraph_omitted_when_no_self_heals_in_pass() {
+        let processed = vec!["regular-change".to_string()];
+        let body = build_pr_body(&processed, false);
+        assert!(
+            !body.contains("This PR archives one or more changes whose implementation was already present"),
+            "disclaimer paragraph must not appear when includes_self_heal=false; got: {body}"
+        );
+        assert!(
+            body.contains("- regular-change"),
+            "normal change listing must remain"
+        );
     }
 }
