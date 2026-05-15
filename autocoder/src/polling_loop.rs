@@ -12,6 +12,7 @@ use crate::control_socket::{ChatOpsHolder, ChatOpsSlot, GithubHolder, ReviewerHo
 use crate::executor::{Executor, ExecutorOutcome, ResumeHandle};
 use crate::{failure_state, git, github, perma_stuck, queue, workspace};
 use anyhow::{Context, Result, anyhow};
+use arc_swap::ArcSwap;
 use chrono::{Duration as ChronoDuration, Utc};
 use std::path::Path;
 use std::sync::Arc;
@@ -46,44 +47,60 @@ pub struct ChatOpsContext {
 ///
 /// The `github`, `reviewer`, and `chatops` holders are reloaded at the top
 /// of each pass — see the control socket (`autocoder reload`) for the
-/// mechanism that swaps values into them.
+/// mechanism that swaps values into them. The `repo` holder is also reloaded
+/// at the top of each pass so the reload handler can hot-swap repository
+/// settings (base/agent branch, poll interval, channel id, local_path,
+/// per-repo PR cap); the snapshot captured at the start of an iteration is
+/// used consistently for the rest of that iteration. The next iteration
+/// picks up any swap that happened during the previous sleep.
 pub async fn run(
-    repo: RepositoryConfig,
+    repo: Arc<ArcSwap<RepositoryConfig>>,
     executor: Arc<dyn Executor>,
     github_holder: GithubHolder,
     reviewer_holder: ReviewerHolder,
     chatops_holder: ChatOpsHolder,
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
-    max_changes_per_pr: u32,
+    executor_max_changes_per_pr: Option<u32>,
     cancel: CancellationToken,
 ) {
-    let workspace = workspace::resolve_path(&repo);
-    tracing::info!(
-        url = repo.url.as_str(),
-        workspace = %workspace.display(),
-        poll_interval_sec = repo.poll_interval_sec,
-        "starting polling loop"
-    );
+    {
+        let initial = repo.load();
+        let workspace = workspace::resolve_path(initial.as_ref());
+        tracing::info!(
+            url = initial.url.as_str(),
+            workspace = %workspace.display(),
+            poll_interval_sec = initial.poll_interval_sec,
+            "starting polling loop"
+        );
+    }
 
     loop {
         if cancel.is_cancelled() {
             break;
         }
 
-        // Snapshot live config once per iteration so a mid-iteration
-        // reload cannot tear it.
+        // Single-snapshot-per-iteration: read `repo`, `github`, `reviewer`,
+        // and `chatops` exactly once at the top of the iteration so a
+        // mid-iteration reload cannot tear the config.
+        let snapshot = repo.load();
+        let snapshot_ref: &RepositoryConfig = snapshot.as_ref();
+        let workspace = workspace::resolve_path(snapshot_ref);
         let github_snap = github_holder.load_full();
         let reviewer_snap = reviewer_holder.load_full();
         let chatops_snap = chatops_holder.load_full();
         let chatops_ctx = chatops_snap
             .as_ref()
             .as_ref()
-            .map(|slot| build_chatops_ctx(&repo, slot));
+            .map(|slot| build_chatops_ctx(snapshot_ref, slot));
+        let max_changes_per_pr = resolve_max_changes_per_pr(
+            snapshot_ref.max_changes_per_pr,
+            executor_max_changes_per_pr,
+        );
 
         if let Err(error) = execute_one_pass(
             &workspace,
-            &repo,
+            snapshot_ref,
             executor.as_ref(),
             &github_snap,
             reviewer_snap.as_deref(),
@@ -95,20 +112,36 @@ pub async fn run(
         .await
         {
             tracing::error!(
-                url = repo.url.as_str(),
+                url = snapshot_ref.url.as_str(),
                 "polling iteration failed for {}: {error:#}",
-                repo.url
+                snapshot_ref.url
             );
         }
+
+        // Per design: the inter-poll sleep uses the snapshot's
+        // poll_interval, not a re-read. Next iteration's read picks up
+        // any hot-swap that landed during the sleep.
+        let sleep_secs = snapshot_ref.poll_interval_sec;
+        drop(snapshot);
 
         tokio::select! {
             biased;
             () = cancel.cancelled() => break,
-            () = sleep(Duration::from_secs(repo.poll_interval_sec)) => {}
+            () = sleep(Duration::from_secs(sleep_secs)) => {}
         }
     }
 
-    tracing::info!(url = repo.url.as_str(), "polling loop exiting");
+    tracing::info!(url = %repo.load().url, "polling loop exiting");
+}
+
+/// Resolve the per-iteration commit cap for the polling task. Mirrors
+/// `RepositoryConfig::max_changes_per_pr` but accepts the per-repo and
+/// executor-level defaults as separate values so the polling loop can
+/// pick up a hot-swapped per-repo override without taking a reference
+/// to the live `ExecutorConfig`.
+fn resolve_max_changes_per_pr(per_repo: Option<u32>, executor_default: Option<u32>) -> u32 {
+    const DEFAULT: u32 = 3;
+    per_repo.or(executor_default).unwrap_or(DEFAULT).max(1)
 }
 
 /// Build the per-iteration `ChatOpsContext` from the loaded snapshot.
@@ -3278,16 +3311,18 @@ mod tests {
             Arc::new(arc_swap::ArcSwap::from_pointee(None));
         let chatops_holder: ChatOpsHolder =
             Arc::new(arc_swap::ArcSwap::from_pointee(None));
+        let repo_holder: Arc<ArcSwap<RepositoryConfig>> =
+            Arc::new(ArcSwap::from_pointee(repo));
         let handle = tokio::spawn(async move {
             run(
-                repo,
+                repo_holder,
                 executor_dyn,
                 github_holder,
                 reviewer_holder,
                 chatops_holder,
                 2400,
                 u32::MAX,
-                u32::MAX,
+                Some(u32::MAX),
                 cancel_for_task,
             )
             .await;
@@ -3361,16 +3396,18 @@ mod tests {
             Arc::new(arc_swap::ArcSwap::from_pointee(None));
         let chatops_holder: ChatOpsHolder =
             Arc::new(arc_swap::ArcSwap::from_pointee(None));
+        let repo_holder: Arc<ArcSwap<RepositoryConfig>> =
+            Arc::new(ArcSwap::from_pointee(repo));
         let handle = tokio::spawn(async move {
             run(
-                repo,
+                repo_holder,
                 executor,
                 github_holder,
                 reviewer_holder,
                 chatops_holder,
                 2400,
                 u32::MAX,
-                u32::MAX,
+                Some(u32::MAX),
                 cancel_for_task,
             )
             .await;

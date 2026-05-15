@@ -5,16 +5,20 @@
 use crate::chatops;
 use crate::code_reviewer::CodeReviewer;
 use crate::config::{Config, ExecutorKind, GithubConfig, NotificationsConfig, RepositoryConfig};
-use crate::control_socket::{self, ChatOpsHolder, ChatOpsSlot, ControlState, GithubHolder, ReviewerHolder};
+use crate::control_socket::{
+    self, ChatOpsHolder, ChatOpsSlot, ControlState, GithubHolder, RepoTaskHandle, RepoTaskMap,
+    ReviewerHolder, SpawnOutcome, SpawnRepoFn,
+};
 use crate::executor::{Executor, claude_cli::ClaudeCliExecutor};
 use crate::github::parse_repo_url;
 use crate::github_credentials::resolve_token_with_source;
 use crate::{git, polling_loop, workspace};
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::task::JoinSet;
+use std::sync::{Arc, Mutex};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
@@ -118,48 +122,48 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     }
 
-    let mut tasks: JoinSet<()> = JoinSet::new();
-    for repo in cfg.repositories.iter().cloned() {
-        if !repo_passes_startup_check(&repo, &cfg.github) {
-            // Per orchestrator-cli baseline: a repo dirty at startup is
-            // skipped for the remainder of the process lifetime. Other
-            // configured repositories continue to be serviced.
-            continue;
-        }
-        let executor = executor.clone();
-        let github_holder = github_holder.clone();
-        let reviewer_holder = reviewer_holder.clone();
-        let chatops_holder = chatops_holder.clone();
-        let cancel = cancel.clone();
-        let max_changes_per_pr = repo.max_changes_per_pr(&cfg.executor);
+    let task_map: RepoTaskMap = Arc::new(Mutex::new(HashMap::new()));
+    let executor_max_changes_per_pr = cfg.executor.max_changes_per_pr;
+    let spawn_repo = build_spawn_repo_fn(SpawnDeps {
+        executor: executor.clone(),
+        github_holder: github_holder.clone(),
+        reviewer_holder: reviewer_holder.clone(),
+        chatops_holder: chatops_holder.clone(),
+        stuck_threshold_secs,
+        perma_stuck_threshold,
+        executor_max_changes_per_pr,
+        global_cancel: cancel.clone(),
+        task_map: task_map.clone(),
+    });
 
-        tasks.spawn(async move {
-            polling_loop::run(
-                repo,
-                executor,
-                github_holder,
-                reviewer_holder,
-                chatops_holder,
-                stuck_threshold_secs,
-                perma_stuck_threshold,
-                max_changes_per_pr,
-                cancel,
-            )
-            .await
-        });
+    for repo in cfg.repositories.iter().cloned() {
+        match spawn_repo(repo) {
+            SpawnOutcome::Spawned => {}
+            SpawnOutcome::AlreadyPresent => {
+                // Cannot happen at startup (map is empty) but log defensively.
+                tracing::warn!("startup: spawn helper reported duplicate URL — ignoring");
+            }
+            SpawnOutcome::StartupCheckFailed => {
+                // Per orchestrator-cli baseline: a repo whose workspace
+                // fails the startup check is skipped for the remainder
+                // of the process lifetime. Other repos continue.
+            }
+        }
     }
 
     // Spawn the control-socket listener as a sibling task. It shares the
-    // same cancellation token and JoinSet as the polling tasks.
+    // same cancellation token as the polling tasks.
     let control_state = ControlState {
         github: github_holder.clone(),
         reviewer: reviewer_holder.clone(),
         chatops: chatops_holder.clone(),
         last_config: Arc::new(ArcSwap::from_pointee(cfg.clone())),
         config_path,
+        repo_tasks: task_map.clone(),
+        spawn_repo: spawn_repo.clone(),
     };
     let listener_cancel = cancel.clone();
-    tasks.spawn(async move {
+    let control_handle: JoinHandle<()> = tokio::spawn(async move {
         if let Err(e) = control_socket::listen(control_state, listener_cancel).await {
             tracing::error!("control socket listener exited: {e:#}");
         }
@@ -167,14 +171,113 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
 
     spawn_signal_handler(cancel.clone());
 
-    while let Some(joined) = tasks.join_next().await {
-        if let Err(e) = joined {
+    // The polling tasks loop until the global cancellation token fires
+    // (or the per-repo token from a reload-induced cancel). Wait for the
+    // global cancel, then drain the task map and await every polling
+    // task. The wrapper inside the spawn closure removes its own entry
+    // on exit, so by draining the map first we take ownership of the
+    // JoinHandles before any wrapper races us for the lock.
+    cancel.cancelled().await;
+    let handles: Vec<JoinHandle<()>> = {
+        let mut guard = task_map.lock().unwrap();
+        guard.drain().map(|(_, h)| h.join).collect()
+    };
+    for h in handles {
+        if let Err(e) = h.await {
             tracing::error!("polling task panicked: {e}");
         }
+    }
+    if let Err(e) = control_handle.await {
+        tracing::error!("control socket task panicked: {e}");
     }
 
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Dependencies the daemon captures into the spawn closure so the reload
+/// handler can launch new polling tasks without re-deriving them.
+struct SpawnDeps {
+    executor: Arc<dyn Executor>,
+    github_holder: GithubHolder,
+    reviewer_holder: ReviewerHolder,
+    chatops_holder: ChatOpsHolder,
+    stuck_threshold_secs: u64,
+    perma_stuck_threshold: u32,
+    executor_max_changes_per_pr: Option<u32>,
+    global_cancel: CancellationToken,
+    task_map: RepoTaskMap,
+}
+
+/// Build a `SpawnRepoFn` that runs the repo's startup check, then spawns
+/// the per-repo polling task with a fresh child cancellation token and a
+/// new `Arc<ArcSwap<RepositoryConfig>>` holder. The spawned task removes
+/// its own map entry on exit so the next reload sees an absent URL.
+fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
+    Arc::new(move |repo: RepositoryConfig| {
+        let url = repo.url.clone();
+        // Fast-path duplicate check before doing the (potentially slow)
+        // startup check. Re-checked under the lock below to close the
+        // race window between this and the insert.
+        {
+            let guard = deps.task_map.lock().unwrap();
+            if guard.contains_key(&url) {
+                return SpawnOutcome::AlreadyPresent;
+            }
+        }
+        // Startup check uses the live github config (post-reload it may
+        // differ from what was on disk at process start).
+        let github_snap = deps.github_holder.load_full();
+        if !repo_passes_startup_check(&repo, &github_snap) {
+            return SpawnOutcome::StartupCheckFailed;
+        }
+        let child_cancel = deps.global_cancel.child_token();
+        let config_holder: Arc<ArcSwap<RepositoryConfig>> =
+            Arc::new(ArcSwap::from_pointee(repo));
+        let cancel_for_task = child_cancel.clone();
+        let config_for_task = config_holder.clone();
+        let map_for_task = deps.task_map.clone();
+        let url_for_task = url.clone();
+        let executor_for_task = deps.executor.clone();
+        let github_for_task = deps.github_holder.clone();
+        let reviewer_for_task = deps.reviewer_holder.clone();
+        let chatops_for_task = deps.chatops_holder.clone();
+        let stuck = deps.stuck_threshold_secs;
+        let perma = deps.perma_stuck_threshold;
+        let exec_max = deps.executor_max_changes_per_pr;
+        let join: JoinHandle<()> = tokio::spawn(async move {
+            polling_loop::run(
+                config_for_task,
+                executor_for_task,
+                github_for_task,
+                reviewer_for_task,
+                chatops_for_task,
+                stuck,
+                perma,
+                exec_max,
+                cancel_for_task,
+            )
+            .await;
+            let mut guard = map_for_task.lock().unwrap();
+            guard.remove(&url_for_task);
+        });
+        let mut guard = deps.task_map.lock().unwrap();
+        if guard.contains_key(&url) {
+            // Lost the race against another spawn. Cancel ours and
+            // report the URL as already present.
+            child_cancel.cancel();
+            return SpawnOutcome::AlreadyPresent;
+        }
+        guard.insert(
+            url,
+            RepoTaskHandle {
+                cancel: child_cancel,
+                config: config_holder,
+                join,
+            },
+        );
+        SpawnOutcome::Spawned
+    })
 }
 
 /// Emit the one-shot startup log line for the active ChatOps backend.

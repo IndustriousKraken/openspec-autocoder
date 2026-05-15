@@ -666,10 +666,10 @@ What gets hot-applied:
 - `github` — per-owner tokens, default `token_env`, `fork_owner`. Applied at the next iteration boundary for each repository.
 - `reviewer` — provider, model, API key, prompt template. In-flight reviews finish with the previous reviewer; subsequent reviews use the new one.
 - `chatops` — backend selection, default channel, notification flags. In-flight notifications finish with the previous backend; subsequent ones use the new one.
+- `repositories` — adding, removing, or modifying repositories in the list. New entries are spawned as fresh polling tasks (workspace setup, dirty-check, busy-marker — same as daemon startup). Removed entries get their per-repo cancellation token fired; the running task finishes its in-flight iteration normally (including push + PR) and exits at the next inter-poll sleep boundary. Modified entries hot-swap an `Arc<ArcSwap<RepositoryConfig>>` holder so the next iteration of that task reads the new `base_branch`, `agent_branch`, `poll_interval_sec`, `chatops_channel_id`, `local_path`, or `max_changes_per_pr`. The reload handler diffs the new list against the current task set by `url` — that field is the identity key. Changing the `url` of an existing entry is treated as `remove old_url + add new_url`. Reordering the list has no effect.
 
 What requires a full restart:
 
-- `repositories` — adding, removing, or modifying the repository list still requires `systemctl restart autocoder`. The reload handler reports this in the response under `requires_restart` so the operator knows the new YAML's repo changes did not take effect.
 - `executor` — only one executor instance exists, shared across tasks. Changes to `executor:` fields are reported under `requires_restart`.
 
 Response shape on success:
@@ -677,13 +677,36 @@ Response shape on success:
 ```json
 {
   "ok": true,
-  "applied": ["github", "reviewer"],
+  "applied": ["github", "reviewer", "repositories"],
   "requires_restart": ["executor"],
-  "unchanged": ["chatops", "repositories"]
+  "unchanged": ["chatops"],
+  "repositories_delta": {
+    "added": ["git@github.com:owner/repo-c.git"],
+    "removed": ["git@github.com:owner/repo-a.git"],
+    "changed": ["git@github.com:owner/repo-b.git"]
+  }
 }
 ```
 
+`repositories_delta` is always present (the three arrays can each be empty) so client tooling has a consistent shape to parse. An entry only appears under one of `added` / `removed` / `changed` per reload.
+
 Validation rejection is non-disruptive: if the new YAML fails to parse or fails semantic validation, the daemon continues running with the previous in-memory config. The response is `{"ok": false, "error": "<message>"}` naming the failure, and the CLI exits non-zero. If the daemon is not running (or is running under a different user), the CLI prints an error naming the expected socket path and hinting at the cause.
+
+#### Adding a repository at runtime
+
+To add a repository without restarting the daemon:
+
+1. Edit `config.yaml` (the path the daemon was launched with) and append the new entry under `repositories:`. Set its `url`, `base_branch`, `agent_branch`, and `poll_interval_sec` as usual.
+2. Run `sudo -u autocoder autocoder reload` from the same host. The CLI prints the daemon's response.
+3. Verify the response includes the new URL under `repositories_delta.added` and `"repositories"` appears in `applied`. The polling task is now running; it does workspace initialization on its first pass.
+
+The reverse (remove a repository) works the same way: delete the entry, reload, and the new URL appears under `repositories_delta.removed`. The cancelled task finishes its current iteration before exiting, so a removal during an active push or PR step completes cleanly.
+
+#### In-flight iteration safety
+
+A repo cancelled mid-iteration finishes its in-flight pass normally. The cancellation check sits in the inter-poll `tokio::select!`, so the next poll never starts after the cancel — but the current one runs to completion. A modify-in-place is observed at the *next* iteration; the current iteration uses the old snapshot. Both rules eliminate mid-iteration tearing of `RepositoryConfig` fields.
+
+If you remove a repo and re-add it (or change a setting) before the previous task has fully exited (e.g. it is mid-push when the reload lands), the response logs a WARN and reports the URL as unchanged for that reload. Run `autocoder reload` again after a brief wait; the second reload sees the URL as absent and re-adds it cleanly.
 
 ---
 
@@ -894,7 +917,7 @@ Edit `config.yaml`, then run:
 sudo -u autocoder autocoder reload
 ```
 
-The `autocoder reload` subcommand connects to the daemon's control socket at `/tmp/autocoder/control/control.sock`. That socket is created on startup with mode `0600` and is owned by the user the daemon runs as (the `autocoder` user in this guide), so any reload command must run as the same user — `sudo -u autocoder` is the standard invocation. The daemon re-reads `config.yaml` from the path it was launched with, validates it, and hot-applies the `github`, `reviewer`, and `chatops` sections at the next iteration boundary for each repo. Changes to `repositories:` or `executor:` are not hot-applied; the response names those under `requires_restart` so you know they still need `systemctl restart autocoder`. See [Runtime control: live config reload](#runtime-control-live-config-reload) above for the full response shape and validation-rejection semantics.
+The `autocoder reload` subcommand connects to the daemon's control socket at `/tmp/autocoder/control/control.sock`. That socket is created on startup with mode `0600` and is owned by the user the daemon runs as (the `autocoder` user in this guide), so any reload command must run as the same user — `sudo -u autocoder` is the standard invocation. The daemon re-reads `config.yaml` from the path it was launched with, validates it, and hot-applies the `github`, `reviewer`, `chatops`, and `repositories` sections at the next iteration boundary for each repo. Only changes to `executor:` are not hot-applied; the response names that under `requires_restart` so you know it still needs `systemctl restart autocoder`. See [Runtime control: live config reload](#runtime-control-live-config-reload) above for the full response shape and validation-rejection semantics.
 
 ### Upgrading
 
