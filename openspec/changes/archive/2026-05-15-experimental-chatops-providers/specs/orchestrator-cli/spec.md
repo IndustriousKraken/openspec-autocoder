@@ -64,13 +64,13 @@ sub-block or when a required env var for the selected provider is unset.
 - **THEN** autocoder exits non-zero with an error naming the missing env
   var AND the provider it was needed for
 
-## MODIFIED Requirements
-
 ### Requirement: Per-repository ChatOps channel override
 autocoder SHALL allow each repository to override the global default
 ChatOps channel by setting `chatops_channel_id` (provider-native format)
 on the `repositories[]` entry. When absent, the repository uses
-`chatops.default_channel_id`.
+`chatops.default_channel_id`. The legacy `slack_channel_id` key on
+repositories is removed from the config schema as part of the broader
+`slack:` → `chatops:` rename.
 
 #### Scenario: Per-repo override present
 - **WHEN** a repository entry has `chatops_channel_id: <value>` set
@@ -80,14 +80,3 @@ on the `repositories[]` entry. When absent, the repository uses
 - **WHEN** a repository entry does NOT set `chatops_channel_id`
 - **THEN** AskUser escalations for that repository post to
   `chatops.default_channel_id`
-
-## REMOVED Requirements
-
-### Requirement: Per-repository Slack channel override (now `chatops_channel_id`)
-**Reason**: superseded by the provider-neutral `chatops_channel_id` field;
-the `slack_channel_id` key is removed from the config schema as part of the
-broader `slack:` → `chatops:` rename. There is no in-flight deployment
-outside the author's own to migrate.
-
-**Migration**: rename any `slack_channel_id:` in `repositories[]` entries
-to `chatops_channel_id:`. Value format is unchanged for Slack operators.

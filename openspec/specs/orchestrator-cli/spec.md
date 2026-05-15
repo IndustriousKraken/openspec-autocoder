@@ -521,7 +521,7 @@ autocoder SHALL query GitHub for open PRs whose `head` matches the configured ag
   from `repo.url`
 
 ### Requirement: Per-repo busy marker prevents concurrent work
-autocoder SHALL acquire a per-repo busy marker file at the start of each polling iteration and hold it through every stage of the pass (executor invocation, commit, review, push, PR creation). The marker lives outside the workspace at `/tmp/autocoder/busy/<workspace-basename>.json` and is created atomically via POSIX `O_EXCL`. Its presence prevents any other autocoder pass — same daemon or different — from concurrently working on the same repo. Crashes that bypass normal release (SIGKILL, segfault, host power loss) leave the marker behind for the next pass to detect and recover from.
+autocoder SHALL acquire a per-repo busy marker file at the start of each polling iteration and hold it through every stage of the pass (executor invocation, commit, review, push, PR creation). The marker lives outside the workspace at `/tmp/autocoder/busy/<workspace-basename>.json` and is created atomically via POSIX `O_EXCL`. Its presence prevents any other autocoder pass — same daemon or different — from concurrently working on the same repo. Crashes that bypass normal release (SIGKILL, segfault, host power loss) leave the marker behind for the next pass to detect and recover from. Stuck-state recovery SHALL prefer the subprocess-sidecar PGID (set by the executor after spawning Claude) over the marker's own `pgid` field when sending kill signals.
 
 #### Scenario: Acquire on a clean repo
 - **WHEN** a polling iteration begins AND no marker file exists at
@@ -563,9 +563,10 @@ autocoder SHALL acquire a per-repo busy marker file at the start of each polling
 - **WHEN** acquire detects a marker older than the stuck threshold
   AND the recorded `pid` does not correspond to a running process
   (verified via `kill(pid, 0)` returning `ESRCH`)
-- **THEN** the daemon deletes the marker, logs WARN naming the
-  marker's prior contents (so operators see what crashed), and
-  proceeds to acquire a fresh marker and run the iteration
+- **THEN** the daemon deletes the marker AND the subprocess
+  sidecar file (if present), logs WARN naming the marker's prior
+  contents (so operators see what crashed), and proceeds to
+  acquire a fresh marker and run the iteration
 
 #### Scenario: Stuck threshold exceeded, PID alive, comm matches
 - **WHEN** acquire detects a marker older than the stuck threshold
@@ -573,13 +574,20 @@ autocoder SHALL acquire a per-repo busy marker file at the start of each polling
   `/proc/<pid>/comm` matches the recorded `comm` field (Linux;
   the comm-check is skipped on non-Linux platforms and the PID
   liveness check is trusted alone)
-- **THEN** the daemon sends `SIGTERM` to the process group via
-  `killpg(pgid, SIGTERM)`, waits up to 5 seconds for the group to
-  exit, sends `SIGKILL` via `killpg(pgid, SIGKILL)` if still alive,
-  deletes the marker, logs WARN with the action taken, attempts
-  to post a chatops alert "repo recovered from stuck state"
-  (best-effort; failure to post is logged but does not block the
-  iteration), and proceeds to acquire a fresh marker and run
+- **THEN** the daemon reads the subprocess sidecar file at
+  `/tmp/autocoder/busy/<workspace-basename>.subprocess` (if
+  present). If present, the recorded subprocess PID is used as
+  the kill target (its PGID equals its PID because the executor
+  spawns with `process_group(0)`); if absent, the marker's
+  `pgid` field is used as the fallback
+- **AND** the daemon sends `SIGTERM` to that process group via
+  `killpg(target_pgid, SIGTERM)`, waits up to 5 seconds for the
+  group to exit, sends `SIGKILL` via `killpg(target_pgid,
+  SIGKILL)` if still alive
+- **AND** the daemon deletes the marker AND the subprocess
+  sidecar file, logs WARN with the action taken, attempts to
+  post a chatops alert "repo recovered from stuck state"
+  (best-effort), and proceeds to acquire a fresh marker and run
 - **AND** the iteration proceeds even when no chatops backend is
   configured
 
@@ -590,7 +598,7 @@ autocoder SHALL acquire a per-repo busy marker file at the start of each polling
 - **THEN** the daemon logs ERROR naming the discrepancy, attempts
   to post a chatops alert "repo stuck — please investigate"
   (best-effort), and SKIPS this iteration without modifying the
-  marker
+  marker or the subprocess sidecar
 - **AND** the marker stays in place for human investigation; the
   next polling iteration will re-evaluate
 - **AND** the iteration is skipped even when no chatops backend
@@ -601,5 +609,87 @@ autocoder SHALL acquire a per-repo busy marker file at the start of each polling
 - **WHEN** acquire detects a marker file that cannot be parsed as
   the expected JSON shape
 - **THEN** the daemon logs WARN naming the parse failure, deletes
-  the marker, and proceeds to acquire a fresh one
+  the marker AND the subprocess sidecar (if present), and
+  proceeds to acquire a fresh one
+
+### Requirement: ChatOps provider selection at startup
+autocoder SHALL read the `chatops.provider` field from `config.yaml` at
+startup and construct a `Box<dyn ChatOpsBackend>` for the matching
+provider via the chatops-manager factory. The supported values are
+`slack`, `discord`, `teams`, `mattermost`, and `matrix`. Any other value
+SHALL cause autocoder to exit non-zero at config-parse time.
+
+#### Scenario: Slack provider selected
+- **WHEN** `config.yaml` has `chatops.provider: slack` AND
+  `chatops.slack.bot_token_env` names an env var whose value is set
+- **THEN** the daemon constructs a `SlackBackend` and wraps it in
+  `Arc<dyn ChatOpsBackend>` for the polling loop
+
+#### Scenario: Experimental provider selected
+- **WHEN** `config.yaml` has `chatops.provider:` set to any of `discord`,
+  `teams`, `mattermost`, or `matrix` AND the matching `chatops.<provider>:`
+  sub-block is present AND all required env vars are set
+- **THEN** the daemon constructs the matching backend and wraps it in
+  `Arc<dyn ChatOpsBackend>` for the polling loop
+
+#### Scenario: Unknown provider rejected at config parse
+- **WHEN** `config.yaml` has `chatops.provider:` set to a value not in the
+  supported set
+- **THEN** `Config::load_from` returns an error whose text names the
+  invalid value AND lists the supported values
+
+### Requirement: Loud warning when an experimental backend is active
+autocoder SHALL emit exactly one startup log line per process declaring the
+active ChatOps backend. When the active backend's `is_experimental()`
+returns `true`, the log line SHALL be `warn`-level and SHALL contain the
+substrings `"EXPERIMENTAL"` AND `"best-effort"` AND the provider name.
+When `is_experimental()` returns `false`, the log line SHALL be
+`info`-level and name the provider without the experimental markers.
+
+#### Scenario: Slack backend logs info-level
+- **WHEN** `chatops.provider: slack` is in use
+- **THEN** the startup log emits one `info`-level line containing
+  `"ChatOps escalation enabled via slack"`
+- **AND** the line does NOT contain `"EXPERIMENTAL"` or `"best-effort"`
+
+#### Scenario: Experimental backend logs warn-level
+- **WHEN** `chatops.provider:` is `discord`, `teams`, `mattermost`, or
+  `matrix`
+- **THEN** the startup log emits one `warn`-level line containing
+  `"EXPERIMENTAL"` AND `"best-effort"` AND the selected provider name
+- **AND** the warning is emitted ONCE at startup, NOT per AskUser
+  iteration
+
+### Requirement: Missing provider sub-block fails fast
+autocoder SHALL fail at startup, before spawning any polling task, when
+the selected `chatops.provider` has no matching `chatops.<provider>:`
+sub-block or when a required env var for the selected provider is unset.
+
+#### Scenario: Provider selected with missing sub-block
+- **WHEN** `chatops.provider: discord` AND `chatops.discord:` is absent
+- **THEN** autocoder exits non-zero before spawning any polling task with
+  an error message naming both `discord` and the missing sub-block
+
+#### Scenario: Provider selected with missing env var
+- **WHEN** `chatops.provider: discord` AND `chatops.discord.bot_token_env`
+  names an env var that is unset
+- **THEN** autocoder exits non-zero with an error naming the missing env
+  var AND the provider it was needed for
+
+### Requirement: Per-repository ChatOps channel override
+autocoder SHALL allow each repository to override the global default
+ChatOps channel by setting `chatops_channel_id` (provider-native format)
+on the `repositories[]` entry. When absent, the repository uses
+`chatops.default_channel_id`. The legacy `slack_channel_id` key on
+repositories is removed from the config schema as part of the broader
+`slack:` → `chatops:` rename.
+
+#### Scenario: Per-repo override present
+- **WHEN** a repository entry has `chatops_channel_id: <value>` set
+- **THEN** AskUser escalations for that repository post to `<value>`
+
+#### Scenario: Per-repo override absent
+- **WHEN** a repository entry does NOT set `chatops_channel_id`
+- **THEN** AskUser escalations for that repository post to
+  `chatops.default_channel_id`
 

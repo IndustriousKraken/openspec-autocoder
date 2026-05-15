@@ -211,7 +211,7 @@ separate data flow.
   authorized for upload) is sent as configured
 
 ### Requirement: Executor output persistence and visibility
-The `ClaudeCliExecutor` SHALL persist every subprocess invocation's prompt, captured stdout, and captured stderr to a per-change log file outside the workspace, and SHALL emit a WARN-level diagnostic tail when an exit-0 run produced no working-tree changes. Additionally, `build_prompt` SHALL log a WARN naming the reason whenever it falls back to raw-markdown concatenation, so operators can distinguish "openspec succeeded" from each of the three silent-failure modes. This guarantees operators can root-cause "agent reported Completed without modifying the workspace" outcomes without re-running by hand.
+The `ClaudeCliExecutor` SHALL persist every subprocess invocation's prompt, captured stdout, and captured stderr to a per-change log file outside the workspace, and SHALL emit a WARN-level diagnostic tail when an exit-0 run produced no working-tree changes. Additionally, `build_prompt` SHALL log a WARN naming the reason whenever it falls back to raw-markdown concatenation. The executor SHALL record the spawned child's PID to a sidecar file alongside the busy marker so stuck-state recovery can target the right process group.
 
 #### Scenario: Persistent log file written on every run
 - **WHEN** `ClaudeCliExecutor::run` completes a subprocess invocation
@@ -274,6 +274,23 @@ The `ClaudeCliExecutor` SHALL persist every subprocess invocation's prompt, capt
 - **AND** this has no effect on the executor's normal
   exit-mapping behavior; it only enables process-group signaling
   during stuck-state recovery
+
+#### Scenario: Subprocess sidecar file tracks Claude's PID
+- **WHEN** `run_subprocess` successfully spawns the wrapped CLI
+- **THEN** the executor writes the child's PID (which equals its
+  PGID because of `process_group(0)`) to
+  `<system-temp>/autocoder/busy/<workspace-basename>.subprocess`
+  as plain decimal text followed by a newline
+- **AND** the file is removed when the child exits (RAII guard
+  scoped to `run_subprocess`)
+- **AND** a daemon crash that bypasses the guard leaves the
+  sidecar file in place, so the next pass's busy-marker stuck-
+  state recovery can read it and `killpg` the orphaned subprocess
+  tree (the original busy marker's `pgid` field records autocoder's
+  group, which is not the kill target an orphaned subprocess
+  requires)
+- **AND** errors writing the sidecar file are logged at WARN but
+  do NOT fail the executor outcome
 
 ### Requirement: Implementer prompt template loading
 The executor SHALL load an implementer prompt template at construction. The template wraps the openspec change content with a role-establishing imperative so the wrapped CLI knows it is acting as an autonomous implementer and not a chat assistant. The default template is compiled into the binary; deployments may override it by setting `executor.implementer_prompt_path` in `config.yaml` to a readable file path.
