@@ -77,6 +77,16 @@ pub async fn execute(cfg: Config) -> Result<()> {
     // plus a 10-minute buffer for review/push/PR steps.
     let stuck_threshold_secs: u64 = cfg.executor.timeout_secs.saturating_add(600);
 
+    // Perma-stuck consecutive-failure threshold. `perma_stuck_threshold`
+    // clamps a misconfigured 0 to 1 internally; we WARN once here so the
+    // operator notices their config is bogus.
+    if cfg.executor.perma_stuck_after_failures == Some(0) {
+        tracing::warn!(
+            "executor.perma_stuck_after_failures is set to 0; clamping to 1 (a zero threshold would mark every change perma-stuck before the first attempt — fix your config)"
+        );
+    }
+    let perma_stuck_threshold: u32 = cfg.executor.perma_stuck_threshold();
+
     let mut tasks: JoinSet<()> = JoinSet::new();
     for repo in cfg.repositories.iter().cloned() {
         if !repo_passes_startup_check(&repo, &cfg.github) {
@@ -117,6 +127,7 @@ pub async fn execute(cfg: Config) -> Result<()> {
                 reviewer,
                 chatops_ctx,
                 stuck_threshold_secs,
+                perma_stuck_threshold,
                 cancel,
             )
             .await

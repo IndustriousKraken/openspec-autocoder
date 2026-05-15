@@ -45,6 +45,11 @@ pub struct AlertEntry {
 pub struct AlertState {
     #[serde(default)]
     pub alerts: HashMap<AlertCategory, AlertEntry>,
+    /// Per-change perma-stuck alert throttle. Keyed by change name. The
+    /// 24h throttle ensures that a repeat fix-test-fail cycle on a single
+    /// change doesn't spam the alert channel.
+    #[serde(default)]
+    pub perma_stuck_alerts: HashMap<String, AlertEntry>,
 }
 
 fn alert_state_path(workspace: &Path) -> PathBuf {

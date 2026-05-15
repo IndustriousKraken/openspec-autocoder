@@ -73,6 +73,52 @@ pub fn ensure_initialized(
         git::ensure_remote(workspace, "fork", fork_url)
             .with_context(|| format!("ensuring fork remote points at {fork_url}"))?;
     }
+    // Per-workspace bookkeeping files live at the workspace root and must
+    // not appear in `git status` output (the dirty-check before each pass
+    // would otherwise refuse to proceed). Register them in
+    // `.git/info/exclude` once at init; the function is idempotent so a
+    // duplicate entry is never added.
+    if let Err(e) = ensure_git_info_excluded(workspace, ".failure-state.json") {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            "could not register .failure-state.json in .git/info/exclude: {e:#}"
+        );
+    }
+    Ok(())
+}
+
+/// Append `entry` to `<workspace>/.git/info/exclude` if it is not already
+/// present (whitespace-trimmed line match). The file is created if absent.
+/// Errors propagate so the caller can decide whether to ignore them; this
+/// function never panics or fails silently on parse issues.
+pub fn ensure_git_info_excluded(workspace: &Path, entry: &str) -> Result<()> {
+    let exclude_path = workspace.join(".git").join("info").join("exclude");
+    let parent = exclude_path
+        .parent()
+        .ok_or_else(|| anyhow!("exclude path has no parent: {}", exclude_path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating {}", parent.display()))?;
+    let existing = match std::fs::read_to_string(&exclude_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("reading {}", exclude_path.display()));
+        }
+    };
+    let already = existing.lines().any(|line| line.trim() == entry);
+    if already {
+        return Ok(());
+    }
+    let needs_newline = !existing.is_empty() && !existing.ends_with('\n');
+    let mut updated = existing;
+    if needs_newline {
+        updated.push('\n');
+    }
+    updated.push_str(entry);
+    updated.push('\n');
+    std::fs::write(&exclude_path, updated)
+        .with_context(|| format!("writing {}", exclude_path.display()))?;
     Ok(())
 }
 
@@ -301,6 +347,33 @@ mod tests {
         let remotes = list_remotes(&workspace);
         assert!(remotes.contains("origin"), "origin must be present");
         assert!(!remotes.contains("fork"), "fork must NOT be present");
+    }
+
+    #[test]
+    fn ensure_git_info_excluded_adds_once_and_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let remote = dir.path().join("remote");
+        let workspace = dir.path().join("local");
+        make_fixture_remote(&remote);
+        let url = remote.to_string_lossy().to_string();
+        ensure_initialized(&workspace, &url, None).unwrap();
+
+        let exclude_path = workspace.join(".git/info/exclude");
+        // After ensure_initialized, .failure-state.json should be registered.
+        let contents = std::fs::read_to_string(&exclude_path).unwrap();
+        assert!(
+            contents.lines().any(|l| l.trim() == ".failure-state.json"),
+            "exclude file must contain .failure-state.json: {contents}"
+        );
+
+        // Calling ensure_initialized again must NOT duplicate the entry.
+        ensure_initialized(&workspace, &url, None).unwrap();
+        let contents = std::fs::read_to_string(&exclude_path).unwrap();
+        let occurrences = contents
+            .lines()
+            .filter(|l| l.trim() == ".failure-state.json")
+            .count();
+        assert_eq!(occurrences, 1, "duplicate entry added: {contents}");
     }
 
     #[test]

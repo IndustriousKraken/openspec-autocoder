@@ -89,6 +89,25 @@ pub struct ExecutorConfig {
     /// `openspec instructions apply` for each change.
     #[serde(default)]
     pub implementer_prompt_path: Option<PathBuf>,
+    /// Number of consecutive Failed outcomes for a single change before
+    /// autocoder marks it perma-stuck (writes `.perma-stuck.json` in the
+    /// change directory, posts a chatops alert, and excludes the change
+    /// from `list_pending` until the marker is removed manually). When
+    /// unset, defaults to 2. A configured value of 0 is a misconfiguration
+    /// and is clamped to 1 with a WARN log at startup.
+    #[serde(default)]
+    pub perma_stuck_after_failures: Option<u32>,
+}
+
+impl ExecutorConfig {
+    /// Effective perma-stuck threshold. `None` → 2 (the default). Any
+    /// configured value is clamped to `>=1` so the agent always gets at
+    /// least one attempt. Callers that want the raw configured value
+    /// (e.g. to warn about a zero) read `perma_stuck_after_failures`
+    /// directly.
+    pub fn perma_stuck_threshold(&self) -> u32 {
+        self.perma_stuck_after_failures.unwrap_or(2).max(1)
+    }
 }
 
 /// Per-iteration tool-use restrictions for the wrapped agent CLI. When
@@ -1329,6 +1348,66 @@ chatops:
         // Helpers must also default to true when chatops itself is None.
         assert!(NotificationsConfig::start_work_enabled(None));
         assert!(NotificationsConfig::failure_alerts_enabled(None));
+    }
+
+    #[test]
+    fn executor_perma_stuck_default_is_two() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.executor.perma_stuck_after_failures.is_none());
+        assert_eq!(cfg.executor.perma_stuck_threshold(), 2);
+    }
+
+    #[test]
+    fn executor_perma_stuck_clamps_zero_to_one() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  perma_stuck_after_failures: 0
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.perma_stuck_after_failures, Some(0));
+        assert_eq!(
+            cfg.executor.perma_stuck_threshold(),
+            1,
+            "zero must clamp to one"
+        );
+    }
+
+    #[test]
+    fn executor_perma_stuck_accepts_custom_value() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  perma_stuck_after_failures: 5
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.perma_stuck_after_failures, Some(5));
+        assert_eq!(cfg.executor.perma_stuck_threshold(), 5);
     }
 
     #[test]

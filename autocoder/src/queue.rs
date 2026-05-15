@@ -14,6 +14,7 @@ const ARCHIVE_DIR: &str = "archive";
 const LOCK_FILE: &str = ".in-progress";
 const PROPOSAL_FILE: &str = "proposal.md";
 const QUESTION_FILE: &str = ".question.json";
+const PERMA_STUCK_FILE: &str = ".perma-stuck.json";
 
 fn changes_dir(workspace: &Path) -> PathBuf {
     workspace.join(CHANGES_SUBDIR)
@@ -26,8 +27,9 @@ fn change_dir(workspace: &Path, change: &str) -> PathBuf {
 /// List pending change names: direct subdirectories of
 /// `<workspace>/openspec/changes/` that are not the literal `archive`
 /// directory, do not begin with `.`, do not contain a `.in-progress` lock
-/// file, do not contain a `.question.json` waiting marker, and contain at
-/// least a `proposal.md` file. Returns sorted ascending.
+/// file, do not contain a `.question.json` waiting marker, do not contain
+/// a `.perma-stuck.json` marker, and contain at least a `proposal.md`
+/// file. Returns sorted ascending.
 pub fn list_pending(workspace: &Path) -> Result<Vec<String>> {
     let root = changes_dir(workspace);
     if !root.exists() {
@@ -58,6 +60,12 @@ pub fn list_pending(workspace: &Path) -> Result<Vec<String>> {
         }
         if dir.join(QUESTION_FILE).exists() {
             // Waiting on a human reply — handled by `list_waiting`, not here.
+            continue;
+        }
+        if dir.join(PERMA_STUCK_FILE).exists() {
+            // Perma-stuck: the change has hit the consecutive-failure
+            // threshold and autocoder will not retry until the operator
+            // removes the marker file.
             continue;
         }
         if !dir.join(PROPOSAL_FILE).is_file() {
@@ -485,6 +493,28 @@ mod tests {
 
         let waiting = list_waiting(ws).unwrap();
         assert_eq!(waiting, vec!["real-wait".to_string()]);
+    }
+
+    #[test]
+    fn list_pending_excludes_perma_stuck() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "alpha");
+        make_change(ws, "beta");
+        make_change(ws, "gamma");
+        // Mark `beta` as perma-stuck.
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR).join("beta").join(PERMA_STUCK_FILE),
+            r#"{"change":"beta","consecutive_failures":2,"last_reason":"x","marked_stuck_at":"2026-01-01T00:00:00Z","operator_action":"Delete this file to retry the change."}"#,
+        )
+        .unwrap();
+
+        let pending = list_pending(ws).unwrap();
+        assert_eq!(
+            pending,
+            vec!["alpha".to_string(), "gamma".to_string()],
+            "perma-stuck change must be excluded from list_pending"
+        );
     }
 
     #[test]
