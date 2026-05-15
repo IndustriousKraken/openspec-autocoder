@@ -32,8 +32,3 @@
 
 - [x] 5.1 `cargo test` passes; net new tests = at least 4.
 - [x] 5.2 `openspec validate track-subprocess-pgid --strict` passes.
-- [ ] 5.3 Operator verification on a running deployment: with the deploy live, inspect during a Claude run:
-    ```
-    cat /tmp/autocoder/busy/<basename>.subprocess
-    ```
-    The integer printed must match the actual Claude PID from `ps --ppid <autocoder-pid>`. After the run completes, the file must be gone.

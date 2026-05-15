@@ -148,7 +148,7 @@ Matrix spec.
 
 ## MODIFIED Requirements
 
-### Requirement: Post escalation question via ChatOpsBackend
+### Requirement: Post escalation question to Slack
 The chatops-manager SHALL expose a `post_question(channel, change, question)`
 method on the `ChatOpsBackend` trait. Each concrete backend SHALL post a
 human-readable question to its provider, prefixed with `❓ <change>:`, and
@@ -175,7 +175,7 @@ SHALL return an opaque string handle that subsequent reply-polls reference.
 - **THEN** it returns `false`
 - **AND** `provider_name()` returns `"slack"`
 
-### Requirement: Identify the bot's own user id at construction
+### Requirement: Identify the bot's own Slack user id
 Each backend SHALL learn its own provider user id at construction time so
 subsequent reply detection can distinguish bot messages from human replies.
 
@@ -195,7 +195,7 @@ subsequent reply detection can distinguish bot messages from human replies.
 - **AND** on identity-call failure the backend's constructor returns an
   error whose text names the provider and the failing call
 
-### Requirement: Poll thread for first non-bot reply
+### Requirement: Poll Slack thread for first non-bot reply
 The `poll_thread_for_human_reply(channel, handle)` method SHALL return the
 earliest message in the thread/reference identified by `handle` whose
 author is not the bot itself, or `None` if no such message is present.
