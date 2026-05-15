@@ -295,9 +295,10 @@ chatops:
   notifications:
     start_work: true       # default true; one message per change pickup
     failure_alerts: true   # default true; throttled per (repo, category)
+    pr_opened: true        # default true; one message per opened PR (with link)
 ```
 
-Both keys are optional. An absent `notifications:` block parses to "both true" — first-time deployments see useful chatops traffic without further configuration. Set a key to `false` to suppress that stream without affecting the other.
+All three keys are optional. An absent `notifications:` block parses to "all true" — first-time deployments see useful chatops traffic without further configuration. Set a key to `false` to suppress that stream without affecting the others.
 
 If `post_notification` itself fails (network blip, channel renamed, scope revoked), the failure is logged to stderr but is NEVER re-routed back through chatops — there is no recursive alert cascade.
 

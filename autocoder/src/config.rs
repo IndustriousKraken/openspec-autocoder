@@ -395,6 +395,8 @@ pub struct NotificationsConfig {
     pub start_work: bool,
     #[serde(default = "default_true")]
     pub failure_alerts: bool,
+    #[serde(default = "default_true")]
+    pub pr_opened: bool,
 }
 
 impl Default for NotificationsConfig {
@@ -402,6 +404,7 @@ impl Default for NotificationsConfig {
         Self {
             start_work: true,
             failure_alerts: true,
+            pr_opened: true,
         }
     }
 }
@@ -424,6 +427,16 @@ impl NotificationsConfig {
         chatops
             .and_then(|s| s.notifications.as_ref())
             .map(|n| n.failure_alerts)
+            .unwrap_or(true)
+    }
+
+    /// Resolve the effective `pr_opened` flag given the (optional) ChatOps
+    /// config: defaults to `true` when no `notifications:` block was set,
+    /// and honors the explicit value otherwise.
+    pub fn pr_opened_enabled(chatops: Option<&ChatOpsConfig>) -> bool {
+        chatops
+            .and_then(|s| s.notifications.as_ref())
+            .map(|n| n.pr_opened)
             .unwrap_or(true)
     }
 }
@@ -1377,6 +1390,84 @@ chatops:
             msg.contains("typo_field") || msg.to_lowercase().contains("unknown"),
             "error should mention unknown field; got: {msg}"
         );
+    }
+
+    #[test]
+    fn pr_opened_default_is_true_when_block_absent() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: slack
+  default_channel_id: C0DEFAULT
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let co = cfg.chatops.expect("chatops present");
+        assert!(NotificationsConfig::pr_opened_enabled(Some(&co)));
+        assert!(NotificationsConfig::pr_opened_enabled(None));
+    }
+
+    #[test]
+    fn pr_opened_default_is_true_when_field_absent() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: slack
+  default_channel_id: C0DEFAULT
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
+  notifications:
+    start_work: false
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let co = cfg.chatops.expect("chatops present");
+        let n = co.notifications.clone().expect("notifications present");
+        assert!(n.pr_opened, "field defaults to true when omitted");
+        assert!(NotificationsConfig::pr_opened_enabled(Some(&co)));
+    }
+
+    #[test]
+    fn pr_opened_explicit_false_disables() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: slack
+  default_channel_id: C0DEFAULT
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
+  notifications:
+    pr_opened: false
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let co = cfg.chatops.expect("chatops present");
+        let n = co.notifications.clone().expect("notifications present");
+        assert!(!n.pr_opened);
+        assert!(!NotificationsConfig::pr_opened_enabled(Some(&co)));
     }
 
     #[test]

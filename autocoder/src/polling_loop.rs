@@ -40,6 +40,10 @@ pub struct ChatOpsContext {
     /// to `true` when the operator did not set
     /// `chatops.notifications.failure_alerts`.
     pub failure_alerts_enabled: bool,
+    /// Whether to post a one-line notification each time a PR is opened
+    /// (with a link to the PR). Defaults to `true` when the operator did
+    /// not set `chatops.notifications.pr_opened`.
+    pub pr_opened_enabled: bool,
 }
 
 /// Run the polling loop for a single repository. Each iteration is wrapped in
@@ -217,6 +221,7 @@ fn build_chatops_ctx(repo: &RepositoryConfig, slot: &ChatOpsSlot) -> ChatOpsCont
             .to_string(),
         start_work_enabled: slot.start_work_enabled,
         failure_alerts_enabled: slot.failure_alerts_enabled,
+        pr_opened_enabled: slot.pr_opened_enabled,
     }
 }
 
@@ -535,10 +540,22 @@ pub async fn run_pass_through_commits(
     // It is intentionally untracked; it must not trip the dirty check.
     let dirty_filtered = filter_alert_state_lines(&dirty);
     if !dirty_filtered.is_empty() {
-        return Err(anyhow!(
+        let e = anyhow!(
             "workspace {} is dirty before pass; refusing to proceed:\n{dirty_filtered}",
             workspace.display()
-        ));
+        );
+        handle_predictable_failure(
+            workspace,
+            &repo.url,
+            chatops_ctx,
+            chatops_ctx
+                .map(|c| c.failure_alerts_enabled)
+                .unwrap_or(false),
+            AlertCategory::WorkspaceDirtyMidIteration,
+            &e,
+        )
+        .await;
+        return Err(e);
     }
 
     git::fetch(workspace)?;
@@ -1203,6 +1220,32 @@ async fn maybe_post_start_of_work(
     }
 }
 
+/// Post a one-line ChatOps notification announcing a freshly-opened PR.
+/// Suppressed when chatops is not configured OR when `pr_opened_enabled` is
+/// false. Best-effort: a failed post logs at WARN and never propagates.
+async fn maybe_post_pr_opened(
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    pr_url: &str,
+    change_count: usize,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.pr_opened_enabled {
+        return;
+    }
+    let text = format!(
+        "🎉 `{}`: opened PR {pr_url} with {change_count} change(s)",
+        repo.url
+    );
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            pr = %pr_url,
+            "pr-opened notification failed; continuing: {e:#}"
+        );
+    }
+}
+
 async fn handle_outcome(
     workspace: &Path,
     repo: &RepositoryConfig,
@@ -1316,11 +1359,19 @@ async fn handle_outcome(
                     reason: "agent attempted lazy archive (rename only, no implementation)".into(),
                 });
             } else {
+                // Build the commit subject BEFORE the archive rename: it
+                // reads `openspec/changes/<change>/proposal.md`, which the
+                // archive step moves to `openspec/changes/archive/...`.
                 let subject = build_commit_subject(workspace, change)?;
+                // Archive BEFORE the commit so the single commit captures
+                // both the executor's implementation diff AND the archive
+                // rename. After this sequence the working tree is clean,
+                // even for the trailing change of a pass — no dangling
+                // rename for the next iteration's dirty-check to trip on.
+                queue::archive(workspace, change)?;
                 git::add_all(workspace)?;
                 git::commit(workspace, &subject)?;
             }
-            queue::archive(workspace, change)?;
             Ok(QueueStep::Archived)
         }
     }
@@ -1507,6 +1558,11 @@ async fn open_pull_request(
         pr_number = pr.number,
         "opened PR"
     );
+
+    // Best-effort: post a one-line ChatOps notification with a link to
+    // the new PR. PR creation already succeeded; never propagate a
+    // failure from this step.
+    maybe_post_pr_opened(repo, chatops_ctx, &pr.html_url, changes.len()).await;
 
     // Best-effort: post a follow-up comment with each change's implementer
     // stdout. PR creation already succeeded; never propagate a failure
@@ -2483,6 +2539,7 @@ mod tests {
             channel: "C_TEST".to_string(),
             start_work_enabled: true,
             failure_alerts_enabled: true,
+            pr_opened_enabled: true,
         };
         let test_github = GithubConfig {
             token_env: "X".into(),
@@ -2580,6 +2637,7 @@ mod tests {
             channel: "C_TEST".to_string(),
             start_work_enabled: true,
             failure_alerts_enabled: true,
+            pr_opened_enabled: true,
         };
         let test_github = GithubConfig {
             token_env: "X".into(),
@@ -2690,6 +2748,7 @@ mod tests {
             channel: "C_TEST".to_string(),
             start_work_enabled: true,
             failure_alerts_enabled: true,
+            pr_opened_enabled: true,
         };
         let test_github = GithubConfig {
             token_env: "X".into(),
@@ -2821,6 +2880,7 @@ mod tests {
             channel: "C_TEST".to_string(),
             start_work_enabled: true,
             failure_alerts_enabled: true,
+            pr_opened_enabled: true,
         };
         let test_github = GithubConfig {
             token_env: "X".into(),
@@ -2930,6 +2990,7 @@ mod tests {
             channel: "C_TEST".to_string(),
             start_work_enabled: true,
             failure_alerts_enabled: true,
+            pr_opened_enabled: true,
         };
         let test_github = GithubConfig {
             token_env: "X".into(),
@@ -3058,6 +3119,7 @@ mod tests {
             channel: "C_TEST".to_string(),
             start_work_enabled: true,
             failure_alerts_enabled: true,
+            pr_opened_enabled: true,
         };
         let test_github = GithubConfig {
             token_env: "X".into(),
@@ -3654,6 +3716,7 @@ mod tests {
             channel: "C_TEST".into(),
             start_work_enabled: true,
             failure_alerts_enabled: true,
+            pr_opened_enabled: true,
         };
         let github = GithubConfig {
             token_env: "X".into(),
@@ -3700,6 +3763,7 @@ mod tests {
             channel: "C_TEST".into(),
             start_work_enabled: false, // disabled
             failure_alerts_enabled: true,
+            pr_opened_enabled: true,
         };
         let github = GithubConfig {
             token_env: "X".into(),
@@ -3790,6 +3854,7 @@ mod tests {
             channel: "C_TEST".into(),
             start_work_enabled: true,
             failure_alerts_enabled: true,
+            pr_opened_enabled: true,
         };
         let github = GithubConfig {
             token_env: "X".into(),
@@ -3883,6 +3948,7 @@ mod tests {
             channel: "C_TEST".into(),
             start_work_enabled: true,
             failure_alerts_enabled: true,
+            pr_opened_enabled: true,
         };
         let github = GithubConfig {
             token_env: "X".into(),
@@ -4367,6 +4433,7 @@ mod tests {
             channel: "C_TEST".into(),
             start_work_enabled: false, // suppress start-of-work to keep matcher unambiguous
             failure_alerts_enabled: true,
+            pr_opened_enabled: true,
         };
         let test_github = GithubConfig {
             token_env: "X".into(),
@@ -4843,6 +4910,415 @@ mod tests {
             still_pending.contains(&"ch04".to_string()),
             "untouched change still pending: {still_pending:?}"
         );
+    }
+
+    /// commit-trailing-archive: after a single-change archive pass, the
+    /// working tree MUST be clean. The original bug left the archive
+    /// rename uncommitted, causing the next iteration's dirty check to
+    /// trip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archived_change_leaves_clean_working_tree() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "only-change", "fixture for trailing-archive");
+        let executor = PerChangeArtifactExecutor;
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let (processed, _) = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &github_cfg,
+            &executor,
+            None,
+            u32::MAX,
+            u32::MAX,
+        )
+        .await
+        .expect("pass succeeds");
+        assert_eq!(processed, vec!["only-change".to_string()]);
+        let porcelain = crate::git::status_porcelain(&ws).unwrap();
+        assert!(
+            porcelain.trim().is_empty(),
+            "working tree must be clean after archive; got:\n{porcelain}"
+        );
+    }
+
+    /// commit-trailing-archive: HEAD's commit MUST contain both the
+    /// executor's implementation file AND the archive rename of
+    /// proposal.md / tasks.md.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_contains_both_impl_and_archive_rename() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "feature-x", "trailing archive test");
+        let executor = PerChangeArtifactExecutor;
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let _ = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &github_cfg,
+            &executor,
+            None,
+            u32::MAX,
+            u32::MAX,
+        )
+        .await
+        .expect("pass succeeds");
+
+        // diff-tree --name-status HEAD^..HEAD shows the files changed in
+        // the new commit. Use `-M` to detect renames so the archive move
+        // shows as a single `R` entry rather than D+A.
+        let out = std::process::Command::new("git")
+            .args(["diff-tree", "--no-commit-id", "--name-status", "-r", "-M", "HEAD^..HEAD"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "diff-tree failed");
+        let body = String::from_utf8_lossy(&out.stdout).to_string();
+
+        // Implementation artifact must appear.
+        assert!(
+            body.contains("artifact-feature-x.txt"),
+            "commit missing executor artifact; diff-tree output:\n{body}"
+        );
+        // Archive move must appear (either as a rename or as D+A pair).
+        let has_rename = body.lines().any(|l| {
+            l.starts_with("R")
+                && l.contains("openspec/changes/feature-x/proposal.md")
+                && l.contains("openspec/changes/archive/")
+        });
+        let has_delete_and_add = body
+            .lines()
+            .any(|l| l.starts_with("D\topenspec/changes/feature-x/"))
+            && body.lines().any(|l| {
+                l.starts_with("A\topenspec/changes/archive/") && l.contains("-feature-x/")
+            });
+        assert!(
+            has_rename || has_delete_and_add,
+            "commit must contain archive rename of openspec/changes/feature-x/; diff-tree output:\n{body}"
+        );
+    }
+
+    /// alert-on-dirty-workspace-mid-iteration: a workspace dirty at
+    /// `run_pass_through_commits` time SHALL post a chatops alert under
+    /// `WorkspaceDirtyMidIteration` and persist state, mirroring the
+    /// other predictable-failure categories.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dirty_workspace_emits_alert_when_chatops_configured() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // Seed a dirty state: write an untracked file under openspec/.
+        std::fs::create_dir_all(ws.join("openspec/changes/leftover")).unwrap();
+        std::fs::write(
+            ws.join("openspec/changes/leftover/proposal.md"),
+            "## Why\nleftover\n",
+        )
+        .unwrap();
+        // Don't commit — leaves the workspace dirty.
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let chatops_ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        };
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        struct UnreachableExecutor;
+        #[async_trait::async_trait]
+        impl Executor for UnreachableExecutor {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                unreachable!("dirty check should error before any executor.run")
+            }
+            async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let result = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &github_cfg,
+            &UnreachableExecutor,
+            Some(&chatops_ctx),
+            u32::MAX,
+            u32::MAX,
+        )
+        .await;
+        assert!(result.is_err(), "dirty workspace should produce Err");
+        assert!(
+            format!("{:#}", result.unwrap_err()).contains("dirty before pass"),
+            "error message should name the dirty state"
+        );
+
+        mock.assert_async().await;
+        let state = crate::alert_state::AlertState::load_or_default(&ws);
+        assert!(
+            state
+                .alerts
+                .contains_key(&crate::alert_state::AlertCategory::WorkspaceDirtyMidIteration),
+            "alert state must record the WorkspaceDirtyMidIteration timestamp"
+        );
+    }
+
+    /// alert-on-dirty-workspace-mid-iteration: without chatops configured,
+    /// the dirty path still returns Err but no panic, no state file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dirty_workspace_silent_without_chatops() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        std::fs::create_dir_all(ws.join("openspec/changes/leftover")).unwrap();
+        std::fs::write(
+            ws.join("openspec/changes/leftover/proposal.md"),
+            "## Why\nleftover\n",
+        )
+        .unwrap();
+
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        struct UnreachableExecutor;
+        #[async_trait::async_trait]
+        impl Executor for UnreachableExecutor {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+            async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let result = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &github_cfg,
+            &UnreachableExecutor,
+            None, // no chatops
+            u32::MAX,
+            u32::MAX,
+        )
+        .await;
+        assert!(result.is_err(), "dirty workspace should still produce Err");
+        // No chatops → handle_predictable_failure short-circuits before
+        // touching the state file.
+        assert!(
+            !ws.join(".alert-state.json").exists(),
+            "no chatops, no state file write"
+        );
+    }
+
+    /// pr-opened-chatops-notification: when `pr_opened_enabled = true`,
+    /// `maybe_post_pr_opened` posts exactly one message to the channel,
+    /// containing the repository URL, the PR URL, and the change count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_opened_notification_fires_when_enabled() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("opened PR".to_string()),
+                mockito::Matcher::Regex(
+                    "https://github\\.com/owner/repo/pull/42".to_string(),
+                ),
+                mockito::Matcher::Regex("3 change".to_string()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        };
+        let repo = RepositoryConfig {
+            url: "git@github.com:owner/repo.git".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+        };
+        maybe_post_pr_opened(
+            &repo,
+            Some(&ctx),
+            "https://github.com/owner/repo/pull/42",
+            3,
+        )
+        .await;
+        mock.assert_async().await;
+    }
+
+    /// pr-opened-chatops-notification: when `pr_opened_enabled = false`,
+    /// no chatops post is made.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_opened_notification_suppressed_when_disabled() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .expect(0)
+            .create_async()
+            .await;
+        let ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: false,
+        };
+        let repo = RepositoryConfig {
+            url: "git@github.com:owner/repo.git".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+        };
+        maybe_post_pr_opened(
+            &repo,
+            Some(&ctx),
+            "https://github.com/owner/repo/pull/42",
+            1,
+        )
+        .await;
+        mock.assert_async().await;
+    }
+
+    /// pr-opened-chatops-notification: when the chatops backend's post
+    /// returns Err, the helper does NOT panic and does NOT propagate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_opened_notification_failure_does_not_propagate() {
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let _mock = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":false,"error":"channel_not_found"}"#)
+            .create_async()
+            .await;
+        let ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        };
+        let repo = RepositoryConfig {
+            url: "git@github.com:owner/repo.git".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+        };
+        // Should not panic; should return Ok-equivalent (it's an async fn
+        // returning unit, so "doesn't panic" is the assertion).
+        maybe_post_pr_opened(
+            &repo,
+            Some(&ctx),
+            "https://github.com/owner/repo/pull/42",
+            1,
+        )
+        .await;
+    }
+
+    /// pr-opened-chatops-notification: when chatops is unconfigured,
+    /// the helper is a no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_opened_notification_noop_without_chatops() {
+        let repo = RepositoryConfig {
+            url: "git@github.com:owner/repo.git".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+        };
+        maybe_post_pr_opened(
+            &repo,
+            None, // no chatops
+            "https://github.com/owner/repo/pull/42",
+            1,
+        )
+        .await;
+    }
+
+    /// commit-trailing-archive: after a multi-change pass, the working
+    /// tree MUST be clean (one commit per change, each containing its
+    /// own archive move).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_change_pass_clean_after_each() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        for n in 1..=3 {
+            add_committed_change(&ws, &format!("ch{n:02}"), &format!("fixture {n}"));
+        }
+        let executor = PerChangeArtifactExecutor;
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+        };
+        let (processed, _) = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &github_cfg,
+            &executor,
+            None,
+            u32::MAX,
+            u32::MAX,
+        )
+        .await
+        .expect("pass succeeds");
+        assert_eq!(processed.len(), 3, "all three archived");
+
+        // Working tree must be clean.
+        let porcelain = crate::git::status_porcelain(&ws).unwrap();
+        assert!(
+            porcelain.trim().is_empty(),
+            "working tree must be clean after multi-change pass; got:\n{porcelain}"
+        );
+
+        // Exactly 3 new commits on agent-q ahead of main.
+        let out = std::process::Command::new("git")
+            .args(["rev-list", "--count", "main..HEAD"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        let count: u32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(count, 3, "three commits ahead of main, one per change");
     }
 
     // ============================================================

@@ -32,6 +32,7 @@ pub struct ChatOpsSlot {
     pub default_channel_id: String,
     pub start_work_enabled: bool,
     pub failure_alerts_enabled: bool,
+    pub pr_opened_enabled: bool,
 }
 
 pub type GithubHolder = Arc<ArcSwap<GithubConfig>>;
@@ -503,6 +504,7 @@ async fn build_chatops_slot(cfg: Option<&ChatOpsConfig>) -> Result<Option<ChatOp
         default_channel_id: co.default_channel_id.clone(),
         start_work_enabled: NotificationsConfig::start_work_enabled(Some(co)),
         failure_alerts_enabled: NotificationsConfig::failure_alerts_enabled(Some(co)),
+        pr_opened_enabled: NotificationsConfig::pr_opened_enabled(Some(co)),
     }))
 }
 

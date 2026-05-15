@@ -86,63 +86,111 @@ The orchestrator SHALL provide a `rewind` subcommand that recovers from a failed
 - **AND** at the end, if any unarchive failed, the process exits non-zero with stderr listing the failed changes and their reasons; otherwise it exits 0 with a summary log line naming all rewound changes
 
 ### Requirement: Per-repository asynchronous polling loop
-autocoder SHALL implement the per-repository polling task referenced in `orchestrator-architecture/specs/orchestrator-cli/spec.md` as a sleep-then-iterate cycle that runs the architecture's single-pass workflow on every iteration. Each iteration's queue walk SHALL commit at most `max_changes_per_pr` archived changes before stopping; remaining pending changes wait for the next iteration.
+autocoder SHALL implement the per-repository polling task referenced in `orchestrator-architecture/specs/orchestrator-cli/spec.md` as a sleep-then-iterate cycle that runs the architecture's single-pass workflow on every iteration. Each polling task SHALL apply a startup jitter (a random sleep in `[0, startup_jitter_max_secs]`) before its first iteration, and an inter-iteration jitter (a random uniform offset in `[-jitter_pct%, +jitter_pct%]` of `poll_interval_sec`) on every subsequent sleep. Both jitter sleeps SHALL respect the task's cancellation token.
 
 #### Scenario: Spawn count matches config
 - **WHEN** the daemon starts with a config containing N repositories AND the workspace collision check passes
 - **THEN** exactly N polling tasks are spawned via `tokio::task::JoinSet`
 - **AND** each task owns its own workspace path (no two tasks share a path; collision detection at startup enforces non-overlap)
 
+#### Scenario: Startup jitter staggers first iterations
+- **WHEN** the daemon spawns N polling tasks with default
+  `startup_jitter_max_secs = 30`
+- **THEN** each task draws a random sleep duration uniformly from
+  `[0, 30]` seconds and waits that long BEFORE its first iteration
+- **AND** different tasks draw independently, so the first iterations
+  of the N tasks are spread across the 30-second window rather than
+  beginning simultaneously
+
+#### Scenario: Startup jitter of zero disables staggering
+- **WHEN** `executor.startup_jitter_max_secs == 0`
+- **THEN** every task begins its first iteration immediately on spawn
+  (matching the pre-change behavior); no startup sleep occurs
+
 #### Scenario: Normal iteration
 - **WHEN** a polling task wakes (start of process or end of previous sleep)
 - **THEN** it runs the full single-pass workflow for its repository: workspace init → stale-lock cleanup → dirty-workspace refusal → branch recreation → queue walk → push and PR creation if any commits were produced
-- **AND** the task then sleeps for `poll_interval_sec` before iterating again
+- **AND** the task then sleeps for a jittered duration of
+  `poll_interval_sec ± (poll_interval_sec * jitter_pct / 100)`
+  before iterating again
 - **AND** no two iterations within the same task overlap
 
+#### Scenario: Inter-iteration jitter offset is uniformly distributed
+- **WHEN** `executor.inter_iteration_jitter_pct = 10` AND
+  `repo.poll_interval_sec = 300`
+- **THEN** each inter-iteration sleep duration is drawn uniformly from
+  `[270, 330]` seconds (300 ± 30, i.e. ±10%)
+- **AND** the draw is independent per iteration; back-to-back
+  iterations do not share a fixed offset
+
+#### Scenario: Inter-iteration jitter of zero gives exact interval
+- **WHEN** `executor.inter_iteration_jitter_pct == 0`
+- **THEN** every inter-iteration sleep is exactly `poll_interval_sec`
+  seconds (matching the pre-change behavior); the offset is not drawn
+
 #### Scenario: Iteration runtime exceeds poll interval
-- **WHEN** an iteration's wall-clock runtime exceeds `poll_interval_sec`
+- **WHEN** an iteration's wall-clock runtime exceeds the (possibly-jittered) `poll_interval_sec`
 - **THEN** the next iteration begins immediately after the current one finishes
 - **AND** no negative sleep is attempted; no two iterations within the same task run in parallel
 
-#### Scenario: Per-iteration commit cap
-- **WHEN** the queue walk has already archived `max_changes_per_pr`
-  changes during the current iteration AND additional pending changes
-  remain in the queue
-- **THEN** the walk stops; the iteration proceeds to the push+PR step
-  with exactly `max_changes_per_pr` commits
-- **AND** the remaining pending changes are NOT removed from the queue
-  and SHALL be picked up by the next iteration
+#### Scenario: Cancellation interrupts startup jitter
+- **WHEN** SIGINT or SIGTERM arrives while a task is in its startup
+  jitter sleep (i.e. before its first iteration)
+- **THEN** the task observes the cancellation token within 200 ms,
+  exits the jitter sleep, and does NOT begin its first iteration
+- **AND** the main process exits within 30 seconds total
 
-#### Scenario: Failed and escalated changes do not count toward cap
-- **WHEN** the queue walk processes a change whose outcome is `Failed`
-  or `Escalated` (i.e. no commit is produced)
-- **THEN** that change does NOT count toward `max_changes_per_pr`; the
-  walk continues to the next pending change
-- **AND** only `Archived` and `ArchivedSelfHeal` outcomes (which DO
-  produce commits) increment the count
-
-#### Scenario: Resumed waiting change counts toward cap
-- **WHEN** the pass begins by resuming a previously-waiting change AND
-  that resume archives successfully
-- **THEN** the resumed-and-archived change counts as `1` toward the
-  iteration's `max_changes_per_pr` cap before the walk reads new
-  pending changes from the queue
-
-#### Scenario: Cap of 1 ships one change per PR
-- **WHEN** `max_changes_per_pr == 1` AND the queue contains multiple
-  pending changes
-- **THEN** each polling iteration ships exactly one change per PR; the
-  queue drains across N iterations rather than one
-- **AND** the operator sees N small PRs over time rather than one large PR
+#### Scenario: Cancellation interrupts jittered inter-iteration sleep
+- **WHEN** SIGINT or SIGTERM arrives while a task is in its
+  inter-iteration sleep
+- **THEN** the task exits the sleep within 200 ms and does not begin
+  another iteration
+- **AND** this holds whether or not the sleep was the jittered or
+  non-jittered branch (a `jitter_pct == 0` configuration produces the
+  same cancellation latency)
 
 ### Requirement: Iteration-level error tolerance
-The polling loop SHALL continue running after a failed iteration; a single iteration's error MUST NOT terminate the task or affect other repositories.
+The polling loop SHALL continue running after a failed iteration; a single iteration's error MUST NOT terminate the task or affect other repositories. Predictable failure categories (workspace init, mid-iteration dirty workspace, branch push, PR creation) SHALL emit a throttled chatops alert via the existing `AlertCategory` + `handle_predictable_failure` mechanism before the iteration returns `Err`.
 
 #### Scenario: Iteration fails
 - **WHEN** any error occurs during a polling iteration (workspace init, git operation, executor failure, PR creation)
 - **THEN** the task emits a log line of the form `"polling iteration failed for <url>: <error chain>"` naming the failed step
 - **AND** the task sleeps for `poll_interval_sec` and proceeds to the next iteration
 - **AND** other repositories' polling tasks are unaffected (their iterations continue on schedule)
+
+#### Scenario: Mid-iteration dirty workspace alerts via chatops
+- **WHEN** `run_pass_through_commits` finds `git status --porcelain`
+  non-empty at the start of a pass (after filtering autocoder
+  bookkeeping files like `.alert-state.json`) AND chatops is
+  configured AND `failure_alerts_enabled` is true
+- **THEN** autocoder posts a throttled chatops notification under
+  `AlertCategory::WorkspaceDirtyMidIteration` naming the repository
+  URL and a short excerpt of the porcelain output
+- **AND** the iteration returns the existing `Err` ("workspace ... is
+  dirty before pass; refusing to proceed: ...")
+- **AND** subsequent iterations that produce the same dirty state
+  within 24 hours do NOT re-post (the per-category 24h throttle
+  suppresses duplicates, matching the existing
+  `WorkspaceInitFailure`/`BranchPushFailure`/`PrCreationFailure`
+  behavior)
+
+#### Scenario: Mid-iteration dirty workspace without chatops still logs
+- **WHEN** the dirty-workspace condition above occurs AND chatops is
+  not configured (or `failure_alerts_enabled` is false)
+- **THEN** no chatops post is attempted
+- **AND** the existing ERROR log line is the operator's sole signal
+- **AND** the iteration still returns `Err` and the polling loop
+  proceeds to the next sleep
+
+#### Scenario: Dirty-workspace alert clears after recovery
+- **WHEN** a subsequent iteration succeeds (workspace no longer
+  dirty AND the pass produces commits AND push+PR steps both
+  succeed)
+- **THEN** the existing on-success `AlertState::clear` call clears
+  the `WorkspaceDirtyMidIteration` throttle alongside every other
+  category
+- **AND** if the workspace becomes dirty again later, the next
+  occurrence re-alerts immediately (no leftover suppression)
 
 ### Requirement: Graceful shutdown on signal
 autocoder SHALL respond to SIGINT or SIGTERM by cancelling all polling tasks; each task completes its current iteration (if any) and exits cleanly.
@@ -786,4 +834,73 @@ The `RepositoryConfig` schema SHALL include an optional `max_changes_per_pr: u32
 - **AND** the loaded `Config` retains the raw `0` so operator-visible
   diagnostics show what was configured (matching the
   `perma_stuck_after_failures` precedent)
+
+### Requirement: PR-opened ChatOps notification
+After successfully creating a Pull Request via the GitHub API, autocoder SHALL post a one-line notification to the configured ChatOps channel naming the repository, the new PR's URL, and the number of changes included. The notification SHALL be best-effort: a ChatOps post failure is logged at WARN and does NOT cause the iteration to fail or block the existing post-PR comment step. The notification is suppressed when ChatOps is not configured OR when `chatops.notifications.pr_opened` is explicitly `false`.
+
+#### Scenario: PR-opened post fires on successful creation
+- **WHEN** `github::create_pull_request` returns `Ok(pr)` for the
+  current pass AND ChatOps is configured AND
+  `chatops.notifications.pr_opened` is unset OR set to `true`
+- **THEN** autocoder posts a single ChatOps notification to the
+  repository's resolved channel containing the literal repository
+  URL, the literal `pr.html_url`, and the count of archived changes
+  in the pass
+- **AND** the post happens AFTER the PR creation succeeds AND BEFORE
+  the existing post-PR implementer-summary comment step (so a
+  failure of the latter never blocks the former)
+
+#### Scenario: PR-opened post is suppressed when notifications.pr_opened is false
+- **WHEN** ChatOps is configured AND
+  `chatops.notifications.pr_opened` is explicitly `false`
+- **THEN** autocoder does NOT post a PR-opened notification
+- **AND** the existing INFO log line `"opened PR pr=<url>"` is
+  emitted unchanged so operators tailing journalctl still see the
+  event
+
+#### Scenario: PR-opened post is suppressed when ChatOps is not configured
+- **WHEN** the daemon's `chatops:` config block is absent
+- **THEN** autocoder does NOT attempt any ChatOps post
+- **AND** the iteration proceeds to the post-PR comment step
+  exactly as it does today
+
+#### Scenario: PR-opened post failure does not fail the iteration
+- **WHEN** ChatOps is configured AND `notifications.pr_opened` is
+  true AND the ChatOps backend's `post_notification` call returns
+  `Err`
+- **THEN** autocoder logs a WARN line naming the repository URL,
+  the PR URL, and the error
+- **AND** the iteration continues normally; the post-PR comment
+  step still runs and the iteration's outcome is unchanged
+- **AND** no chatops-failure alert is emitted (chatops failures are
+  never re-routed through chatops, matching the existing
+  `handle_predictable_failure` convention)
+
+#### Scenario: PR-opened post uses the per-repo channel override
+- **WHEN** the PR-opened notification is about to fire AND the
+  current repository has `chatops_channel_id` set to a value
+  different from `chatops.default_channel_id`
+- **THEN** the notification posts to the per-repo channel, not the
+  default channel
+- **AND** the channel resolution matches the channel used for
+  start-of-work and failure-alert notifications for the same
+  repository
+
+### Requirement: Notifications config gains pr_opened flag
+`chatops.notifications` SHALL include an optional `pr_opened: bool` field that defaults to `true` when unset. The flag SHALL be the sole knob controlling whether the PR-opened notification fires; no other config field affects it.
+
+#### Scenario: pr_opened defaults to true when notifications block is absent
+- **WHEN** the operator's config has no `chatops.notifications`
+  block at all
+- **THEN** the effective `pr_opened` flag is `true`
+
+#### Scenario: pr_opened defaults to true when notifications block is present but field is unset
+- **WHEN** the operator's config has `chatops.notifications` with
+  `start_work` and/or `failure_alerts` set but no `pr_opened` key
+- **THEN** the effective `pr_opened` flag is `true`
+
+#### Scenario: pr_opened explicit false suppresses the post
+- **WHEN** the operator sets `chatops.notifications.pr_opened: false`
+- **THEN** the effective flag is `false` and the PR-opened post
+  does NOT fire
 

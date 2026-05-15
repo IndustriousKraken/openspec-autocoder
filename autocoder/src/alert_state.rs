@@ -19,6 +19,7 @@ const ALERT_STATE_FILE: &str = ".alert-state.json";
 #[serde(rename_all = "snake_case")]
 pub enum AlertCategory {
     WorkspaceInitFailure,
+    WorkspaceDirtyMidIteration,
     BranchPushFailure,
     PrCreationFailure,
 }
@@ -29,6 +30,7 @@ impl AlertCategory {
     pub fn label(&self) -> &'static str {
         match self {
             Self::WorkspaceInitFailure => "workspace init keeps failing",
+            Self::WorkspaceDirtyMidIteration => "workspace dirty mid-iteration",
             Self::BranchPushFailure => "branch push keeps failing",
             Self::PrCreationFailure => "PR creation keeps failing",
         }

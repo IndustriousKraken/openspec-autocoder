@@ -133,6 +133,7 @@ mod tests {
             channel: "C_FIXTURE".to_string(),
             start_work_enabled: true,
             failure_alerts_enabled: true,
+            pr_opened_enabled: true,
         }
     }
 
@@ -160,6 +161,19 @@ mod tests {
         assert!(text.contains("branch push keeps failing"));
         assert!(text.contains("server hangup"));
         assert!(text.starts_with("⚠️"));
+    }
+
+    #[test]
+    fn format_alert_text_workspace_dirty_mid_iteration() {
+        let err = anyhow!("workspace /tmp/x is dirty before pass: D foo/bar");
+        let text = format_alert_text(
+            "git@github.com:owner/repo.git",
+            AlertCategory::WorkspaceDirtyMidIteration,
+            &err,
+        );
+        assert!(text.contains("git@github.com:owner/repo.git"));
+        assert!(text.contains("workspace dirty mid-iteration"));
+        assert!(text.contains("D foo/bar"));
     }
 
     #[tokio::test]

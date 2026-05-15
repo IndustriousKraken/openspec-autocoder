@@ -62,6 +62,7 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
                 default_channel_id: co.default_channel_id.clone(),
                 start_work_enabled: NotificationsConfig::start_work_enabled(Some(co)),
                 failure_alerts_enabled: NotificationsConfig::failure_alerts_enabled(Some(co)),
+                pr_opened_enabled: NotificationsConfig::pr_opened_enabled(Some(co)),
             })
         }
         None => {
