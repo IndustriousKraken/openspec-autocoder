@@ -5,6 +5,7 @@
 use crate::audits::{
     Audit, AuditRegistry, brightline::ArchitectureBrightlineAudit,
     dependency_update::DependencyUpdateAudit, drift::DriftAudit,
+    missing_tests::MissingTestsAudit,
 };
 use crate::chatops;
 use crate::code_reviewer::CodeReviewer;
@@ -154,6 +155,10 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         cfg.github.clone(),
     )));
     registry.register(Arc::new(DriftAudit::new(&audit_settings, &cfg.executor)));
+    registry.register(Arc::new(MissingTestsAudit::new(
+        &audit_settings,
+        &cfg.executor,
+    )));
     // Validate every audit type name in the operator's config is in the
     // registry. A typo here means the audit will silently never run, so
     // we fail fast at startup with the list of known names.

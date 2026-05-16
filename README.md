@@ -137,7 +137,7 @@ Top-level periodic-audit framework configuration. Absent block → every audit's
 
 | Field | Type | Description |
 |---|---|---|
-| `defaults` | `map<audit-slug, Cadence>` | Global default cadence per audit type. Audit slugs must match a registered type (currently `architecture_brightline`, `dependency_update_triage`, `drift_audit`); typos fail at config load with a list of known slugs. |
+| `defaults` | `map<audit-slug, Cadence>` | Global default cadence per audit type. Audit slugs must match a registered type (currently `architecture_brightline`, `dependency_update_triage`, `drift_audit`, `missing_tests_audit`); typos fail at config load with a list of known slugs. |
 | `settings` | `map<audit-slug, AuditSettings>` | Per-audit knobs. See below. |
 
 Per-repo override: each entry under `repositories[]` accepts an `audits:` field that maps audit slugs to cadences. Per-repo entries take precedence over `audits.defaults`; an absent entry in both locations resolves to `disabled`.
@@ -148,9 +148,9 @@ Per-repo override: each entry under `repositories[]` accepts an `audits:` field 
 
 | Field | Type | Description |
 |---|---|---|
-| `prompt_path` | `path` (optional) | Override the audit's embedded LLM prompt template. Used by `drift_audit` (the embedded default is `prompts/drift-audit.md`). An empty file is rejected at audit invocation so the daemon does not feed an empty prompt to the wrapped CLI. |
+| `prompt_path` | `path` (optional) | Override the audit's embedded LLM prompt template. Used by `drift_audit` (embedded default: `prompts/drift-audit.md`) and `missing_tests_audit` (embedded default: `prompts/missing-tests-audit.md`). An empty file is rejected at audit invocation so the daemon does not feed an empty prompt to the wrapped CLI. |
 | `notify_on_clean` | `bool` (default `false`) | When `true`, an empty-findings `Reported` outcome posts `✅ <repo>: <audit_type> — no findings` to chatops. When `false`, silence is success. |
-| `extra` | `map<string, yaml>` | Free-form per-audit knobs. `architecture_brightline` reads `file_lines_threshold` (default `800`) from here. `dependency_update_triage` reads `max_approvals_per_run` (`u32`, default `5`) and `fork_remote_name` (`string`, default `"fork"`) from here. `drift_audit` does not currently read any `extra` knobs; configure it via the top-level `prompt_path` and `notify_on_clean` fields under `audits.settings.drift_audit`. |
+| `extra` | `map<string, yaml>` | Free-form per-audit knobs. `architecture_brightline` reads `file_lines_threshold` (default `800`) from here. `dependency_update_triage` reads `max_approvals_per_run` (`u32`, default `5`) and `fork_remote_name` (`string`, default `"fork"`) from here. `missing_tests_audit` reads `max_proposals_per_run` (`u32`, default `2`) from here. `drift_audit` does not currently read any `extra` knobs; configure it via the top-level `prompt_path` and `notify_on_clean` fields under `audits.settings.drift_audit`. |
 
 ---
 
@@ -721,6 +721,7 @@ The framework is **default-off**. With no `audits:` block in the config, every r
 | `architecture_brightline` | Pure-code metrics — file size, duplicate signatures across files. Surfaces oversize files and accidental copies. | No | `disabled` (opt-in via `audits.defaults` or per-repo) | `None` (read-only) |
 | `dependency_update_triage` | Lists Dependabot PRs on the bot's fork (or upstream when `github.fork_owner` is unset), applies a strict "safe shape" filter (manifest-only version-string bumps, no script hooks, no URL changes), approves the safe ones via the GitHub Reviews API up to `max_approvals_per_run` per invocation, and posts chatops findings for unsafe ones. | No | `disabled` (opt-in via `audits.defaults` or per-repo) | `None` (read-only; only writes to GitHub via API) |
 | `drift_audit` | Invokes the wrapped agent CLI (typically `claude`) with a read-only sandbox (`Read`, `Glob`, `Grep`, `Bash`) and a drift-detection prompt. The agent compares each requirement in `openspec/specs/<capability>/spec.md` against observable code behavior and emits structured findings. Triggers on HEAD change at the configured cadence. Purely **advisory** — never modifies code or specs; the operator decides whether each finding becomes a code-fix change, a spec-fix change, or is dismissed. | Yes | `disabled` (opt-in via `audits.defaults` or per-repo) | `None` (read-only; sandbox blocks `Write`/`Edit`, post-hoc diff check reverts any sneaky writes) |
+| `missing_tests_audit` | Invokes the wrapped agent CLI with a sandbox that allows `Write` and `Edit` under `openspec/changes/` only, plus the read tools. The agent surveys the source tree, identifies uncovered error paths / branches without assertions / obvious edge cases, and creates up to `max_proposals_per_run` (default `2`) new OpenSpec change directories under `openspec/changes/tests-*` proposing tests to fill those gaps. The audit validates each new change via `openspec validate --strict`, rejects invalid ones (deletes the directory), and commits the valid ones to the agent branch as `audit: missing-tests proposals (N change(s))`. Returns `AuditOutcome::SpecsWritten(names)` so the same iteration's `walk_queue` picks the new changes up and the implementer ships them in the same PR. **Additive only:** the prompt forbids deleting or modifying existing tests (except factually broken ones). All produced changes use the `tests-` prefix so operators recognize audit-produced work at a glance. Triggers on HEAD change at the configured cadence. | Yes | `disabled` (opt-in via `audits.defaults` or per-repo) | `OpenSpecOnly` (sandbox allows `Write`/`Edit`; post-hoc diff check reverts anything outside `openspec/changes/`) |
 
 Each audit declares a `WritePolicy`:
 
@@ -736,6 +737,7 @@ audits:
     architecture_brightline: weekly      # disabled | daily | every-N-days | weekly | monthly | quarterly
     dependency_update_triage: daily      # check the fork for Dependabot PRs once a day
     drift_audit: weekly                  # spec/code alignment audit; HEAD-change gated
+    missing_tests_audit: weekly          # propose OpenSpec changes to fill test-coverage gaps; HEAD-change gated
   settings:
     architecture_brightline:
       notify_on_clean: false             # silence is success; set true for an explicit ✅ post each clean run
@@ -748,6 +750,11 @@ audits:
     drift_audit:
       prompt_path: null                  # path to a markdown file overriding the embedded default prompt; null → embedded prompt
       notify_on_clean: false             # true → post a brief "no findings" chatops message on clean runs
+    missing_tests_audit:
+      prompt_path: null                  # path overriding the embedded prompts/missing-tests-audit.md; null → embedded prompt
+      notify_on_clean: false             # missing-tests is a spec-writing audit (SpecsWritten outcome is silent regardless); this only affects the rare error case
+      extra:
+        max_proposals_per_run: 2         # cap on the number of new openspec/changes/tests-* directories created per invocation (default 2)
 
 repositories:
   - url: "git@github.com:my-org/repo.git"
@@ -762,7 +769,7 @@ Per-repo entries under `repositories[].audits` override the corresponding `audit
 
 **When audits fire:** Each polling iteration, after `recreate_branch` and BEFORE `list_pending`. This ordering means a spec-writing audit (`AuditOutcome::SpecsWritten(...)`) creates `openspec/changes/<name>/` and the same iteration's queue walk picks the new change up — implementer commit and audit's creation commit ship in one PR.
 
-**`requires_head_change` semantics:** Audits that compute over the codebase (like `architecture_brightline` and `drift_audit`) declare `requires_head_change = true`; the scheduler skips them when the base-branch HEAD SHA matches the recorded `last_run_sha`, regardless of cadence. Audits whose inputs are external (package registries, GitHub PR lists) return `false` and run on cadence alone.
+**`requires_head_change` semantics:** Audits that compute over the codebase (like `architecture_brightline`, `drift_audit`, and `missing_tests_audit`) declare `requires_head_change = true`; the scheduler skips them when the base-branch HEAD SHA matches the recorded `last_run_sha`, regardless of cadence. Audits whose inputs are external (package registries, GitHub PR lists) return `false` and run on cadence alone.
 
 **Audit-run logs:** Every invocation (success, failure, violation) writes a timestamped log file at:
 

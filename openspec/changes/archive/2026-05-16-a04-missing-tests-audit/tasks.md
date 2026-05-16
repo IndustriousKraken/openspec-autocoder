@@ -1,6 +1,6 @@
 ## 1. Default prompt template
 
-- [ ] 1.1 New file `prompts/missing-tests-audit.md`. Contents:
+- [x] 1.1 New file `prompts/missing-tests-audit.md`. Contents:
   - Framing: "You are auditing test coverage for this repository. Output: zero or more new OpenSpec change directories under `openspec/changes/`, each describing a meaningful coverage gap and proposing tests to fill it."
   - Survey instructions: glob source files via language-agnostic heuristics (look at file extensions: `.rs`, `.py`, `.cs`, `.go`, `.js`, `.ts`, `.rb`, `.java`, etc.). For each, identify functions/methods and their tests.
   - Filtering: suppress trivial getters, setters, single-line constructors, `Default` impls, conversions with no behavior. Focus on:
@@ -19,13 +19,13 @@
     - "Do NOT propose modifying existing tests unless they are factually broken (the test does not compile, or runs but never asserts)."
     - "Pick at most N gaps for this run, where N is provided as `MAX_PROPOSALS` at the top of this prompt. Order by severity: missing tests on error paths first, then untested branches, then edge cases."
   - The audit's `run()` substitutes `MAX_PROPOSALS` with the configured value before sending the prompt.
-- [ ] 1.2 Embed at compile time via `include_str!`.
+- [x] 1.2 Embed at compile time via `include_str!`.
 
 ## 2. Audit implementation
 
-- [ ] 2.1 New module `autocoder/src/audits/missing_tests.rs`. Define `pub struct MissingTestsAudit { settings: AuditSettings, max_proposals_per_run: u32, executor_command: String, executor_timeout_secs: u64 }`.
-- [ ] 2.2 `impl Audit` with `audit_type() = "missing_tests_audit"`, `requires_head_change() = true`, `write_policy() = WritePolicy::OpenSpecOnly`.
-- [ ] 2.3 `run(&self, ctx)`:
+- [x] 2.1 New module `autocoder/src/audits/missing_tests.rs`. Define `pub struct MissingTestsAudit { settings: AuditSettings, max_proposals_per_run: u32, executor_command: String, executor_timeout_secs: u64 }`.
+- [x] 2.2 `impl Audit` with `audit_type() = "missing_tests_audit"`, `requires_head_change() = true`, `write_policy() = WritePolicy::OpenSpecOnly`.
+- [x] 2.3 `run(&self, ctx)`:
   1. Resolve prompt (override or default). Substitute `MAX_PROPOSALS` → string of `self.max_proposals_per_run`.
   2. Build sandbox: allowed_tools = `["Read", "Glob", "Grep", "Bash", "Write", "Edit"]`; standard deny lists.
   3. Spawn CLI with the prompt on stdin, capture stdout/stderr, enforce timeout. Mirror into audit-run log.
@@ -33,8 +33,8 @@
   5. For each new directory: validate via `openspec validate <name> --strict`. If validation fails, reject the change (delete the directory) and add a Finding to the audit-run log noting the failure. (Do NOT chatops-alert per-change validation failures; the audit's WARN log is sufficient.)
   6. If at least one validated change exists: `git add openspec/changes/ && git commit -m "audit: missing-tests proposals (<N> change(s))"`.
   7. Return `AuditOutcome::SpecsWritten(validated_names)`.
-- [ ] 2.4 The pre-run snapshot of `openspec/changes/` is captured before spawning the CLI so we can diff post-run reliably.
-- [ ] 2.5 Tests `audits::missing_tests::tests`:
+- [x] 2.4 The pre-run snapshot of `openspec/changes/` is captured before spawning the CLI so we can diff post-run reliably.
+- [x] 2.5 Tests `audits::missing_tests::tests`:
   - `parses_max_proposals_substitution_into_prompt`
   - `pre_run_snapshot_captures_existing_change_dirs`
   - `post_run_detects_only_new_change_dirs`
@@ -44,14 +44,14 @@
 
 ## 3. Registration
 
-- [ ] 3.1 In `cli/run.rs::build_audit_registry`, append `Arc::new(MissingTestsAudit::new(&audit_settings, &cfg.executor))`.
+- [x] 3.1 In `cli/run.rs::build_audit_registry`, append `Arc::new(MissingTestsAudit::new(&audit_settings, &cfg.executor))`.
 
 ## 4. Documentation
 
-- [ ] 4.1 README "Periodic audits" — add `missing_tests_audit` to the registered-audits list. Document additive-only semantics, the `tests-` naming convention, the per-run cap.
-- [ ] 4.2 README "Config reference" — under `audits.missing_tests_audit`, document `prompt_path`, `max_proposals_per_run` (default `2`), `notify_on_clean`.
+- [x] 4.1 README "Periodic audits" — add `missing_tests_audit` to the registered-audits list. Document additive-only semantics, the `tests-` naming convention, the per-run cap.
+- [x] 4.2 README "Config reference" — under `audits.missing_tests_audit`, document `prompt_path`, `max_proposals_per_run` (default `2`), `notify_on_clean`.
 
 ## 5. Verification
 
-- [ ] 5.1 `cargo test` passes.
-- [ ] 5.2 `openspec validate missing-tests-audit --strict` passes.
+- [x] 5.1 `cargo test` passes.
+- [x] 5.2 `openspec validate missing-tests-audit --strict` passes.
