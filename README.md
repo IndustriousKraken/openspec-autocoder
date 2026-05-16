@@ -137,7 +137,7 @@ Top-level periodic-audit framework configuration. Absent block → every audit's
 
 | Field | Type | Description |
 |---|---|---|
-| `defaults` | `map<audit-slug, Cadence>` | Global default cadence per audit type. Audit slugs must match a registered type (currently `architecture_brightline`); typos fail at config load with a list of known slugs. |
+| `defaults` | `map<audit-slug, Cadence>` | Global default cadence per audit type. Audit slugs must match a registered type (currently `architecture_brightline`, `dependency_update_triage`); typos fail at config load with a list of known slugs. |
 | `settings` | `map<audit-slug, AuditSettings>` | Per-audit knobs. See below. |
 
 Per-repo override: each entry under `repositories[]` accepts an `audits:` field that maps audit slugs to cadences. Per-repo entries take precedence over `audits.defaults`; an absent entry in both locations resolves to `disabled`.
@@ -150,7 +150,7 @@ Per-repo override: each entry under `repositories[]` accepts an `audits:` field 
 |---|---|---|
 | `prompt_path` | `path` (optional) | Override the audit's embedded LLM prompt template. No LLM audits ship in the foundation change; the mechanism is in place for future audits. |
 | `notify_on_clean` | `bool` (default `false`) | When `true`, an empty-findings `Reported` outcome posts `✅ <repo>: <audit_type> — no findings` to chatops. When `false`, silence is success. |
-| `extra` | `map<string, yaml>` | Free-form per-audit knobs. `architecture_brightline` reads `file_lines_threshold` (default `800`) from here. |
+| `extra` | `map<string, yaml>` | Free-form per-audit knobs. `architecture_brightline` reads `file_lines_threshold` (default `800`) from here. `dependency_update_triage` reads `max_approvals_per_run` (`u32`, default `5`) and `fork_remote_name` (`string`, default `"fork"`) from here. |
 
 ---
 
@@ -719,6 +719,7 @@ The framework is **default-off**. With no `audits:` block in the config, every r
 | Slug | What it does | LLM | Default cadence | WritePolicy |
 |---|---|---|---|---|
 | `architecture_brightline` | Pure-code metrics — file size, duplicate signatures across files. Surfaces oversize files and accidental copies. | No | `disabled` (opt-in via `audits.defaults` or per-repo) | `None` (read-only) |
+| `dependency_update_triage` | Lists Dependabot PRs on the bot's fork (or upstream when `github.fork_owner` is unset), applies a strict "safe shape" filter (manifest-only version-string bumps, no script hooks, no URL changes), approves the safe ones via the GitHub Reviews API up to `max_approvals_per_run` per invocation, and posts chatops findings for unsafe ones. | No | `disabled` (opt-in via `audits.defaults` or per-repo) | `None` (read-only; only writes to GitHub via API) |
 
 Each audit declares a `WritePolicy`:
 
@@ -732,11 +733,16 @@ Each audit declares a `WritePolicy`:
 audits:
   defaults:
     architecture_brightline: weekly      # disabled | daily | every-N-days | weekly | monthly | quarterly
+    dependency_update_triage: daily      # check the fork for Dependabot PRs once a day
   settings:
     architecture_brightline:
       notify_on_clean: false             # silence is success; set true for an explicit ✅ post each clean run
       extra:
         file_lines_threshold: 800        # override the brightline default (800)
+    dependency_update_triage:
+      extra:
+        max_approvals_per_run: 5         # cap on auto-approvals per audit invocation (default 5)
+        fork_remote_name: "fork"         # matches the existing fork-PR mode remote name
 
 repositories:
   - url: "git@github.com:my-org/repo.git"

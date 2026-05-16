@@ -96,6 +96,301 @@ async fn list_open_prs_at(
     Ok(parsed)
 }
 
+/// Summary of an open pull request used by audits that triage PRs by
+/// author. Compared to [`OpenPr`] this struct also carries the author
+/// login (filtered on by callers) and the title (used for chatops
+/// findings). Only the fields autocoder consults are deserialized.
+#[derive(Debug, Clone)]
+pub struct PullRequestSummary {
+    pub number: u64,
+    pub html_url: String,
+    pub author_login: String,
+    pub title: String,
+}
+
+#[derive(Deserialize)]
+struct RawPullSummary {
+    number: u64,
+    html_url: String,
+    title: Option<String>,
+    user: Option<RawUser>,
+}
+
+#[derive(Deserialize)]
+struct RawUser {
+    login: Option<String>,
+}
+
+/// One pull-request review entry. Used by audits to detect prior approval.
+#[derive(Debug, Clone)]
+pub struct PullRequestReview {
+    pub user_login: String,
+    pub state: String,
+}
+
+#[derive(Deserialize)]
+struct RawReview {
+    state: Option<String>,
+    user: Option<RawUser>,
+}
+
+/// List the open PRs whose author login matches one of `author_logins`.
+/// Filtering is performed client-side because the GitHub REST API does
+/// not expose an `author=` filter on the `GET /pulls` endpoint. Used by
+/// the dependency-update-triage audit to find Dependabot PRs.
+pub async fn list_open_prs_by_author(
+    owner: &str,
+    repo: &str,
+    author_logins: &[&str],
+    token: &str,
+) -> Result<Vec<PullRequestSummary>> {
+    list_open_prs_by_author_at(DEFAULT_API_BASE, owner, repo, author_logins, token).await
+}
+
+#[cfg(test)]
+pub(crate) async fn list_open_prs_by_author_at_for_test(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    author_logins: &[&str],
+    token: &str,
+) -> Result<Vec<PullRequestSummary>> {
+    list_open_prs_by_author_at(api_base, owner, repo, author_logins, token).await
+}
+
+pub(crate) async fn list_open_prs_by_author_at(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    author_logins: &[&str],
+    token: &str,
+) -> Result<Vec<PullRequestSummary>> {
+    let url = format!("{api_base}/repos/{owner}/{repo}/pulls");
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .query(&[("state", "open"), ("per_page", "100")])
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .send()
+        .await
+        .map_err(|e| anyhow!("github pulls (by-author) GET failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_snippet = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github pulls GET {owner}/{repo} returned {status}: {body_snippet}"
+        ));
+    }
+    let parsed: Vec<RawPullSummary> = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("github pulls response decode failed: {e}"))?;
+    let mut out = Vec::new();
+    for p in parsed {
+        let login = p
+            .user
+            .as_ref()
+            .and_then(|u| u.login.clone())
+            .unwrap_or_default();
+        if author_logins.iter().any(|a| login == *a) {
+            out.push(PullRequestSummary {
+                number: p.number,
+                html_url: p.html_url,
+                author_login: login,
+                title: p.title.unwrap_or_default(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Fetch the unified diff for a single PR via the GitHub Pulls API. Uses
+/// the `application/vnd.github.v3.diff` media type so the response body
+/// is plain unified-diff text rather than the default JSON envelope.
+pub async fn fetch_pr_diff(
+    owner: &str,
+    repo: &str,
+    number: u64,
+    token: &str,
+) -> Result<String> {
+    fetch_pr_diff_at(DEFAULT_API_BASE, owner, repo, number, token).await
+}
+
+#[cfg(test)]
+pub(crate) async fn fetch_pr_diff_at_for_test(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    token: &str,
+) -> Result<String> {
+    fetch_pr_diff_at(api_base, owner, repo, number, token).await
+}
+
+pub(crate) async fn fetch_pr_diff_at(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    token: &str,
+) -> Result<String> {
+    let url = format!("{api_base}/repos/{owner}/{repo}/pulls/{number}");
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github.v3.diff")
+        .header("User-Agent", "openspec-autocoder")
+        .send()
+        .await
+        .map_err(|e| anyhow!("github pr-diff GET failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_snippet = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github pr-diff GET {owner}/{repo}#{number} returned {status}: {body_snippet}"
+        ));
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| anyhow!("github pr-diff response read failed: {e}"))?;
+    Ok(body)
+}
+
+/// List reviews on a PR. Used by the dependency-update audit to detect
+/// prior approval and avoid double-counting/double-posting.
+pub async fn list_pr_reviews(
+    owner: &str,
+    repo: &str,
+    number: u64,
+    token: &str,
+) -> Result<Vec<PullRequestReview>> {
+    list_pr_reviews_at(DEFAULT_API_BASE, owner, repo, number, token).await
+}
+
+#[cfg(test)]
+pub(crate) async fn list_pr_reviews_at_for_test(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    token: &str,
+) -> Result<Vec<PullRequestReview>> {
+    list_pr_reviews_at(api_base, owner, repo, number, token).await
+}
+
+pub(crate) async fn list_pr_reviews_at(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    token: &str,
+) -> Result<Vec<PullRequestReview>> {
+    let url = format!("{api_base}/repos/{owner}/{repo}/pulls/{number}/reviews");
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .send()
+        .await
+        .map_err(|e| anyhow!("github pr-reviews GET failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_snippet = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github pr-reviews GET {owner}/{repo}#{number} returned {status}: {body_snippet}"
+        ));
+    }
+    let parsed: Vec<RawReview> = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("github pr-reviews decode failed: {e}"))?;
+    let out = parsed
+        .into_iter()
+        .map(|r| PullRequestReview {
+            user_login: r.user.and_then(|u| u.login).unwrap_or_default(),
+            state: r.state.unwrap_or_default(),
+        })
+        .collect();
+    Ok(out)
+}
+
+/// Submit an approving review for the given PR. Idempotent on the GitHub
+/// side: posting an APPROVE review when one already exists from the same
+/// user creates an additional approval rather than erroring, so callers
+/// should detect prior approval via [`list_pr_reviews`] before invoking.
+pub async fn approve_pr(
+    owner: &str,
+    repo: &str,
+    number: u64,
+    body: &str,
+    token: &str,
+) -> Result<()> {
+    approve_pr_at(DEFAULT_API_BASE, owner, repo, number, body, token).await
+}
+
+#[cfg(test)]
+pub(crate) async fn approve_pr_at_for_test(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    body: &str,
+    token: &str,
+) -> Result<()> {
+    approve_pr_at(api_base, owner, repo, number, body, token).await
+}
+
+pub(crate) async fn approve_pr_at(
+    api_base: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    body: &str,
+    token: &str,
+) -> Result<()> {
+    let url = format!("{api_base}/repos/{owner}/{repo}/pulls/{number}/reviews");
+    let payload = serde_json::json!({ "event": "APPROVE", "body": body });
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| anyhow!("github approve POST failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_snippet = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github approve POST {owner}/{repo}#{number} returned {status}: {body_snippet}"
+        ));
+    }
+    Ok(())
+}
+
 /// Create a fork of the upstream repo via the GitHub REST API. The fork's
 /// destination is implicit from the PAT's owner — GitHub forks to the
 /// authenticated user's account by default. Returns Ok on 2xx (including
@@ -1110,6 +1405,176 @@ mod tests {
         .expect_err("404 must surface as Err");
         let msg = format!("{err:#}");
         assert!(msg.contains("404"), "error must name status code; got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn list_open_prs_filters_by_author() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/repos/owner/repo/pulls?state=open&per_page=100")
+            .match_header("authorization", "Bearer testtoken")
+            .with_status(200)
+            .with_body(
+                r#"[
+                  {"number":1,"html_url":"https://github.com/owner/repo/pull/1","title":"deps: bump foo","user":{"login":"dependabot[bot]"}},
+                  {"number":2,"html_url":"https://github.com/owner/repo/pull/2","title":"hand-rolled","user":{"login":"alice"}},
+                  {"number":3,"html_url":"https://github.com/owner/repo/pull/3","title":"deps: bump bar","user":{"login":"dependabot-preview[bot]"}}
+                ]"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let prs = list_open_prs_by_author_at_for_test(
+            &server.url(),
+            "owner",
+            "repo",
+            &["dependabot[bot]", "dependabot-preview[bot]"],
+            "testtoken",
+        )
+        .await
+        .expect("list_open_prs_by_author should succeed");
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 1);
+        assert_eq!(prs[0].author_login, "dependabot[bot]");
+        assert_eq!(prs[0].title, "deps: bump foo");
+        assert_eq!(prs[1].number, 3);
+        assert_eq!(prs[1].author_login, "dependabot-preview[bot]");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_open_prs_by_author_errors_on_non_2xx() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(500)
+            .with_body(r#"{"message":"internal error"}"#)
+            .create_async()
+            .await;
+
+        let err = list_open_prs_by_author_at_for_test(
+            &server.url(),
+            "owner",
+            "repo",
+            &["dependabot[bot]"],
+            "testtoken",
+        )
+        .await
+        .expect_err("non-2xx must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("500"), "error must name status code: {msg}");
+    }
+
+    #[tokio::test]
+    async fn fetch_pr_diff_accepts_diff_media_type() {
+        let mut server = mockito::Server::new_async().await;
+        let diff_body = "diff --git a/Cargo.toml b/Cargo.toml\n--- a/Cargo.toml\n+++ b/Cargo.toml\n@@ -1,1 +1,1 @@\n-version = \"1.0.0\"\n+version = \"1.0.1\"\n";
+        let mock = server
+            .mock("GET", "/repos/owner/repo/pulls/42")
+            .match_header("authorization", "Bearer testtoken")
+            .match_header("accept", "application/vnd.github.v3.diff")
+            .with_status(200)
+            .with_header("content-type", "text/x-diff")
+            .with_body(diff_body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let got = fetch_pr_diff_at_for_test(&server.url(), "owner", "repo", 42, "testtoken")
+            .await
+            .expect("fetch_pr_diff should succeed");
+        assert_eq!(got, diff_body);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_pr_diff_errors_on_non_2xx() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/owner/repo/pulls/99")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+        let err = fetch_pr_diff_at_for_test(&server.url(), "owner", "repo", 99, "t")
+            .await
+            .expect_err("404 should surface as Err");
+        assert!(format!("{err:#}").contains("404"));
+    }
+
+    #[tokio::test]
+    async fn list_pr_reviews_returns_user_logins() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/repos/owner/repo/pulls/7/reviews")
+            .match_header("authorization", "Bearer testtoken")
+            .with_status(200)
+            .with_body(
+                r#"[
+                  {"state":"APPROVED","user":{"login":"machine-bot"}},
+                  {"state":"COMMENTED","user":{"login":"alice"}},
+                  {"state":"APPROVED","user":null}
+                ]"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let reviews = list_pr_reviews_at_for_test(&server.url(), "owner", "repo", 7, "testtoken")
+            .await
+            .expect("list_pr_reviews should succeed");
+        assert_eq!(reviews.len(), 3);
+        assert_eq!(reviews[0].user_login, "machine-bot");
+        assert_eq!(reviews[0].state, "APPROVED");
+        assert_eq!(reviews[1].user_login, "alice");
+        assert_eq!(reviews[1].state, "COMMENTED");
+        // Missing user → empty login string (does not error).
+        assert_eq!(reviews[2].user_login, "");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn approve_pr_posts_correct_payload() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/repos/owner/repo/pulls/123/reviews")
+            .match_header("authorization", "Bearer testtoken")
+            .match_header("accept", "application/vnd.github+json")
+            .match_header("user-agent", "openspec-autocoder")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"event":"APPROVE","body":"autocoder: safe"}"#.to_string(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"id":1,"state":"APPROVED"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        approve_pr_at_for_test(
+            &server.url(),
+            "owner",
+            "repo",
+            123,
+            "autocoder: safe",
+            "testtoken",
+        )
+        .await
+        .expect("approve_pr should succeed");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn approve_pr_errors_on_non_2xx() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/repos/owner/repo/pulls/123/reviews")
+            .with_status(422)
+            .with_body(r#"{"message":"Unprocessable"}"#)
+            .create_async()
+            .await;
+        let err = approve_pr_at_for_test(&server.url(), "owner", "repo", 123, "x", "t")
+            .await
+            .expect_err("422 should surface as Err");
+        assert!(format!("{err:#}").contains("422"));
     }
 
     #[tokio::test]

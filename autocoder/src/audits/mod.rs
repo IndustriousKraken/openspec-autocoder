@@ -15,6 +15,7 @@
 //! - [`scheduler`]: cadence + change-guard + write-policy enforcement.
 
 pub mod brightline;
+pub mod dependency_update;
 pub mod scheduler;
 pub mod state;
 

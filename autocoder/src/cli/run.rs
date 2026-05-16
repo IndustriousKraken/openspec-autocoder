@@ -2,7 +2,10 @@
 //! configured repository and waits for shutdown signal (SIGINT/SIGTERM) or
 //! all tasks to finish.
 
-use crate::audits::{Audit, AuditRegistry, brightline::ArchitectureBrightlineAudit};
+use crate::audits::{
+    Audit, AuditRegistry, brightline::ArchitectureBrightlineAudit,
+    dependency_update::DependencyUpdateAudit,
+};
 use crate::chatops;
 use crate::code_reviewer::CodeReviewer;
 use crate::config::{
@@ -146,6 +149,10 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
     let audits_cfg_arc: Option<Arc<AuditsConfig>> = cfg.audits.clone().map(Arc::new);
     let mut registry = AuditRegistry::new();
     registry.register(Arc::new(ArchitectureBrightlineAudit::new(&audit_settings)));
+    registry.register(Arc::new(DependencyUpdateAudit::new(
+        &audit_settings,
+        cfg.github.clone(),
+    )));
     // Validate every audit type name in the operator's config is in the
     // registry. A typo here means the audit will silently never run, so
     // we fail fast at startup with the list of known names.

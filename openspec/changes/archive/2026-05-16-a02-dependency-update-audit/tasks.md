@@ -1,10 +1,10 @@
 ## 1. GitHub helpers
 
-- [ ] 1.1 In `autocoder/src/github.rs`, add `pub async fn list_open_prs_by_author(owner, repo, author_logins: &[&str], token: &str) -> Result<Vec<PullRequestSummary>>` where `PullRequestSummary { number, html_url, author_login, title }`. Hits `GET /repos/{owner}/{repo}/pulls?state=open` and filters client-side by author.
-- [ ] 1.2 `pub async fn fetch_pr_diff(owner, repo, number, token) -> Result<String>` — `GET /repos/.../pulls/{n}` with `Accept: application/vnd.github.v3.diff`.
-- [ ] 1.3 `pub async fn list_pr_reviews(owner, repo, number, token) -> Result<Vec<PullRequestReview>>` where `PullRequestReview { user_login, state }`. Used to detect prior approval.
-- [ ] 1.4 `pub async fn approve_pr(owner, repo, number, body, token) -> Result<()>` — `POST /repos/.../pulls/{n}/reviews` with `{"event": "APPROVE", "body": ...}`.
-- [ ] 1.5 Tests in `github::tests` using mockito for each helper. Especially:
+- [x] 1.1 In `autocoder/src/github.rs`, add `pub async fn list_open_prs_by_author(owner, repo, author_logins: &[&str], token: &str) -> Result<Vec<PullRequestSummary>>` where `PullRequestSummary { number, html_url, author_login, title }`. Hits `GET /repos/{owner}/{repo}/pulls?state=open` and filters client-side by author.
+- [x] 1.2 `pub async fn fetch_pr_diff(owner, repo, number, token) -> Result<String>` — `GET /repos/.../pulls/{n}` with `Accept: application/vnd.github.v3.diff`.
+- [x] 1.3 `pub async fn list_pr_reviews(owner, repo, number, token) -> Result<Vec<PullRequestReview>>` where `PullRequestReview { user_login, state }`. Used to detect prior approval.
+- [x] 1.4 `pub async fn approve_pr(owner, repo, number, body, token) -> Result<()>` — `POST /repos/.../pulls/{n}/reviews` with `{"event": "APPROVE", "body": ...}`.
+- [x] 1.5 Tests in `github::tests` using mockito for each helper. Especially:
   - `list_open_prs_filters_by_author`
   - `fetch_pr_diff_accepts_diff_media_type`
   - `approve_pr_posts_correct_payload`
@@ -12,8 +12,8 @@
 
 ## 2. Safe-shape filter
 
-- [ ] 2.1 New module `autocoder/src/audits/dependency_update.rs`. Constants: `KNOWN_MANIFEST_FILES: &[&str]` (the list from the spec — `Cargo.toml`, `package.json`, etc.).
-- [ ] 2.2 `fn classify_diff(diff: &str) -> Classification` where `Classification` is:
+- [x] 2.1 New module `autocoder/src/audits/dependency_update.rs`. Constants: `KNOWN_MANIFEST_FILES: &[&str]` (the list from the spec — `Cargo.toml`, `package.json`, etc.).
+- [x] 2.2 `fn classify_diff(diff: &str) -> Classification` where `Classification` is:
   ```rust
   pub enum Classification {
       Safe,
@@ -24,14 +24,14 @@
       DiffParseError(String),
   }
   ```
-- [ ] 2.3 Parse the unified diff (a small ad-hoc parser is sufficient — split on `diff --git`, extract `+++` / `---` paths, scan `+` lines).
-- [ ] 2.4 For each modified manifest file:
+- [x] 2.3 Parse the unified diff (a small ad-hoc parser is sufficient — split on `diff --git`, extract `+++` / `---` paths, scan `+` lines).
+- [x] 2.4 For each modified manifest file:
   - Reject if path is not in `KNOWN_MANIFEST_FILES`.
   - For `package.json`: parse the added/removed JSON fragments; reject if the diff adds keys under `dependencies`/`devDependencies` that didn't exist, or modifies anything under `scripts` (`postinstall`/`preinstall`/`prepublish`/etc).
   - For `Cargo.toml`: reject any new top-level dependency entry; reject any `build = "..."` field changes; reject any `registry = "..."` field changes.
   - For lockfiles (`*.lock`): allow only version + hash field changes per dependency entry.
   - For language-specific manifests (`requirements.txt`, `pyproject.toml`, `*.csproj`, `go.mod`, `Gemfile`, etc.): start with the same "no new top-level entries, no script-equivalent fields" check.
-- [ ] 2.5 Tests `dependency_update::tests`:
+- [x] 2.5 Tests `dependency_update::tests`:
   - `safe_classification_for_version_bump_only_diff`
   - `new_dependency_entry_in_package_json_rejected`
   - `new_postinstall_script_in_package_json_rejected`
@@ -42,9 +42,9 @@
 
 ## 3. Audit implementation
 
-- [ ] 3.1 `pub struct DependencyUpdateAudit { settings: ..., max_approvals_per_run: u32, fork_remote_name: String }` implementing `Audit`.
-- [ ] 3.2 `audit_type() -> "dependency_update_triage"`, `requires_head_change() -> false`, `write_policy() -> WritePolicy::None`.
-- [ ] 3.3 `run(&self, ctx) -> Result<AuditOutcome>`:
+- [x] 3.1 `pub struct DependencyUpdateAudit { settings: ..., max_approvals_per_run: u32, fork_remote_name: String }` implementing `Audit`.
+- [x] 3.2 `audit_type() -> "dependency_update_triage"`, `requires_head_change() -> false`, `write_policy() -> WritePolicy::None`.
+- [x] 3.3 `run(&self, ctx) -> Result<AuditOutcome>`:
   1. Determine target repo: if `github.fork_owner` is set, target is `<fork_owner>/<repo_name>`. Else `<upstream_owner>/<repo_name>`.
   2. Resolve the GitHub token via the existing `github_credentials::resolve_token`.
   3. Call `list_open_prs_by_author(target_owner, repo_name, &["dependabot[bot]", "dependabot-preview[bot]"], &token)`.
@@ -56,8 +56,8 @@
      - Otherwise: add a `Finding` to the outcome.
   5. After the loop, if the safe-but-deferred count is > 0, add a `Finding` listing the deferred PR numbers.
   6. Return `AuditOutcome::Reported(findings)`.
-- [ ] 3.4 Registration in `cli/run.rs::build_audit_registry`: append `Arc::new(DependencyUpdateAudit::new(&audit_settings, github_cfg.clone()))`.
-- [ ] 3.5 Tests `dependency_update::audit_tests`:
+- [x] 3.4 Registration in `cli/run.rs::build_audit_registry`: append `Arc::new(DependencyUpdateAudit::new(&audit_settings, github_cfg.clone()))`.
+- [x] 3.5 Tests `dependency_update::audit_tests`:
   - `run_approves_safe_prs_up_to_cap`
   - `run_skips_already_approved_prs`
   - `run_reports_unsafe_prs_via_findings`
@@ -67,10 +67,10 @@
 
 ## 4. Documentation
 
-- [ ] 4.1 README "Periodic audits" — add `dependency_update_triage` to the list of registered audits with its semantics and config knobs.
-- [ ] 4.2 README "Config reference" — under `audits.dependency_update_triage`, document `max_approvals_per_run` (default `5`) and `fork_remote_name` (default `"fork"`).
+- [x] 4.1 README "Periodic audits" — add `dependency_update_triage` to the list of registered audits with its semantics and config knobs.
+- [x] 4.2 README "Config reference" — under `audits.dependency_update_triage`, document `max_approvals_per_run` (default `5`) and `fork_remote_name` (default `"fork"`).
 
 ## 5. Verification
 
-- [ ] 5.1 `cargo test` passes.
-- [ ] 5.2 `openspec validate dependency-update-audit --strict` passes.
+- [x] 5.1 `cargo test` passes.
+- [x] 5.2 `openspec validate dependency-update-audit --strict` passes.
