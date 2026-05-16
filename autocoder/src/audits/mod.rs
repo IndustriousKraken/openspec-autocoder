@@ -16,6 +16,7 @@
 
 pub mod brightline;
 pub mod dependency_update;
+pub mod drift;
 pub mod scheduler;
 pub mod state;
 
@@ -27,7 +28,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::config::RepositoryConfig;
+use crate::config::{RepositoryConfig, ResolvedSandbox};
 use crate::polling_loop::ChatOpsContext;
 
 /// What the audit is permitted to do to the workspace. The framework
@@ -256,6 +257,80 @@ impl AuditRegistry {
     pub fn known_type_names(&self) -> Vec<&'static str> {
         self.audits.iter().map(|a| a.audit_type()).collect()
     }
+}
+
+/// RAII guard that removes a temp sandbox-settings file when dropped.
+/// Returned alongside the on-disk path by [`write_sandbox_settings`].
+/// Holding the guard until the spawned CLI has exited keeps the file
+/// available; dropping it deletes the file even if the run errored or
+/// panicked.
+pub struct SandboxSettingsGuard(PathBuf);
+
+impl SandboxSettingsGuard {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for SandboxSettingsGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.0.display(),
+                "failed to remove sandbox settings temp file: {e}"
+            );
+        }
+    }
+}
+
+/// Write a one-shot Claude Code `--settings` file mirroring the same
+/// `permissions.deny` structure used by [`crate::executor::claude_cli`].
+/// The deny list is built from the sandbox's `disallowed_bash_patterns`
+/// and `disallowed_read_paths` plus explicit `Write(*)` and `Edit(*)`
+/// entries so audits whose `WritePolicy` is `None` have a defense-in-
+/// depth backstop ahead of the post-hoc diff check.
+///
+/// `settings_dir` selects the directory the file is written to. Pass
+/// `None` to use `std::env::temp_dir()`; tests pass a per-test
+/// `TempDir` so concurrent runs do not collide on filename probes.
+///
+/// Returns the path and an RAII guard. Drop the guard AFTER the
+/// spawned CLI has exited.
+pub fn write_sandbox_settings(
+    sandbox: &ResolvedSandbox,
+    settings_dir: Option<&Path>,
+) -> Result<(PathBuf, SandboxSettingsGuard)> {
+    let mut deny: Vec<String> = Vec::new();
+    deny.push("Write(*)".to_string());
+    deny.push("Edit(*)".to_string());
+    for pat in &sandbox.disallowed_bash_patterns {
+        deny.push(format!("Bash({pat})"));
+    }
+    for pat in &sandbox.disallowed_read_paths {
+        deny.push(format!("Read({pat})"));
+    }
+    let json = serde_json::json!({
+        "permissions": {
+            "allow": Vec::<String>::new(),
+            "deny": deny,
+        }
+    });
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let dir: PathBuf = settings_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join(format!("autocoder-audit-settings-{pid}-{stamp}.json"));
+    std::fs::write(&path, serde_json::to_string_pretty(&json)?)
+        .with_context(|| format!("writing audit sandbox settings to {}", path.display()))?;
+    Ok((path.clone(), SandboxSettingsGuard(path)))
 }
 
 #[cfg(test)]
