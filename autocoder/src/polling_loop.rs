@@ -4,13 +4,16 @@
 
 use crate::alert_state::{AlertCategory, AlertEntry, AlertState};
 use crate::alerts::handle_predictable_failure;
+use crate::audits::AuditRegistry;
+use crate::audits::scheduler::run_due_audits;
 use crate::busy_marker;
 use crate::chatops::{self, AnswerPayload, ChatOpsBackend, QuestionPayload};
 use crate::code_reviewer::{CodeReviewer, ReviewReport, ReviewVerdict};
-use crate::config::{GithubConfig, RepositoryConfig};
+use crate::config::{AuditSettings, AuditsConfig, GithubConfig, RepositoryConfig};
 use crate::control_socket::{ChatOpsHolder, ChatOpsSlot, GithubHolder, ReviewerHolder};
 use crate::executor::{Executor, ExecutorOutcome, ResumeHandle};
 use crate::{failure_state, git, github, perma_stuck, queue, workspace};
+use std::collections::HashMap;
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -69,6 +72,9 @@ pub async fn run(
     executor_max_changes_per_pr: Option<u32>,
     startup_jitter_max_secs: u64,
     inter_iteration_jitter_pct: u8,
+    audit_registry: Arc<AuditRegistry>,
+    audits_cfg: Option<Arc<AuditsConfig>>,
+    audit_settings: Arc<HashMap<String, AuditSettings>>,
     cancel: CancellationToken,
 ) {
     {
@@ -142,6 +148,9 @@ pub async fn run(
             stuck_threshold_secs,
             perma_stuck_threshold,
             max_changes_per_pr,
+            audit_registry.as_ref(),
+            audits_cfg.as_deref(),
+            audit_settings.as_ref(),
         )
         .await
         {
@@ -238,6 +247,9 @@ pub async fn execute_one_pass(
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
     max_changes_per_pr: u32,
+    audit_registry: &AuditRegistry,
+    audits_cfg: Option<&AuditsConfig>,
+    audit_settings: &HashMap<String, AuditSettings>,
 ) -> Result<()> {
     // Acquire the per-repo busy marker. Held across the entire pass
     // (executor → review → push → PR); released by Drop on every return.
@@ -285,6 +297,9 @@ pub async fn execute_one_pass(
         chatops_ctx,
         perma_stuck_threshold,
         max_changes_per_pr,
+        audit_registry,
+        audits_cfg,
+        audit_settings,
     )
     .await?;
     if processed.is_empty() {
@@ -514,6 +529,9 @@ pub async fn run_pass_through_commits(
     chatops_ctx: Option<&ChatOpsContext>,
     perma_stuck_threshold: u32,
     max_changes_per_pr: u32,
+    audit_registry: &AuditRegistry,
+    audits_cfg: Option<&AuditsConfig>,
+    audit_settings: &HashMap<String, AuditSettings>,
 ) -> Result<(Vec<String>, bool)> {
     let fork_url = match github_cfg.fork_owner.as_deref() {
         Some(owner) => Some(crate::github::derive_fork_url(&repo.url, owner)?),
@@ -588,6 +606,27 @@ pub async fn run_pass_through_commits(
     git::checkout(workspace, &repo.base_branch)?;
     git::pull_ff_only(workspace, &repo.base_branch)?;
     git::recreate_branch(workspace, &repo.agent_branch)?;
+
+    // Periodic audits run AFTER recreate_branch (so the working tree is
+    // on a clean agent-q) AND BEFORE list_pending (so any specs a
+    // spec-writing audit creates are picked up by this same iteration's
+    // queue walk). Per design: audit failures inside the scheduler are
+    // logged and never abort the iteration.
+    if let Err(e) = run_due_audits(
+        audit_registry,
+        workspace,
+        repo,
+        audits_cfg,
+        audit_settings,
+        chatops_ctx,
+    )
+    .await
+    {
+        tracing::error!(
+            url = %repo.url,
+            "audit scheduler errored (iteration continues): {e:#}"
+        );
+    }
 
     let pending_at_start = queue::list_pending(workspace)?;
     let waiting_at_start = queue::list_waiting(workspace)?;
@@ -2287,6 +2326,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         }
     }
 
@@ -2367,6 +2407,10 @@ mod tests {
         let (processed, _self_heal) =
             run_pass_through_commits(
                 workspace, &repo, &github_cfg, executor, None, u32::MAX, u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
             )
             .await?;
         Ok(processed)
@@ -2642,6 +2686,10 @@ mod tests {
             Some(&chatops_ctx),
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -2741,6 +2789,10 @@ mod tests {
             Some(&chatops_ctx),
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -2853,6 +2905,10 @@ mod tests {
             Some(&chatops_ctx),
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -2986,6 +3042,10 @@ mod tests {
             Some(&chatops_ctx),
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds without running pending");
@@ -3097,6 +3157,10 @@ mod tests {
             Some(&chatops_ctx),
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -3226,7 +3290,11 @@ mod tests {
             &executor,
             Some(&chatops_ctx),
             u32::MAX,
-            2, // cap of 2 across resume + pending
+            2, // cap of 2 across resume + pending,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -3343,6 +3411,10 @@ mod tests {
                 None,
                 u32::MAX,
                 u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
             )
             .await
             .expect("commits step succeeds");
@@ -3513,6 +3585,7 @@ mod tests {
             poll_interval_sec: 0, // tight loop so we get many iterations fast
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -3542,6 +3615,9 @@ mod tests {
                 Some(u32::MAX),
                 0, // startup_jitter_max_secs: deterministic for tests
                 0, // inter_iteration_jitter_pct: deterministic for tests
+                std::sync::Arc::new(crate::audits::AuditRegistry::default()),
+                None,
+                std::sync::Arc::new(std::collections::HashMap::new()),
                 cancel_for_task,
             )
             .await;
@@ -3599,6 +3675,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         };
         let github = GithubConfig {
             token_env: "DOES_NOT_EXIST".into(),
@@ -3630,6 +3707,9 @@ mod tests {
                 Some(u32::MAX),
                 0, // startup_jitter_max_secs: deterministic for tests
                 0, // inter_iteration_jitter_pct: deterministic for tests
+                std::sync::Arc::new(crate::audits::AuditRegistry::default()),
+                None,
+                std::sync::Arc::new(std::collections::HashMap::new()),
                 cancel_for_task,
             )
             .await;
@@ -3658,6 +3738,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         }
     }
 
@@ -3829,6 +3910,10 @@ mod tests {
             Some(&chatops_ctx),
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -3877,6 +3962,10 @@ mod tests {
             Some(&chatops_ctx),
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -3975,6 +4064,10 @@ mod tests {
             stuck_secs,
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await;
         assert!(
@@ -4069,6 +4162,10 @@ mod tests {
             stuck_secs,
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await;
         assert!(
@@ -4325,6 +4422,10 @@ mod tests {
             None,
             threshold,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await?;
         Ok(processed)
@@ -4479,6 +4580,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         };
         let github_cfg = GithubConfig {
             token_env: "X".into(),
@@ -4497,6 +4599,10 @@ mod tests {
             None,
             1,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await;
         assert!(result.is_err(), "pre-executor failure must propagate");
@@ -4553,6 +4659,10 @@ mod tests {
             Some(&chatops_ctx),
             1, // threshold = 1 → first failure marks perma-stuck
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await;
 
@@ -4618,6 +4728,10 @@ mod tests {
             Some(&chatops_ctx),
             1, // threshold = 1
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await;
         alert_mock.assert_async().await;
@@ -4743,7 +4857,12 @@ mod tests {
             recreate_fork_on_reinit: false,
         };
         let (processed, includes_self_heal) =
-            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX)
+            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
+)
                 .await
                 .expect("self-heal pass succeeds");
         assert_eq!(
@@ -4813,7 +4932,12 @@ mod tests {
             recreate_fork_on_reinit: false,
         };
         let (processed, includes_self_heal) =
-            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX)
+            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
+)
                 .await
                 .expect("pass returns Failed via fall-through, not Err");
         assert!(
@@ -4870,7 +4994,12 @@ mod tests {
             recreate_fork_on_reinit: false,
         };
         let (processed, includes_self_heal) =
-            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX)
+            run_pass_through_commits(&ws, &repo, &github_cfg, &executor, None, u32::MAX, u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
+)
                 .await
                 .expect("pass returns Failed via fall-through, not Err");
         assert!(processed.is_empty());
@@ -4951,7 +5080,11 @@ mod tests {
             &executor,
             None,
             u32::MAX,
-            3, // cap
+            3, // cap,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -4994,7 +5127,11 @@ mod tests {
             &executor,
             None,
             u32::MAX,
-            1, // cap of 1
+            1, // cap of 1,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -5059,7 +5196,11 @@ mod tests {
             &executor,
             None,
             u32::MAX,
-            10, // cap intentionally generous; halt must come from the failure
+            10, // cap intentionally generous; halt must come from the failure,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -5160,7 +5301,11 @@ mod tests {
             &executor,
             Some(&chatops_ctx),
             u32::MAX,
-            10, // cap intentionally generous; halt must come from escalation
+            10, // cap intentionally generous; halt must come from escalation,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -5206,6 +5351,10 @@ mod tests {
             None,
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -5240,6 +5389,10 @@ mod tests {
             None,
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -5335,6 +5488,10 @@ mod tests {
             Some(&chatops_ctx),
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await;
         assert!(result.is_err(), "dirty workspace should produce Err");
@@ -5390,6 +5547,10 @@ mod tests {
             None, // no chatops
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await;
         assert!(result.is_err(), "dirty workspace should still produce Err");
@@ -5437,6 +5598,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         };
         maybe_post_pr_opened(
             &repo,
@@ -5474,6 +5636,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         };
         maybe_post_pr_opened(
             &repo,
@@ -5512,6 +5675,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         };
         // Should not panic; should return Ok-equivalent (it's an async fn
         // returning unit, so "doesn't panic" is the assertion).
@@ -5558,6 +5722,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         };
         maybe_post_refork_notification(&repo, Some(&ctx)).await;
         mock.assert_async().await;
@@ -5590,6 +5755,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         };
         maybe_post_refork_notification(&repo, Some(&ctx)).await;
         mock.assert_async().await;
@@ -5607,6 +5773,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         };
         maybe_post_pr_opened(
             &repo,
@@ -5642,6 +5809,10 @@ mod tests {
             None,
             u32::MAX,
             u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        
         )
         .await
         .expect("pass succeeds");
@@ -5801,6 +5972,9 @@ mod tests {
                 None,
                 60, // startup_jitter_max_secs: large window
                 0,  // inter_iteration_jitter_pct: irrelevant
+                std::sync::Arc::new(crate::audits::AuditRegistry::default()),
+                None,
+                std::sync::Arc::new(std::collections::HashMap::new()),
                 task_cancel,
             )
             .await;

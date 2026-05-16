@@ -3,6 +3,7 @@ use clap::Parser;
 
 mod alert_state;
 mod alerts;
+mod audits;
 mod busy_marker;
 mod chatops;
 mod cli;

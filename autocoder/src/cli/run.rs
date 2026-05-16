@@ -2,9 +2,13 @@
 //! configured repository and waits for shutdown signal (SIGINT/SIGTERM) or
 //! all tasks to finish.
 
+use crate::audits::{Audit, AuditRegistry, brightline::ArchitectureBrightlineAudit};
 use crate::chatops;
 use crate::code_reviewer::CodeReviewer;
-use crate::config::{Config, ExecutorKind, GithubConfig, NotificationsConfig, RepositoryConfig};
+use crate::config::{
+    AuditSettings, AuditsConfig, Config, ExecutorKind, GithubConfig, NotificationsConfig,
+    RepositoryConfig, validate_audit_type_names,
+};
 use crate::control_socket::{
     self, ChatOpsHolder, ChatOpsSlot, ControlState, GithubHolder, RepoTaskHandle, RepoTaskMap,
     ReviewerHolder, SpawnOutcome, SpawnRepoFn,
@@ -128,6 +132,28 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     }
 
+    // Build the audit registry once at startup. Operators wire the
+    // architecture-brightline audit by listing its slug under
+    // `audits.defaults` (and optionally setting `extra` knobs under
+    // `audits.settings.architecture_brightline`); the cadence resolver
+    // returns `Disabled` for absent entries so the registry can stay
+    // populated without forcing any audit to run.
+    let audit_settings: HashMap<String, AuditSettings> = cfg
+        .audits
+        .as_ref()
+        .map(|a| a.settings.clone())
+        .unwrap_or_default();
+    let audits_cfg_arc: Option<Arc<AuditsConfig>> = cfg.audits.clone().map(Arc::new);
+    let mut registry = AuditRegistry::new();
+    registry.register(Arc::new(ArchitectureBrightlineAudit::new(&audit_settings)));
+    // Validate every audit type name in the operator's config is in the
+    // registry. A typo here means the audit will silently never run, so
+    // we fail fast at startup with the list of known names.
+    validate_audit_type_names(&cfg, &registry.known_type_names())?;
+    let audit_registry: Arc<AuditRegistry> = Arc::new(registry);
+    let audit_settings_arc: Arc<HashMap<String, AuditSettings>> =
+        Arc::new(audit_settings);
+
     let task_map: RepoTaskMap = Arc::new(Mutex::new(HashMap::new()));
     let executor_max_changes_per_pr = cfg.executor.max_changes_per_pr;
     let startup_jitter_max_secs = cfg.executor.startup_jitter_max_secs();
@@ -142,6 +168,9 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         executor_max_changes_per_pr,
         startup_jitter_max_secs,
         inter_iteration_jitter_pct,
+        audit_registry: audit_registry.clone(),
+        audits_cfg: audits_cfg_arc.clone(),
+        audit_settings: audit_settings_arc.clone(),
         global_cancel: cancel.clone(),
         task_map: task_map.clone(),
     });
@@ -217,6 +246,9 @@ struct SpawnDeps {
     executor_max_changes_per_pr: Option<u32>,
     startup_jitter_max_secs: u64,
     inter_iteration_jitter_pct: u8,
+    audit_registry: Arc<AuditRegistry>,
+    audits_cfg: Option<Arc<AuditsConfig>>,
+    audit_settings: Arc<HashMap<String, AuditSettings>>,
     global_cancel: CancellationToken,
     task_map: RepoTaskMap,
 }
@@ -259,6 +291,9 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let exec_max = deps.executor_max_changes_per_pr;
         let startup_jitter = deps.startup_jitter_max_secs;
         let iter_jitter = deps.inter_iteration_jitter_pct;
+        let registry_for_task = deps.audit_registry.clone();
+        let audits_cfg_for_task = deps.audits_cfg.clone();
+        let audit_settings_for_task = deps.audit_settings.clone();
         let join: JoinHandle<()> = tokio::spawn(async move {
             polling_loop::run(
                 config_for_task,
@@ -271,6 +306,9 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 exec_max,
                 startup_jitter,
                 iter_jitter,
+                registry_for_task,
+                audits_cfg_for_task,
+                audit_settings_for_task,
                 cancel_for_task,
             )
             .await;
@@ -678,6 +716,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         }
     }
 
@@ -697,6 +736,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         }
     }
 

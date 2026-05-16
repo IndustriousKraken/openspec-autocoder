@@ -119,6 +119,12 @@ pub fn ensure_initialized(
             "could not register .failure-state.json in .git/info/exclude: {e:#}"
         );
     }
+    if let Err(e) = ensure_git_info_excluded(workspace, ".audit-state.json") {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            "could not register .audit-state.json in .git/info/exclude: {e:#}"
+        );
+    }
     Ok(())
 }
 
@@ -314,6 +320,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         }
     }
 
@@ -326,6 +333,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         }
     }
 
@@ -772,6 +780,7 @@ mod tests {
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         }
     }
 

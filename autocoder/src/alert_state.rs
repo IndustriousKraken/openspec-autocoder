@@ -22,6 +22,12 @@ pub enum AlertCategory {
     WorkspaceDirtyMidIteration,
     BranchPushFailure,
     PrCreationFailure,
+    /// A periodic audit attempted a disallowed write per its declared
+    /// `WritePolicy`. The scheduler reverts the workspace, leaves the
+    /// audit's state entry untouched so the cadence will retrigger on
+    /// the next iteration, and emits a throttled alert under this
+    /// category so the operator can investigate.
+    AuditWritePolicyViolation,
 }
 
 impl AlertCategory {
@@ -33,6 +39,7 @@ impl AlertCategory {
             Self::WorkspaceDirtyMidIteration => "workspace dirty mid-iteration",
             Self::BranchPushFailure => "branch push keeps failing",
             Self::PrCreationFailure => "PR creation keeps failing",
+            Self::AuditWritePolicyViolation => "audit attempted disallowed write",
         }
     }
 }

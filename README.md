@@ -131,6 +131,27 @@ See [Code Review](#code-review). Absent block disables the reviewer step.
 
 See [ChatOps Escalation](#chatops-escalation). The block carries a required `provider:` field (`slack` officially supported; `discord`, `teams`, `mattermost`, `matrix` are [EXPERIMENTAL](#experimental-chatops-backends)) plus a `default_channel_id:` and a per-provider sub-block. Absent block disables ChatOps escalation; an executor `AskUser` outcome falls back to "log and exit the iteration" behavior.
 
+### `audits:` (optional)
+
+Top-level periodic-audit framework configuration. Absent block → every audit's effective cadence is `disabled` and the daemon behaves identically to a build without the framework. See [Periodic audits](#periodic-audits) for the full operational model.
+
+| Field | Type | Description |
+|---|---|---|
+| `defaults` | `map<audit-slug, Cadence>` | Global default cadence per audit type. Audit slugs must match a registered type (currently `architecture_brightline`); typos fail at config load with a list of known slugs. |
+| `settings` | `map<audit-slug, AuditSettings>` | Per-audit knobs. See below. |
+
+Per-repo override: each entry under `repositories[]` accepts an `audits:` field that maps audit slugs to cadences. Per-repo entries take precedence over `audits.defaults`; an absent entry in both locations resolves to `disabled`.
+
+**`Cadence` syntax (string):** `disabled` | `daily` | `every-N-days` (N must be a positive integer; `every-0-days` and negative N are rejected at load time) | `weekly` | `monthly` | `quarterly`.
+
+**`AuditSettings` fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `prompt_path` | `path` (optional) | Override the audit's embedded LLM prompt template. No LLM audits ship in the foundation change; the mechanism is in place for future audits. |
+| `notify_on_clean` | `bool` (default `false`) | When `true`, an empty-findings `Reported` outcome posts `✅ <repo>: <audit_type> — no findings` to chatops. When `false`, silence is success. |
+| `extra` | `map<string, yaml>` | Free-form per-audit knobs. `architecture_brightline` reads `file_lines_threshold` (default `800`) from here. |
+
 ---
 
 ## Multiple GitHub Tokens
@@ -686,6 +707,72 @@ Before each polling iteration begins its work, autocoder queries GitHub for open
 To re-implement after rejecting a PR: close it (don't merge). The next poll proceeds. To accept the implementation: merge it; the archive moves land on the base branch and the changes drop out of `list_pending`.
 
 If the GitHub query itself fails (transport error, non-2xx), the iteration proceeds as if no PR existed — better to incur a redundant Claude run than to halt the repo on a flaky API. The failure is logged at WARN.
+
+### Periodic audits
+
+Beyond the OpenSpec change queue, autocoder runs a periodic-audit framework: a set of registered audits that fire on per-audit cadences, write per-invocation logs, and (depending on the audit) post chatops findings or write new OpenSpec changes that feed back into the queue.
+
+The framework is **default-off**. With no `audits:` block in the config, every registered audit's effective cadence resolves to `disabled` and the daemon behaves exactly as it did before the framework existed. Operators opt in explicitly per audit.
+
+**Registered audit type names:**
+
+| Slug | What it does | LLM | Default cadence | WritePolicy |
+|---|---|---|---|---|
+| `architecture_brightline` | Pure-code metrics — file size, duplicate signatures across files. Surfaces oversize files and accidental copies. | No | `disabled` (opt-in via `audits.defaults` or per-repo) | `None` (read-only) |
+
+Each audit declares a `WritePolicy`:
+
+- **`None`** — sandbox blocks `Write`/`Edit`; after `run()` returns the framework runs `git status --porcelain -uall` and asserts the workspace is clean. Any unexpected diff is treated as failure: the state file is NOT updated (so the cadence retriggers on the next iteration), the diff is reverted via `git reset --hard HEAD` + `git clean -fd`, and a throttled chatops alert under the `audit_write_policy_violation` category is posted.
+- **`OpenSpecOnly`** — sandbox allows `Write`/`Edit`; after `run()` returns every modified or new path must begin with `openspec/changes/`. A diff outside that prefix triggers the same failure handling.
+- **`Approved`** — full write access. Reserved for future audits with broader scope; not used by any audit shipped today.
+
+**Cadence configuration:**
+
+```yaml
+audits:
+  defaults:
+    architecture_brightline: weekly      # disabled | daily | every-N-days | weekly | monthly | quarterly
+  settings:
+    architecture_brightline:
+      notify_on_clean: false             # silence is success; set true for an explicit ✅ post each clean run
+      extra:
+        file_lines_threshold: 800        # override the brightline default (800)
+
+repositories:
+  - url: "git@github.com:my-org/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 300
+    audits:
+      architecture_brightline: every-3-days   # per-repo override of the global default
+```
+
+Per-repo entries under `repositories[].audits` override the corresponding `audits.defaults` entry for that repository only. An audit name that does not match a registered slug fails config validation at startup with a list of the known names; this prevents typos silently disabling an audit.
+
+**When audits fire:** Each polling iteration, after `recreate_branch` and BEFORE `list_pending`. This ordering means a spec-writing audit (`AuditOutcome::SpecsWritten(...)`) creates `openspec/changes/<name>/` and the same iteration's queue walk picks the new change up — implementer commit and audit's creation commit ship in one PR.
+
+**`requires_head_change` semantics:** Audits that compute over the codebase (like `architecture_brightline`) declare `requires_head_change = true`; the scheduler skips them when the base-branch HEAD SHA matches the recorded `last_run_sha`, regardless of cadence. Audits whose inputs are external (package registries, GitHub PR lists) return `false` and run on cadence alone.
+
+**Audit-run logs:** Every invocation (success, failure, violation) writes a timestamped log file at:
+
+```
+/tmp/autocoder/logs/<workspace-basename>/audits/<audit_type>-<UTC-RFC3339-with-Z>.log
+```
+
+The log contains: the audit type, workspace path, start/end timestamps, the resolved cadence, the last-run record (if any), the prompt (for LLM audits), the raw audit output, every finding's full body, and the final `AuditOutcome` variant. The directory is created on first use. Cleanup is operator-driven (same model as the per-change run logs).
+
+**State file:** Per-workspace audit run state lives at `<workspace>/.audit-state.json`. The file is autocoder bookkeeping and is registered in `.git/info/exclude` at workspace init so it does not trip the pre-pass dirty check. Missing/unparseable file → "no audits have ever run" (every audit is eligible on its next due iteration). Lost state safely re-runs all audits on schedule.
+
+**Outcome dispatch:**
+
+- `AuditOutcome::Reported(findings)` → chatops post with header `📋 <repo>: <audit_type> — N finding(s)` and a bullet list of severity-glyphed subjects (low: `•`, medium: `⚠`, high: `🔴`). Default per-finding excerpt is 200 chars; full bodies live in the audit-run log. Empty findings vector is silent unless `notify_on_clean: true`.
+- `AuditOutcome::SpecsWritten(names)` → no chatops post (the existing start-of-work + PR-opened notifications cover the subsequent flow). The framework logs an info line naming each created change.
+- `AuditOutcome::NoFindings` → silent.
+
+**Failure modes:**
+
+- An audit returning `Err` is logged at ERROR; the state file is NOT updated for that audit; the iteration continues to the remaining audits and then to `list_pending`. Other audits in the registry still run.
+- A WritePolicy violation is treated the same way (state untouched), additionally reverts the workspace and posts the throttled `audit_write_policy_violation` chatops alert.
 
 ### Recovering from a bad run
 

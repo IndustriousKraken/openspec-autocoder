@@ -57,6 +57,13 @@ pub struct Config {
     pub reviewer: Option<ReviewerConfig>,
     #[serde(default)]
     pub chatops: Option<ChatOpsConfig>,
+    /// Optional periodic-audit framework configuration. When the entire
+    /// block is absent, every audit's effective cadence is `Disabled` and
+    /// the daemon behaves exactly as it did before the framework existed.
+    /// Operators opt in explicitly by listing audit type names with a
+    /// non-`disabled` cadence under `audits.defaults`.
+    #[serde(default)]
+    pub audits: Option<AuditsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +85,13 @@ pub struct RepositoryConfig {
     /// `Config::resolved_max_changes_per_pr` for the resolved value.
     #[serde(default)]
     pub max_changes_per_pr: Option<u32>,
+    /// Per-repository audit cadence overrides. Keys are audit type names
+    /// (matching a registered audit's `audit_type()` slug). Each value
+    /// overrides the global `audits.defaults` entry for the same type for
+    /// this repository only. Absent → fall back to the global default →
+    /// `Disabled`.
+    #[serde(default)]
+    pub audits: Option<HashMap<String, Cadence>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -449,6 +463,200 @@ impl NotificationsConfig {
             .map(|n| n.pr_opened)
             .unwrap_or(true)
     }
+}
+
+/// Top-level periodic-audits config. Operators set this block to enable
+/// any audits — without it every audit's effective cadence is `Disabled`
+/// and no scheduler work happens. `defaults` maps audit type names to
+/// their global cadence; `settings` carries per-audit knobs (prompt
+/// override path, notify-on-clean flag, free-form `extra` for per-audit
+/// thresholds like brightline's `file_lines_threshold`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditsConfig {
+    #[serde(default)]
+    pub defaults: HashMap<String, Cadence>,
+    #[serde(default)]
+    pub settings: HashMap<String, AuditSettings>,
+}
+
+/// Per-audit settings keyed by audit type name. `prompt_path` overrides
+/// the audit's embedded default LLM prompt template (no LLM audits ship
+/// in the foundation change; the field is laid in for future audits).
+/// `notify_on_clean` toggles a brief "no findings" chatops post for
+/// `Reported(vec![])` outcomes (silence is success by default). `extra`
+/// is a free-form YAML mapping each audit can read its own knobs out of.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditSettings {
+    #[serde(default)]
+    pub prompt_path: Option<PathBuf>,
+    #[serde(default)]
+    pub notify_on_clean: bool,
+    #[serde(default)]
+    pub extra: HashMap<String, serde_yaml::Value>,
+}
+
+/// Cadence at which a periodic audit fires. Deserializes from a YAML
+/// string in one of the literal forms documented in the spec:
+/// `disabled`, `daily`, `every-N-days` (N a positive integer),
+/// `weekly`, `monthly`, `quarterly`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Cadence {
+    Disabled,
+    Daily,
+    EveryNDays(u32),
+    Weekly,
+    Monthly,
+    Quarterly,
+}
+
+impl Cadence {
+    /// Effective inter-run interval. `Disabled` returns `None` so callers
+    /// can short-circuit without computing a duration that would never
+    /// trigger. All other variants return `Some(Duration)`.
+    pub fn interval(self) -> Option<chrono::Duration> {
+        match self {
+            Self::Disabled => None,
+            Self::Daily => Some(chrono::Duration::days(1)),
+            Self::EveryNDays(n) => Some(chrono::Duration::days(i64::from(n))),
+            Self::Weekly => Some(chrono::Duration::days(7)),
+            Self::Monthly => Some(chrono::Duration::days(30)),
+            Self::Quarterly => Some(chrono::Duration::days(90)),
+        }
+    }
+
+    /// True for any variant other than `Disabled`. Equivalent to
+    /// `self.interval().is_some()`.
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+impl<'de> Deserialize<'de> for Cadence {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let raw = String::deserialize(deserializer)?;
+        Cadence::parse(&raw).map_err(D::Error::custom)
+    }
+}
+
+impl Cadence {
+    /// Parse a cadence string. Used by the custom `Deserialize` impl and
+    /// directly by tests. Rejects `every-0-days`, negative N, and
+    /// non-integer N with a descriptive error.
+    pub fn parse(raw: &str) -> std::result::Result<Self, String> {
+        let trimmed = raw.trim();
+        match trimmed {
+            "disabled" => Ok(Self::Disabled),
+            "daily" => Ok(Self::Daily),
+            "weekly" => Ok(Self::Weekly),
+            "monthly" => Ok(Self::Monthly),
+            "quarterly" => Ok(Self::Quarterly),
+            other => {
+                if let Some(rest) = other.strip_prefix("every-").and_then(|s| s.strip_suffix("-days")) {
+                    // Reject leading `-` (negative) explicitly so the
+                    // error message is precise; u32::from_str would also
+                    // reject but with a generic "invalid digit" message.
+                    if rest.starts_with('-') {
+                        return Err(format!(
+                            "cadence `{raw}`: N must be a positive integer, got negative value"
+                        ));
+                    }
+                    let n: u32 = rest.parse().map_err(|_| {
+                        format!(
+                            "cadence `{raw}`: N must be a positive integer (parsed segment: `{rest}`)"
+                        )
+                    })?;
+                    if n == 0 {
+                        return Err(format!(
+                            "cadence `{raw}`: N must be a positive integer, got 0"
+                        ));
+                    }
+                    Ok(Self::EveryNDays(n))
+                } else {
+                    Err(format!(
+                        "cadence `{raw}`: expected one of `disabled`, `daily`, `every-N-days`, `weekly`, `monthly`, `quarterly`"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Resolve the effective cadence for `audit_type` against the given repo
+/// and (optional) global audits config. Lookup order: per-repo override
+/// → global default → `Disabled`. Used by the scheduler each iteration.
+pub fn resolved_cadence(
+    repo: &RepositoryConfig,
+    audits_cfg: Option<&AuditsConfig>,
+    audit_type: &str,
+) -> Cadence {
+    if let Some(overrides) = repo.audits.as_ref() {
+        if let Some(c) = overrides.get(audit_type) {
+            return *c;
+        }
+    }
+    if let Some(global) = audits_cfg {
+        if let Some(c) = global.defaults.get(audit_type) {
+            return *c;
+        }
+    }
+    Cadence::Disabled
+}
+
+/// Validate that every audit type name appearing in `audits.defaults` or
+/// any `repositories[].audits` is in `known_audit_types`. Returns an
+/// error listing each unknown name + the set of known names so the
+/// operator can correct the config. Called from the daemon entry point
+/// after the audit registry is built.
+pub fn validate_audit_type_names(
+    cfg: &Config,
+    known_audit_types: &[&str],
+) -> Result<()> {
+    let mut unknown: Vec<(String, String)> = Vec::new();
+    if let Some(audits) = cfg.audits.as_ref() {
+        for name in audits.defaults.keys() {
+            if !known_audit_types.contains(&name.as_str()) {
+                unknown.push((format!("audits.defaults.{name}"), name.clone()));
+            }
+        }
+        for name in audits.settings.keys() {
+            if !known_audit_types.contains(&name.as_str()) {
+                unknown.push((format!("audits.settings.{name}"), name.clone()));
+            }
+        }
+    }
+    for (idx, repo) in cfg.repositories.iter().enumerate() {
+        if let Some(overrides) = repo.audits.as_ref() {
+            for name in overrides.keys() {
+                if !known_audit_types.contains(&name.as_str()) {
+                    unknown.push((
+                        format!("repositories[{idx}].audits.{name}"),
+                        name.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let known_list = if known_audit_types.is_empty() {
+        "(none registered)".to_string()
+    } else {
+        known_audit_types.join(", ")
+    };
+    let mut msg = format!(
+        "unknown audit type name(s) in config; known types: {known_list}\n"
+    );
+    for (path, name) in &unknown {
+        msg.push_str(&format!("  - {path}: `{name}` is not a registered audit type\n"));
+    }
+    Err(anyhow!(msg.trim_end().to_string()))
 }
 
 impl RepositoryConfig {
@@ -862,6 +1070,7 @@ chatops:
             poll_interval_sec: 60,
             chatops_channel_id: Some("C_REPO_LEVEL".into()),
             max_changes_per_pr: None,
+            audits: None,
         };
         assert_eq!(repo_with_override.chatops_channel("C_DEFAULT"), "C_REPO_LEVEL");
 
@@ -873,6 +1082,7 @@ chatops:
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         };
         assert_eq!(repo_default.chatops_channel("C_DEFAULT"), "C_DEFAULT");
     }
@@ -1784,6 +1994,260 @@ github: {}
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.executor.inter_iteration_jitter_pct, Some(250));
         assert_eq!(cfg.executor.inter_iteration_jitter_pct(), 100);
+    }
+
+    // -----------------------------------------------------------------
+    // Periodic-audit framework tests (Section 1 of
+    // a01-periodic-audits-foundation).
+    // -----------------------------------------------------------------
+
+    fn make_repo(url: &str, audits: Option<HashMap<String, Cadence>>) -> RepositoryConfig {
+        RepositoryConfig {
+            url: url.into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits,
+        }
+    }
+
+    #[test]
+    fn cadence_parses_each_string_form() {
+        assert_eq!(Cadence::parse("disabled").unwrap(), Cadence::Disabled);
+        assert_eq!(Cadence::parse("daily").unwrap(), Cadence::Daily);
+        assert_eq!(Cadence::parse("weekly").unwrap(), Cadence::Weekly);
+        assert_eq!(Cadence::parse("monthly").unwrap(), Cadence::Monthly);
+        assert_eq!(Cadence::parse("quarterly").unwrap(), Cadence::Quarterly);
+        assert_eq!(
+            Cadence::parse("every-3-days").unwrap(),
+            Cadence::EveryNDays(3)
+        );
+        assert_eq!(
+            Cadence::parse("every-1-days").unwrap(),
+            Cadence::EveryNDays(1)
+        );
+        // Also via serde
+        let parsed: Cadence = serde_yaml::from_str("\"every-7-days\"").unwrap();
+        assert_eq!(parsed, Cadence::EveryNDays(7));
+    }
+
+    #[test]
+    fn cadence_every_n_days_rejects_zero() {
+        let err = Cadence::parse("every-0-days").expect_err("zero must be rejected");
+        assert!(err.contains("0"), "error must mention zero: {err}");
+        // And via serde:
+        let res: std::result::Result<Cadence, _> = serde_yaml::from_str("\"every-0-days\"");
+        assert!(res.is_err(), "serde must reject every-0-days");
+    }
+
+    #[test]
+    fn cadence_every_n_days_rejects_negative() {
+        let err = Cadence::parse("every--3-days").expect_err("negative must be rejected");
+        assert!(
+            err.to_lowercase().contains("negative") || err.contains("positive"),
+            "error must indicate negativity; got: {err}"
+        );
+    }
+
+    #[test]
+    fn cadence_rejects_unknown_form() {
+        assert!(Cadence::parse("yearly").is_err());
+        assert!(Cadence::parse("every-day").is_err());
+        assert!(Cadence::parse("every-3-day").is_err()); // missing trailing s
+    }
+
+    #[test]
+    fn audits_block_parses() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    architecture_brightline: weekly
+  settings:
+    architecture_brightline:
+      notify_on_clean: true
+      extra:
+        file_lines_threshold: 500
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config with audits block should parse");
+        let audits = cfg.audits.expect("audits block present");
+        assert_eq!(
+            audits.defaults.get("architecture_brightline").copied(),
+            Some(Cadence::Weekly)
+        );
+        let settings = audits
+            .settings
+            .get("architecture_brightline")
+            .expect("settings present");
+        assert!(settings.notify_on_clean);
+        assert!(
+            settings.extra.get("file_lines_threshold").is_some(),
+            "extra threshold should be parsed"
+        );
+    }
+
+    #[test]
+    fn audits_unknown_type_fails_at_load() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    nonexistent_audit_xyz: weekly
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("YAML must parse — validation is separate");
+        let err = validate_audit_type_names(&cfg, &["architecture_brightline"])
+            .expect_err("unknown audit name must be rejected by validate_audit_type_names");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nonexistent_audit_xyz"),
+            "error must name the offending audit type; got: {msg}"
+        );
+        assert!(
+            msg.contains("architecture_brightline"),
+            "error must list known types; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn audits_unknown_per_repo_type_fails_at_load() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    audits:
+      typo_audit: daily
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("YAML must parse");
+        let err = validate_audit_type_names(&cfg, &["architecture_brightline"])
+            .expect_err("unknown per-repo audit name must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("typo_audit"),
+            "error must name the offending audit type; got: {msg}"
+        );
+        assert!(
+            msg.contains("repositories[0]"),
+            "error must name the field path; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn per_repo_audit_overrides_global_default() {
+        let mut defaults = HashMap::new();
+        defaults.insert("architecture_brightline".to_string(), Cadence::Weekly);
+        let audits_cfg = AuditsConfig {
+            defaults,
+            settings: HashMap::new(),
+        };
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "architecture_brightline".to_string(),
+            Cadence::EveryNDays(3),
+        );
+        let repo = make_repo("git@github.com:o/r.git", Some(overrides));
+        let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_brightline");
+        assert_eq!(effective, Cadence::EveryNDays(3));
+    }
+
+    #[test]
+    fn audit_absent_from_both_resolves_to_disabled() {
+        let repo = make_repo("git@github.com:o/r.git", None);
+        let effective = resolved_cadence(&repo, None, "architecture_brightline");
+        assert_eq!(effective, Cadence::Disabled);
+
+        let audits_cfg = AuditsConfig::default();
+        let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_brightline");
+        assert_eq!(effective, Cadence::Disabled);
+
+        let mut defaults = HashMap::new();
+        defaults.insert("other_audit".to_string(), Cadence::Daily);
+        let audits_cfg = AuditsConfig {
+            defaults,
+            settings: HashMap::new(),
+        };
+        let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_brightline");
+        assert_eq!(
+            effective,
+            Cadence::Disabled,
+            "an audit not listed anywhere must resolve to Disabled"
+        );
+    }
+
+    #[test]
+    fn global_default_applies_when_no_per_repo_override() {
+        let mut defaults = HashMap::new();
+        defaults.insert("architecture_brightline".to_string(), Cadence::Monthly);
+        let audits_cfg = AuditsConfig {
+            defaults,
+            settings: HashMap::new(),
+        };
+        let repo = make_repo("git@github.com:o/r.git", None);
+        let effective = resolved_cadence(&repo, Some(&audits_cfg), "architecture_brightline");
+        assert_eq!(effective, Cadence::Monthly);
+    }
+
+    #[test]
+    fn validate_audit_type_names_passes_when_all_known() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+    audits:
+      architecture_brightline: daily
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    architecture_brightline: weekly
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        validate_audit_type_names(&cfg, &["architecture_brightline"])
+            .expect("registered audit must pass validation");
+    }
+
+    #[test]
+    fn cadence_interval_matches_documented_durations() {
+        assert!(Cadence::Disabled.interval().is_none());
+        assert_eq!(Cadence::Daily.interval(), Some(chrono::Duration::days(1)));
+        assert_eq!(Cadence::Weekly.interval(), Some(chrono::Duration::days(7)));
+        assert_eq!(
+            Cadence::EveryNDays(3).interval(),
+            Some(chrono::Duration::days(3))
+        );
+        assert_eq!(Cadence::Monthly.interval(), Some(chrono::Duration::days(30)));
+        assert_eq!(
+            Cadence::Quarterly.interval(),
+            Some(chrono::Duration::days(90))
+        );
     }
 
     #[test]

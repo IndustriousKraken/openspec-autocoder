@@ -1103,6 +1103,7 @@ github:
             poll_interval_sec: 60,
             chatops_channel_id: None,
             max_changes_per_pr: None,
+            audits: None,
         };
         {
             let mut guard = state.repo_tasks.lock().unwrap();

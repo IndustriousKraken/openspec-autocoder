@@ -241,6 +241,20 @@ pub fn status_porcelain(workspace: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Return the trimmed stdout of `git status --porcelain -uall`. Unlike
+/// `status_porcelain`, this expands untracked directories to every
+/// individual file path inside them, so callers doing per-path policy
+/// checks (e.g. the audit framework's `WritePolicy::OpenSpecOnly`
+/// enforcement) see the actual paths, not just the parent dir.
+pub fn status_porcelain_untracked_all(workspace: &Path) -> Result<String> {
+    let output = run_git(
+        workspace,
+        "status --porcelain -uall",
+        &["status", "--porcelain", "-uall"],
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Return the 40-character commit SHA pointed to by `rev`.
 pub fn rev_parse(workspace: &Path, rev: &str) -> Result<String> {
     let output = run_git(workspace, "rev-parse", &["rev-parse", rev])?;
