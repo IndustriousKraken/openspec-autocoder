@@ -337,6 +337,45 @@ pub fn write_sandbox_settings(
     Ok((path.clone(), SandboxSettingsGuard(path)))
 }
 
+/// Spawn a child process, retrying briefly on `ETXTBSY`.
+///
+/// Linux returns `ETXTBSY` when a `Command::spawn` execve targets a file
+/// that any process currently holds open for write. With many parallel
+/// tests writing short-lived shell scripts and immediately spawning
+/// them, this race can fire — one test's `fork()` (inside `spawn`) can
+/// inherit another thread's writable fd to its own to-be-exec'd script
+/// during the brief window between `std::fs::write` returning and the
+/// `File` being dropped. The inherited fd dies on `execve` (Rust opens
+/// files with `O_CLOEXEC`), but until `execve` happens, the kernel sees
+/// the file as busy and refuses the exec on it from any other process.
+///
+/// The window is microseconds. A short retry loop closes it without
+/// needing to serialize the test suite. Tied to `docs/test-reliability.md`
+/// entry "ETXTBSY from concurrent audit-CLI fixtures".
+pub async fn spawn_with_etxtbsy_retry<F>(
+    mut build: F,
+) -> std::io::Result<tokio::process::Child>
+where
+    F: FnMut() -> tokio::process::Command,
+{
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut attempt: u32 = 0;
+    loop {
+        match build().spawn() {
+            Ok(child) => return Ok(child),
+            Err(e)
+                if e.raw_os_error() == Some(libc::ETXTBSY)
+                    && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                attempt += 1;
+                let backoff = std::time::Duration::from_millis(20 * u64::from(attempt));
+                tokio::time::sleep(backoff).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

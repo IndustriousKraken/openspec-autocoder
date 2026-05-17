@@ -328,22 +328,27 @@ async fn run_subprocess(
     prompt: &str,
     timeout: Duration,
 ) -> Result<SubprocessOutcome> {
-    let mut child = Command::new(command)
-        .arg("--settings")
-        .arg(settings_path)
-        .arg("--allowedTools")
-        .arg(allowed_tools.join(","))
-        .arg("--permission-mode")
-        .arg("acceptEdits")
-        .current_dir(workspace)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .with_context(|| {
-            format!("spawning architecture-consultative command `{command}`")
-        })?;
+    // ETXTBSY retry: see docs/test-reliability.md
+    // "ETXTBSY from concurrent audit-CLI fixtures".
+    let mut child = super::spawn_with_etxtbsy_retry(|| {
+        let mut cmd = Command::new(command);
+        cmd.arg("--settings")
+            .arg(settings_path)
+            .arg("--allowedTools")
+            .arg(allowed_tools.join(","))
+            .arg("--permission-mode")
+            .arg("acceptEdits")
+            .current_dir(workspace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        cmd
+    })
+    .await
+    .with_context(|| {
+        format!("spawning architecture-consultative command `{command}`")
+    })?;
 
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes()).await;
