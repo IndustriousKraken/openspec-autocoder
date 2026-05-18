@@ -584,22 +584,59 @@ pub async fn run_pass_through_commits(
     // It is intentionally untracked; it must not trip the dirty check.
     let dirty_filtered = filter_alert_state_lines(&dirty);
     if !dirty_filtered.is_empty() {
-        let e = anyhow!(
-            "workspace {} is dirty before pass; refusing to proceed:\n{dirty_filtered}",
-            workspace.display()
+        let dirty_count = dirty_filtered.lines().count();
+        tracing::warn!(
+            url = repo.url.as_str(),
+            workspace = %workspace.display(),
+            "workspace dirty mid-iteration ({dirty_count} entries); attempting recovery (git reset --hard origin/{} + git clean -fd)",
+            repo.base_branch
         );
-        handle_predictable_failure(
-            workspace,
-            &repo.url,
-            chatops_ctx,
-            chatops_ctx
-                .map(|c| c.failure_alerts_enabled)
-                .unwrap_or(false),
-            AlertCategory::WorkspaceDirtyMidIteration,
-            &e,
-        )
-        .await;
-        return Err(e);
+        match attempt_dirty_workspace_recovery(workspace, &repo.base_branch) {
+            Ok(()) => {
+                let recheck = git::status_porcelain(workspace)?;
+                let recheck_filtered = filter_alert_state_lines(&recheck);
+                if recheck_filtered.is_empty() {
+                    tracing::info!(
+                        url = repo.url.as_str(),
+                        "workspace recovered mid-iteration; proceeding"
+                    );
+                } else {
+                    let e = anyhow!(
+                        "workspace {} still dirty after recovery; refusing to proceed:\n{recheck_filtered}",
+                        workspace.display()
+                    );
+                    handle_predictable_failure(
+                        workspace,
+                        &repo.url,
+                        chatops_ctx,
+                        chatops_ctx
+                            .map(|c| c.failure_alerts_enabled)
+                            .unwrap_or(false),
+                        AlertCategory::WorkspaceDirtyMidIteration,
+                        &e,
+                    )
+                    .await;
+                    return Err(e);
+                }
+            }
+            Err(recovery_err) => {
+                let e = anyhow!(
+                    "dirty-workspace recovery failed: {recovery_err:#}; original dirty state:\n{dirty_filtered}"
+                );
+                handle_predictable_failure(
+                    workspace,
+                    &repo.url,
+                    chatops_ctx,
+                    chatops_ctx
+                        .map(|c| c.failure_alerts_enabled)
+                        .unwrap_or(false),
+                    AlertCategory::WorkspaceDirtyMidIteration,
+                    &e,
+                )
+                .await;
+                return Err(e);
+            }
+        }
     }
 
     git::fetch(workspace)?;
@@ -1247,6 +1284,24 @@ fn truncate_reason(reason: &str) -> String {
         out.push('…');
         out
     }
+}
+
+/// Attempt to recover a workspace whose pre-pass dirty check tripped.
+/// Mirrors the startup recovery in `cli/run.rs::repo_passes_startup_check`:
+/// best-effort `git checkout <base>` (might fail if uncommitted
+/// modifications would be overwritten — that's fine, the next step forces
+/// the issue), then `git reset --hard origin/<base>`, then `git clean -fd`.
+///
+/// Safe in the per-iteration position because the agent branch is rebuilt
+/// from base each iteration via `recreate_branch`; wholesale wiping does
+/// not lose recoverable work. The caller is responsible for re-checking
+/// `git status --porcelain` after this returns.
+fn attempt_dirty_workspace_recovery(workspace: &Path, base_branch: &str) -> Result<()> {
+    let _ = git::checkout(workspace, base_branch);
+    git::reset_hard_to_remote(workspace, base_branch)
+        .with_context(|| format!("git reset --hard origin/{base_branch}"))?;
+    git::clean_force(workspace).with_context(|| "git clean -fd".to_string())?;
+    Ok(())
 }
 
 /// Remove `git status --porcelain` lines that reference the
@@ -5431,21 +5486,104 @@ mod tests {
         );
     }
 
-    /// alert-on-dirty-workspace-mid-iteration: a workspace dirty at
-    /// `run_pass_through_commits` time SHALL post a chatops alert under
-    /// `WorkspaceDirtyMidIteration` and persist state, mirroring the
-    /// other predictable-failure categories.
+    /// recover-dirty-workspace-mid-iteration: a workspace dirty at
+    /// `run_pass_through_commits` time triggers auto-recovery
+    /// (`git reset --hard origin/<base> + git clean -fd`). When recovery
+    /// cleans the dirt, the iteration proceeds normally AND no chatops
+    /// alert fires (the operator does not need to be notified about a
+    /// self-healed condition).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dirty_workspace_emits_alert_when_chatops_configured() {
+    async fn dirty_workspace_recovers_and_iteration_proceeds() {
         let (_dir, ws) = fixture_workspace_with_remote();
-        // Seed a dirty state: write an untracked file under openspec/.
+        // Seed a dirty state: untracked file under openspec/.
+        // `git clean -fd` (the recovery step) will remove this.
         std::fs::create_dir_all(ws.join("openspec/changes/leftover")).unwrap();
         std::fs::write(
             ws.join("openspec/changes/leftover/proposal.md"),
             "## Why\nleftover\n",
         )
         .unwrap();
-        // Don't commit — leaves the workspace dirty.
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        // No alert should fire — recovery handles the dirt silently.
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .expect(0)
+            .create_async()
+            .await;
+        let chatops_ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        };
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+        struct UnreachableExecutor;
+        #[async_trait::async_trait]
+        impl Executor for UnreachableExecutor {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                // After `git clean -fd` the leftover dir is gone, so the
+                // queue walk has nothing to do and the executor is never
+                // invoked. If this panics, the test reveals a regression.
+                unreachable!("post-recovery queue must be empty; executor should not be invoked")
+            }
+            async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let result = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &github_cfg,
+            &UnreachableExecutor,
+            Some(&chatops_ctx),
+            u32::MAX,
+            u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "iteration should succeed after recovery; got: {result:?}"
+        );
+        // The dirty untracked dir must be gone.
+        assert!(
+            !ws.join("openspec/changes/leftover").exists(),
+            "git clean -fd should have removed the untracked dir"
+        );
+        // No state file was written because no alert fired.
+        assert!(
+            !ws.join(".alert-state.json").exists(),
+            "no alert, no state file write"
+        );
+        mock.assert_async().await;
+    }
+
+    /// recover-dirty-workspace-mid-iteration: when recovery itself
+    /// errors (e.g. `git reset --hard` against an origin that doesn't
+    /// have the configured base branch), the iteration falls back to
+    /// the old alert-and-return-Err path. The alert is the operator's
+    /// signal that a manually-fixable problem is present.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dirty_workspace_recovery_failure_still_alerts() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // Dirty state same as the success-path test.
+        std::fs::create_dir_all(ws.join("openspec/changes/leftover")).unwrap();
+        std::fs::write(
+            ws.join("openspec/changes/leftover/proposal.md"),
+            "## Why\nleftover\n",
+        )
+        .unwrap();
 
         let mut server = mockito::Server::new_async().await;
         let chatops = fixture_chatops_for(&mut server).await;
@@ -5470,11 +5608,17 @@ mod tests {
             fork_owner: None,
             recreate_fork_on_reinit: false,
         };
+        // base_branch points at a branch that does NOT exist on origin
+        // → `git reset --hard origin/nonexistent-branch` errors →
+        // recovery returns Err → fall back to alert path.
+        let mut repo = fixture_repo(&ws);
+        repo.base_branch = "nonexistent-branch".into();
+
         struct UnreachableExecutor;
         #[async_trait::async_trait]
         impl Executor for UnreachableExecutor {
             async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
-                unreachable!("dirty check should error before any executor.run")
+                unreachable!()
             }
             async fn resume(&self, _h: ResumeHandle, _a: &str) -> Result<ExecutorOutcome> {
                 unreachable!()
@@ -5482,7 +5626,7 @@ mod tests {
         }
         let result = run_pass_through_commits(
             &ws,
-            &fixture_repo(&ws),
+            &repo,
             &github_cfg,
             &UnreachableExecutor,
             Some(&chatops_ctx),
@@ -5491,15 +5635,14 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
         )
         .await;
-        assert!(result.is_err(), "dirty workspace should produce Err");
+        assert!(result.is_err(), "recovery failure must surface as Err");
+        let err = format!("{:#}", result.unwrap_err());
         assert!(
-            format!("{:#}", result.unwrap_err()).contains("dirty before pass"),
-            "error message should name the dirty state"
+            err.contains("recovery failed") || err.contains("dirty"),
+            "error should name the recovery failure; got: {err}"
         );
-
         mock.assert_async().await;
         let state = crate::alert_state::AlertState::load_or_default(&ws);
         assert!(
@@ -5510,10 +5653,11 @@ mod tests {
         );
     }
 
-    /// alert-on-dirty-workspace-mid-iteration: without chatops configured,
-    /// the dirty path still returns Err but no panic, no state file.
+    /// recover-dirty-workspace-mid-iteration: without chatops the
+    /// auto-recovery still runs. Workspace dirty → recovery cleans
+    /// → iteration succeeds. No state file is written (no alert posted).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dirty_workspace_silent_without_chatops() {
+    async fn dirty_workspace_recovers_without_chatops() {
         let (_dir, ws) = fixture_workspace_with_remote();
         std::fs::create_dir_all(ws.join("openspec/changes/leftover")).unwrap();
         std::fs::write(
@@ -5550,16 +5694,40 @@ mod tests {
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
-        
         )
         .await;
-        assert!(result.is_err(), "dirty workspace should still produce Err");
-        // No chatops → handle_predictable_failure short-circuits before
-        // touching the state file.
+        assert!(result.is_ok(), "iteration should succeed: {result:?}");
         assert!(
             !ws.join(".alert-state.json").exists(),
             "no chatops, no state file write"
         );
+    }
+
+    /// attempt_dirty_workspace_recovery is a thin wrapper; unit-test it
+    /// in isolation so a regression in the helper itself is caught
+    /// independently of the run_pass_through_commits integration.
+    #[test]
+    fn attempt_dirty_workspace_recovery_clears_untracked_and_tracked_modifications() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // Tracked modification: rewrite README.md.
+        std::fs::write(ws.join("README.md"), "modified\n").unwrap();
+        // Untracked file.
+        std::fs::write(ws.join("untracked.txt"), "stranger\n").unwrap();
+        // Sanity: status reports both.
+        let dirty = git::status_porcelain(&ws).unwrap();
+        assert!(
+            dirty.contains("README.md") && dirty.contains("untracked.txt"),
+            "fixture must seed both kinds of dirt: {dirty}"
+        );
+        attempt_dirty_workspace_recovery(&ws, "main").expect("recovery should succeed");
+        let after = git::status_porcelain(&ws).unwrap();
+        assert!(
+            after.is_empty(),
+            "workspace must be clean after recovery; got: {after}"
+        );
+        // README.md should be restored to origin's content.
+        let restored = std::fs::read_to_string(ws.join("README.md")).unwrap();
+        assert_eq!(restored, "hi\n", "tracked file restored from origin");
     }
 
     /// pr-opened-chatops-notification: when `pr_opened_enabled = true`,
