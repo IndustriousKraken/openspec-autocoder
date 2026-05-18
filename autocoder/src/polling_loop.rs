@@ -1689,8 +1689,8 @@ async fn open_pull_request(
     // posted to upstream's /pulls endpoint regardless of fork-PR mode, so
     // the credential authorizing that call must have access to upstream.
     let token = crate::github_credentials::resolve_token(github_cfg, &owner)?;
-    let title = format!("agent: {} change(s) in pass", changes.len());
-    let body = build_pr_body(changes, includes_self_heal);
+    let title = build_pr_title(changes);
+    let body = build_pr_body(workspace, changes, includes_self_heal);
 
     // In fork-PR mode the `head` is namespaced `<fork-owner>:<branch>` for
     // GitHub to recognize the cross-repo PR. Direct-push mode uses the bare
@@ -1905,18 +1905,119 @@ fn truncate_to_fit(body: String, max: usize) -> String {
     truncated
 }
 
-fn build_pr_body(changes: &[String], includes_self_heal: bool) -> String {
+/// Replace hyphens in `slug` with spaces. If the slug carries the
+/// stacked `aNN-` prefix convention (`^[a-z]+\d+-`), keep that prefix as
+/// a leading label followed by `": "` and the de-hyphenated remainder.
+/// Otherwise just swap hyphens for spaces wholesale.
+fn humanize_slug(slug: &str) -> String {
+    let re = regex::Regex::new(r"^([a-z]+\d+)-(.+)$")
+        .expect("static regex compiles");
+    if let Some(caps) = re.captures(slug) {
+        let prefix = &caps[1];
+        let rest = caps[2].replace('-', " ");
+        format!("{prefix}: {rest}")
+    } else {
+        slug.replace('-', " ")
+    }
+}
+
+/// Build a PR title from the list of changes processed in a pass.
+/// Single-change passes get the humanized slug; multi-change passes get
+/// `<first humanized> (+N more)`. Total length is capped at ~80 chars,
+/// with an ellipsis replacing the truncated tail.
+fn build_pr_title(changes: &[String]) -> String {
+    const MAX_LEN: usize = 80;
+    const ELLIPSIS: char = '…';
+
+    if changes.is_empty() {
+        return "agent: empty pass".to_string();
+    }
+    let first = humanize_slug(&changes[0]);
+    let title = if changes.len() == 1 {
+        first
+    } else {
+        format!("{first} (+{} more)", changes.len() - 1)
+    };
+
+    if title.chars().count() <= MAX_LEN {
+        return title;
+    }
+
+    // Truncate at a char boundary so we don't slice through a multibyte
+    // codepoint. Leave room for the ellipsis itself.
+    let take = MAX_LEN.saturating_sub(1);
+    let truncated: String = title.chars().take(take).collect();
+    let mut out = truncated;
+    out.push(ELLIPSIS);
+    out
+}
+
+fn build_pr_body(workspace: &Path, changes: &[String], includes_self_heal: bool) -> String {
     let mut s = String::new();
     if includes_self_heal {
         s.push_str(
             "_This PR archives one or more changes whose implementation was already present on the base branch. No code diff is included; only the openspec archive move._\n\n",
         );
     }
+    for change in changes {
+        let why = read_archived_why(workspace, change);
+        let body = match why {
+            Some(w) if !w.trim().is_empty() => w.trim().to_string(),
+            _ => "_(no proposal.md available)_".to_string(),
+        };
+        s.push_str(&format!("## {change}\n\n{body}\n\n"));
+    }
     s.push_str("Changes implemented in this pass:\n\n");
     for change in changes {
         s.push_str(&format!("- {change}\n"));
     }
     s
+}
+
+/// Locate `<workspace>/openspec/changes/archive/*-<change>/proposal.md`
+/// (picking the lexicographically last match if multiple exist), read
+/// the file, and return the `## Why` section. Returns `None` if the
+/// directory or file is missing, the read fails, or no `## Why` heading
+/// is present.
+fn read_archived_why(workspace: &Path, change: &str) -> Option<String> {
+    let archive_root = workspace.join("openspec/changes/archive");
+    let entries = std::fs::read_dir(&archive_root).ok()?;
+    let suffix = format!("-{change}");
+    let mut matches: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with(&suffix)
+        })
+        .map(|e| e.path())
+        .collect();
+    matches.sort();
+    let dir = matches.last()?;
+    let proposal = dir.join("proposal.md");
+    let raw = std::fs::read_to_string(&proposal).ok()?;
+    extract_why_section(&raw)
+}
+
+/// Pull the `## Why` section out of a proposal.md body: everything from
+/// the line after `## Why` up to (but not including) the next `## `
+/// heading or EOF. Returns `None` if no `## Why` heading exists.
+fn extract_why_section(raw: &str) -> Option<String> {
+    let mut lines = raw.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == "## Why" {
+            let mut out = String::new();
+            for next in lines.by_ref() {
+                if next.trim_start().starts_with("## ") {
+                    break;
+                }
+                out.push_str(next);
+                out.push('\n');
+            }
+            return Some(out);
+        }
+    }
+    None
 }
 
 /// Read `openspec/changes/<change>/tasks.md` and decide whether every task
@@ -4959,7 +5060,7 @@ mod tests {
         );
 
         // PR body for this pass carries the disclaimer paragraph.
-        let body = build_pr_body(&processed, includes_self_heal);
+        let body = build_pr_body(&ws, &processed, includes_self_heal);
         assert!(
             body.contains("_This PR archives one or more changes whose implementation was already present on the base branch."),
             "PR body should include the self-heal disclaimer; got: {body}"
@@ -5077,8 +5178,9 @@ mod tests {
     /// NOT include the self-heal disclaimer paragraph in the PR body.
     #[test]
     fn self_heal_paragraph_omitted_when_no_self_heals_in_pass() {
+        let tmp = tempfile::TempDir::new().unwrap();
         let processed = vec!["regular-change".to_string()];
-        let body = build_pr_body(&processed, false);
+        let body = build_pr_body(tmp.path(), &processed, false);
         assert!(
             !body.contains("This PR archives one or more changes whose implementation was already present"),
             "disclaimer paragraph must not appear when includes_self_heal=false; got: {body}"
@@ -6160,6 +6262,182 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(500),
             "cancellation should be observed within 500 ms; took {elapsed:?}"
+        );
+    }
+
+    // ----- Title generator -----
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn build_pr_title_single_change_humanizes_aNN_prefix() {
+        let input = vec!["a06-refactor-portal-handlers-to-fromref".to_string()];
+        assert_eq!(
+            build_pr_title(&input),
+            "a06: refactor portal handlers to fromref",
+        );
+    }
+
+    #[test]
+    fn build_pr_title_single_change_without_prefix() {
+        let input = vec!["fix-bug-in-thing".to_string()];
+        assert_eq!(build_pr_title(&input), "fix bug in thing");
+    }
+
+    #[test]
+    fn build_pr_title_multi_change_uses_first_and_count() {
+        let input = vec![
+            "a04-foo-thing".to_string(),
+            "a05-bar-thing".to_string(),
+            "a06-baz-thing".to_string(),
+        ];
+        assert_eq!(build_pr_title(&input), "a04: foo thing (+2 more)");
+    }
+
+    #[test]
+    fn build_pr_title_caps_overlong() {
+        let mut slug = String::from("a06-");
+        for _ in 0..50 {
+            slug.push_str("verylong-");
+        }
+        let input = vec![slug];
+        let title = build_pr_title(&input);
+        assert!(
+            title.chars().count() <= 80,
+            "title should be capped at 80 chars; got {} chars: {title:?}",
+            title.chars().count()
+        );
+        assert!(
+            title.ends_with('…'),
+            "truncated title should end with ellipsis; got {title:?}"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn humanize_slug_strips_aNN_prefix_into_label() {
+        assert_eq!(humanize_slug("a06-x-y"), "a06: x y");
+        assert_eq!(humanize_slug("b13-foo-bar"), "b13: foo bar");
+        assert_eq!(humanize_slug("foo-bar"), "foo bar");
+    }
+
+    // ----- Body generator -----
+
+    /// Write a fixture archive entry with a known proposal.md.
+    fn write_fixture_archive(workspace: &Path, date_slug: &str, proposal: &str) {
+        let dir = workspace.join("openspec/changes/archive").join(date_slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proposal.md"), proposal).unwrap();
+    }
+
+    #[test]
+    fn build_pr_body_inlines_why_from_archived_proposal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fixture_archive(
+            tmp.path(),
+            "2026-05-18-fix-thing",
+            "## Why\n\nThing was broken because of reasons.\n\n## What Changes\n\nstuff\n",
+        );
+        let body = build_pr_body(tmp.path(), &["fix-thing".to_string()], false);
+        assert!(body.contains("## fix-thing"), "body: {body}");
+        assert!(
+            body.contains("Thing was broken because of reasons."),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("Changes implemented in this pass"),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn build_pr_body_falls_back_when_proposal_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No archive directory at all.
+        let body = build_pr_body(tmp.path(), &["fix-thing".to_string()], false);
+        assert!(body.contains("## fix-thing"), "body: {body}");
+        assert!(
+            body.contains("_(no proposal.md available)_"),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn build_pr_body_handles_multiple_changes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fixture_archive(
+            tmp.path(),
+            "2026-05-18-a04-foo",
+            "## Why\n\nFoo rationale.\n\n## What Changes\n\nx\n",
+        );
+        write_fixture_archive(
+            tmp.path(),
+            "2026-05-18-a05-bar",
+            "## Why\n\nBar rationale.\n\n## What Changes\n\nx\n",
+        );
+        write_fixture_archive(
+            tmp.path(),
+            "2026-05-18-a06-baz",
+            "## Why\n\nBaz rationale.\n\n## What Changes\n\nx\n",
+        );
+        let changes = vec![
+            "a04-foo".to_string(),
+            "a05-bar".to_string(),
+            "a06-baz".to_string(),
+        ];
+        let body = build_pr_body(tmp.path(), &changes, false);
+
+        // Each per-change heading appears in input order.
+        let foo_pos = body.find("## a04-foo").expect("a04-foo heading");
+        let bar_pos = body.find("## a05-bar").expect("a05-bar heading");
+        let baz_pos = body.find("## a06-baz").expect("a06-baz heading");
+        assert!(foo_pos < bar_pos && bar_pos < baz_pos);
+
+        // Each section contains its own Why text.
+        assert!(body.contains("Foo rationale."));
+        assert!(body.contains("Bar rationale."));
+        assert!(body.contains("Baz rationale."));
+    }
+
+    #[test]
+    fn build_pr_body_preserves_self_heal_disclaimer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fixture_archive(
+            tmp.path(),
+            "2026-05-18-fix-thing",
+            "## Why\n\nA reason.\n\n## What Changes\n\nx\n",
+        );
+        let body = build_pr_body(tmp.path(), &["fix-thing".to_string()], true);
+        assert!(
+            body.starts_with("_This PR archives one or more changes whose implementation was already present on the base branch."),
+            "body must begin with the self-heal disclaimer; got: {body}"
+        );
+        let disclaimer_end = body
+            .find("_\n\n")
+            .expect("disclaimer paragraph terminator");
+        let after_disclaimer = &body[disclaimer_end..];
+        assert!(
+            after_disclaimer.contains("## fix-thing"),
+            "per-change section must follow disclaimer; got: {body}"
+        );
+    }
+
+    #[test]
+    fn build_pr_body_extracts_only_why_section() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fixture_archive(
+            tmp.path(),
+            "2026-05-18-fix-thing",
+            "## Why\nWhy text.\n## What Changes\nDifferent text.\n## Impact\nMore text.\n",
+        );
+        let body = build_pr_body(tmp.path(), &["fix-thing".to_string()], false);
+        assert!(body.contains("Why text."), "body: {body}");
+        assert!(
+            !body.contains("Different text."),
+            "body must not include non-Why sections; got: {body}"
+        );
+        assert!(
+            !body.contains("More text."),
+            "body must not include non-Why sections; got: {body}"
         );
     }
 }
