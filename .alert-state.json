@@ -1,9 +1,0 @@
-{
-  "alerts": {
-    "workspace_dirty_mid_iteration": {
-      "last_alerted_at": "2026-05-16T18:12:32.171124448Z",
-      "last_error_excerpt": "workspace /tmp/workspaces/github_com_IndustriousKraken_openspec-autocoder is dirty before pass; refusing to proceed:\n?? openspec/changes/audit-flaky-tests/.perma-stuck.json"
-    }
-  },
-  "perma_stuck_alerts": {}
-}
