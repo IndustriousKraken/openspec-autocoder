@@ -28,14 +28,19 @@ fn excerpt_str(s: &str) -> String {
     }
 }
 
-/// Format the alert text as `⚠️ <repo>: <label> for the past 24h. Latest: <excerpt>`.
+/// Format the alert text as `⚠️ <repo>: <label>. Latest: <excerpt>`.
+/// The 24h throttle that governs how often this category re-posts is an
+/// implementation detail of `handle_predictable_failure` — earlier
+/// wordings claimed "for the past 24h" inside the alert body, which
+/// operators read as a duration measurement rather than a throttle
+/// window. The duration claim is intentionally absent here.
 pub(crate) fn format_alert_text(
     repo_url: &str,
     category: AlertCategory,
     err: &anyhow::Error,
 ) -> String {
     format!(
-        "⚠️ `{repo_url}`: {label} for the past 24h. Latest: {excerpt}",
+        "⚠️ `{repo_url}`: {label}. Latest: {excerpt}",
         label = category.label(),
         excerpt = excerpt(err),
     )
@@ -161,6 +166,29 @@ mod tests {
         assert!(text.contains("branch push keeps failing"));
         assert!(text.contains("server hangup"));
         assert!(text.starts_with("⚠️"));
+    }
+
+    /// Regression: an earlier version of the format included "for the
+    /// past 24h" as a hardcoded duration claim, which operators read as
+    /// a measurement rather than as the throttle window. The phrase is
+    /// intentionally absent now — pin it so no future change
+    /// reintroduces the misleading wording.
+    #[test]
+    fn format_alert_text_does_not_claim_a_duration() {
+        let err = anyhow!("anything");
+        let text = format_alert_text(
+            "git@github.com:owner/repo.git",
+            AlertCategory::WorkspaceDirtyMidIteration,
+            &err,
+        );
+        assert!(
+            !text.contains("for the past 24h"),
+            "alert text must not claim a duration measurement; got: {text}"
+        );
+        assert!(
+            !text.contains("past 24h"),
+            "alert text must not claim a duration measurement; got: {text}"
+        );
     }
 
     #[test]

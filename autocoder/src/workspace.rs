@@ -125,6 +125,20 @@ pub fn ensure_initialized(
             "could not register .audit-state.json in .git/info/exclude: {e:#}"
         );
     }
+    // Per-change perma-stuck markers live at
+    // `openspec/changes/<change>/.perma-stuck.json`. They are operator-
+    // managed (deletion is the "retry this change" signal), so they
+    // must NOT trip the pre-pass dirty check AND must survive the
+    // per-iteration `git clean -fd` recovery. `.git/info/exclude` makes
+    // them gitignored at any depth, which gets both behaviors for free:
+    // `git status --porcelain` omits ignored files, and `git clean -fd`
+    // (without `-x`) preserves them.
+    if let Err(e) = ensure_git_info_excluded(workspace, ".perma-stuck.json") {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            "could not register .perma-stuck.json in .git/info/exclude: {e:#}"
+        );
+    }
     Ok(())
 }
 

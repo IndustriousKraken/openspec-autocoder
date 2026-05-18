@@ -812,6 +812,13 @@ The `rewind` subcommand discards the in-flight agent branch and re-queues one or
 
 If a workspace under `/tmp/workspaces/` is left dirty between polls (uncommitted edits, untracked files, or a checked-out branch other than the base), autocoder recovers automatically at the next startup or poll cycle: it checks out the configured `base_branch`, runs `git reset --hard origin/<base_branch>`, and runs `git clean -fd`. The repo then re-enters its normal polling loop. If recovery itself fails (e.g. the remote is unreachable), the repo is skipped for the daemon's lifetime and an error is logged — restart the daemon once the underlying problem is fixed.
 
+Recovery runs at two points in the lifecycle:
+
+1. **Startup** (`autocoder run` boot): every configured repo passes through `repo_passes_startup_check`. A dirty workspace at this point usually means a daemon restart after a previous run was killed mid-iteration. Recovery resets the workspace and the repo proceeds to normal polling; if recovery itself fails the repo is excluded for the process lifetime.
+2. **Per iteration** (`run_pass_through_commits` pre-pass check): a failed executor invocation that returned `Failed` or timed out without committing leaves tracked-file modifications behind. The next iteration's pre-pass dirty check runs the same recovery before the iteration's normal flow begins. On success the iteration proceeds and no operator notification fires. Only when recovery itself errors (or the workspace is somehow still dirty after the recovery commands complete) does autocoder post the `WorkspaceDirtyMidIteration` chatops alert and return the iteration as failed.
+
+Wholesale wiping of the workspace is safe at both points because the agent branch is rebuilt from base each iteration via `recreate_branch` — any local state the recovery destroys would have been overwritten anyway. The recovery does NOT touch the fork remote; it operates purely on the local working tree.
+
 Operators who want to inspect a dirty workspace before any daemon action should stop the systemd unit first:
 
 ```bash
