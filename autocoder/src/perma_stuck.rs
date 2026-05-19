@@ -132,4 +132,27 @@ mod tests {
         make_change_dir(ws, "foo");
         assert!(!marker_exists(ws, "foo"));
     }
+
+    #[test]
+    fn write_marker_errors_when_change_directory_absent() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        // Intentionally do NOT create openspec/changes/foo/.
+        let result = write_marker(ws, "foo", &fixture_entry());
+        let err = result.expect_err("write_marker should fail when change dir is absent");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("change directory does not exist"),
+            "error message missing guard text: {msg}"
+        );
+        assert!(
+            msg.contains("foo"),
+            "error message missing change name: {msg}"
+        );
+        // Guard runs before any filesystem write — no marker file should exist.
+        assert!(
+            !ws.join("openspec/changes/foo/.perma-stuck.json").exists(),
+            "marker file should not exist after failed guard",
+        );
+    }
 }
