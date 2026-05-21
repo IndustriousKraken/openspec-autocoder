@@ -6,7 +6,7 @@ use crate::audits::{
     Audit, AuditRegistry,
     architecture_consultative::ArchitectureConsultativeAudit,
     brightline::ArchitectureBrightlineAudit,
-    dependency_update::DependencyUpdateAudit, drift::DriftAudit,
+    drift::DriftAudit,
     missing_tests::MissingTestsAudit, security_bug::SecurityBugAudit,
 };
 use crate::chatops;
@@ -152,10 +152,6 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
     let audits_cfg_arc: Option<Arc<AuditsConfig>> = cfg.audits.clone().map(Arc::new);
     let mut registry = AuditRegistry::new();
     registry.register(Arc::new(ArchitectureBrightlineAudit::new(&audit_settings)));
-    registry.register(Arc::new(DependencyUpdateAudit::new(
-        &audit_settings,
-        cfg.github.clone(),
-    )));
     registry.register(Arc::new(DriftAudit::new(&audit_settings, &cfg.executor)));
     registry.register(Arc::new(MissingTestsAudit::new(
         &audit_settings,

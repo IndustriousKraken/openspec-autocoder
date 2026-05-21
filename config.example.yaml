@@ -36,7 +36,6 @@ repositories:
     # `disabled`, `daily`, `every-N-days`, `weekly`, `monthly`, `quarterly`.
     # audits:
     #   architecture_brightline: weekly
-    #   dependency_update_triage: daily
 
 executor:
   # The default executor wraps the `claude` CLI (Claude Code) installed and
@@ -211,9 +210,8 @@ github:
 #   #   access_token_env: MATRIX_ACCESS_TOKEN
 
 # Periodic audits — long-cycle background checks orchestrated by the
-# daemon between regular polling iterations. Six audits ship today:
+# daemon between regular polling iterations. Five audits ship today:
 #   - architecture_brightline    — flags files exceeding a line-count threshold
-#   - dependency_update_triage   — opens a change per ready dependabot PR
 #   - drift_audit                — detects spec/code drift via LLM scan
 #   - missing_tests_audit        — proposes test coverage for untested code
 #   - security_bug_audit         — LLM scan for security smells
@@ -231,7 +229,6 @@ github:
 #   # Global default cadence per audit type. Omitted entries → `Disabled`.
 #   defaults:
 #     architecture_brightline: weekly
-#     dependency_update_triage: daily
 #     drift_audit: weekly
 #     missing_tests_audit: monthly
 #     security_bug_audit: weekly
@@ -248,12 +245,6 @@ github:
 #       notify_on_clean: false
 #       extra:
 #         file_lines_threshold: 500   # WARN any file with > N lines
-#     dependency_update_triage:
-#       # prompt_path: /etc/autocoder/prompts/dep-update.md
-#       notify_on_clean: false
-#       extra:
-#         max_approvals_per_run: 3    # cap auto-approved dependabot PRs per run
-#         fork_remote_name: origin    # which remote to push update branches to
 #     drift_audit:
 #       # prompt_path: /etc/autocoder/prompts/drift.md
 #       notify_on_clean: false

@@ -16,7 +16,6 @@
 
 pub mod architecture_consultative;
 pub mod brightline;
-pub mod dependency_update;
 pub mod drift;
 pub mod missing_tests;
 pub mod scheduler;
