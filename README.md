@@ -4,7 +4,26 @@
 
 ---
 
-## Quick Start
+## Quick install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/openspec-autocoder/main/install.sh | bash
+```
+
+The script detects your OS and architecture, optionally installs system packages and the Claude CLI, downloads the latest pre-built autocoder binary from GitHub Releases (SHA-256 verified), runs a short config wizard for the essentials (one repository URL, a GitHub PAT, optional ChatOps + reviewer backends), and lays everything out at the right paths.
+
+Two install modes:
+
+- **Server mode** (Linux with systemd) — creates a dedicated `autocoder` system user, installs to `/usr/local/bin/autocoder`, writes `/etc/autocoder/config.yaml` and `/etc/autocoder/secrets.env`, and enables an `autocoder.service` systemd unit. Selected by default on Linux hosts with a running systemd PID 1.
+- **Dev mode** (macOS, or Linux without systemd) — installs the binary under `~/.local/bin/` (or `/usr/local/bin/` if you have sudo and prefer that), writes config to `~/.config/autocoder/config.yaml`, and leaves you to run `autocoder run --config …` in a terminal or tmux. macOS is dev-mode only for now (no launchd support yet).
+
+Running the script a second time skips the wizard, swaps the binary for the chosen version, and preserves your existing `config.yaml` + `secrets.env`. See [Manual install from source](#manual-install-from-source) below if you'd rather build from a `git clone`.
+
+---
+
+## Manual install from source
+
+Recommended for contributors and operators who need fine-grained control; new users should prefer the install script above.
 
 Get from `git clone` to a running daemon in about ten minutes. Each step is self-contained; do them in order.
 
@@ -881,6 +900,8 @@ If you remove a repo and re-add it (or change a setting) before the previous tas
 ## Deployment
 
 For production, run autocoder as a systemd service on a dedicated Linux host. The daemon polls on its own — do not wrap it in a cron job.
+
+> The [install script](#quick-install) handles every step below for you; this section documents the manual equivalents for operators who want to audit or customize the process.
 
 ### 1. Install the binary
 
