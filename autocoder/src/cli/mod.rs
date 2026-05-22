@@ -6,6 +6,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+pub mod install;
 pub mod reload;
 pub mod rewind;
 pub mod run;
@@ -40,6 +41,13 @@ pub enum Command {
     /// the daemon is not running or the new YAML fails validation.
     Reload,
 
+    /// First-run wizard. Collects the minimum configuration an operator
+    /// needs (one repo URL, a GitHub PAT, optional chatops + reviewer),
+    /// writes config.yaml + secrets.env, and on server mode renders +
+    /// enables a systemd unit. Idempotent: re-running against an existing
+    /// config prints a status line and exits 0.
+    Install(install::InstallArgs),
+
     /// Recover from a failed PR or bad implementation by unarchiving named
     /// changes and resetting the agent branch.
     Rewind {
@@ -69,6 +77,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = config::Config::load_from(&config)?;
             run::execute(cfg, config).await
         }
+        Command::Install(args) => install::execute(args).await,
         Command::Reload => reload::execute().await,
         Command::McpAskUserServer => crate::mcp_askuser_server::run(),
         Command::Rewind {

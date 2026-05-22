@@ -1,0 +1,28 @@
+[Unit]
+Description=autocoder — autonomous OpenSpec PR daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=autocoder
+Group=autocoder
+EnvironmentFile=/etc/autocoder/secrets.env
+ExecStart=/usr/local/bin/autocoder run --config /etc/autocoder/config.yaml
+Restart=on-failure
+RestartSec=10
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/autocoder /tmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

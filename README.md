@@ -4,9 +4,37 @@
 
 ---
 
-## Quick Start
+## Quick install
 
-Get from `git clone` to a running daemon in about ten minutes. Each step is self-contained; do them in order.
+```bash
+curl -fsSL https://raw.githubusercontent.com/IndustriousKraken/openspec-autocoder/main/install.sh | bash
+```
+
+The one-liner downloads a pre-built binary, verifies its SHA-256, places it at `/usr/local/bin/autocoder` (or `~/.local/bin/autocoder` if `sudo` is unavailable or `--user` is passed), then execs `autocoder install`. **The bootstrap script is intentionally tiny (~75 lines, no operator prompts).** Everything else — the configuration wizard, `useradd`/`systemctl`/`apt-get`, optional Claude CLI bootstrap — lives in the `autocoder install` Rust subcommand which ships with `cargo test` coverage.
+
+By default `autocoder install` picks **server mode** on Linux when systemd is detected (`/run/systemd/system` present): it creates an `autocoder` system user, writes `/etc/autocoder/config.yaml` + `/etc/autocoder/secrets.env`, renders `/etc/systemd/system/autocoder.service`, and offers to start it. Otherwise it picks **dev mode** and writes to `~/.config/autocoder/` instead, with no system-user / systemd work. Either mode can be forced with `--mode server` or `--mode dev`.
+
+For automation (Ansible, Terraform, cloud-init), pass `--non-interactive` along with `--repo-url`, `--token-env-var`, `--chatops-backend`, and `--reviewer-provider`. Anything after `--` on the `install.sh` command line is forwarded to the subcommand:
+
+```bash
+curl -fsSL .../install.sh | bash -s -- --non-interactive \
+  --repo-url git@github.com:acme/widgets.git \
+  --token-env-var GITHUB_TOKEN \
+  --chatops-backend none \
+  --reviewer-provider none
+```
+
+Prefer to build from source instead? See [Manual install from source](#manual-install-from-source) further down.
+
+### Reinstalling / upgrading
+
+Re-running `install.sh` downloads the latest binary (or a specific tag — pass `--version vX.Y.Z` to the script or set `AUTOCODER_VERSION=vX.Y.Z` in the environment), verifies the checksum, and replaces `/usr/local/bin/autocoder`. The subsequent `autocoder install` detects the existing `config.yaml` and exits 0 without re-prompting: the operator's choices made on first run are preserved across binary upgrades. To force the wizard back on (e.g. to relocate the config), pass `--upgrade` after `--`.
+
+---
+
+## Manual install from source
+
+For contributors and operators who specifically want to avoid downloaded binaries. The steps below take a checkout from `git clone` to a running daemon in about ten minutes. Each step is self-contained; do them in order.
 
 ### 1. Prerequisites
 
