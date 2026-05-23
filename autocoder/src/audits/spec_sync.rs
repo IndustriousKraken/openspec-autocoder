@@ -43,6 +43,10 @@ impl Audit for SpecSyncAudit {
         Self::TYPE
     }
 
+    fn description(&self) -> &'static str {
+        "backfills drift between archived changes and canonical openspec/specs/ files"
+    }
+
     fn requires_head_change(&self) -> bool {
         false
     }

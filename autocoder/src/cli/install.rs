@@ -9,9 +9,10 @@
 //! exist; the wizard deserializes a copy and mutates it. No string-splicing
 //! or sed against YAML — serde does the round trip.
 use crate::config::{
-    ChatOpsConfig, ChatOpsProvider, Config, GithubConfig, ReviewerConfig, ReviewerProvider,
-    SecretSource, SlackProviderConfig,
+    AuditsConfig, Cadence, ChatOpsConfig, ChatOpsProvider, Config, GithubConfig, ReviewerConfig,
+    ReviewerProvider, SecretSource, SlackProviderConfig,
 };
+use std::collections::HashMap;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use clap::{Args, ValueEnum};
@@ -64,6 +65,32 @@ pub struct InstallArgs {
     pub reviewer_provider: Option<ReviewerProviderArg>,
     #[arg(long)]
     pub reviewer_model: Option<String>,
+
+    // ---------- audits ----------
+    /// Cadence for `spec_sync_audit`. Default `daily` (the conservative
+    /// recommended default — cheap, defensive, no LLM cost).
+    #[arg(long, value_enum)]
+    pub audits_spec_sync: Option<AuditCadenceArg>,
+
+    /// Master switch for the LLM-driven audits (architecture_brightline,
+    /// architecture_consultative, drift_audit, missing_tests_audit,
+    /// security_bug_audit). Default `none`.
+    #[arg(long, value_enum)]
+    pub audits_llm_driven: Option<LlmDrivenAuditsArg>,
+
+    /// Override the cadence for `architecture_brightline`. Only consulted
+    /// when `--audits-llm-driven recommended`. Ignored under `none` /
+    /// `all-disabled` (the master switch wins).
+    #[arg(long, value_enum)]
+    pub audit_architecture_brightline: Option<AuditCadenceArg>,
+    #[arg(long, value_enum)]
+    pub audit_architecture_consultative: Option<AuditCadenceArg>,
+    #[arg(long, value_enum)]
+    pub audit_drift_audit: Option<AuditCadenceArg>,
+    #[arg(long, value_enum)]
+    pub audit_missing_tests_audit: Option<AuditCadenceArg>,
+    #[arg(long, value_enum)]
+    pub audit_security_bug_audit: Option<AuditCadenceArg>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -90,6 +117,85 @@ pub enum ReviewerProviderArg {
     OpenAiCompatible,
 }
 
+/// Master switch for the LLM-driven audits in non-interactive mode. Mirrors
+/// the interactive "Enable the LLM-driven audits? [y/N]" gate; the `recommended`
+/// variant additionally accepts the fast-path defaults inline.
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum LlmDrivenAuditsArg {
+    /// Same as the default: no LLM-driven audits enabled.
+    None,
+    /// Enable every LLM-driven audit at its recommended cadence. Individual
+    /// `--audit-<slug>` flags can override one cadence each.
+    Recommended,
+    /// Same as `none`, but prints a one-line acknowledgement so IaC logs
+    /// can distinguish "operator opted out explicitly" from "operator did
+    /// not pass the flag at all".
+    AllDisabled,
+}
+
+/// Cadence choice for an individual audit. Mirrors `Cadence` minus the
+/// `every-N-days` advanced form (operators wanting that edit config.yaml
+/// post-install).
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum AuditCadenceArg {
+    Disabled,
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl AuditCadenceArg {
+    pub fn to_cadence(self) -> Cadence {
+        match self {
+            Self::Disabled => Cadence::Disabled,
+            Self::Daily => Cadence::Daily,
+            Self::Weekly => Cadence::Weekly,
+            Self::Monthly => Cadence::Monthly,
+        }
+    }
+}
+
+/// Slugs of the audits the wizard knows about. The order is the order they
+/// appear in the per-audit walk-through.
+pub const SPEC_SYNC_SLUG: &str = "spec_sync_audit";
+pub const LLM_DRIVEN_SLUGS: &[(&str, Cadence)] = &[
+    ("architecture_brightline", Cadence::Weekly),
+    ("drift_audit", Cadence::Weekly),
+    ("missing_tests_audit", Cadence::Monthly),
+    ("security_bug_audit", Cadence::Weekly),
+    ("architecture_consultative", Cadence::Monthly),
+];
+
+/// One-line operator-facing description per known audit slug. Mirrors each
+/// audit impl's `Audit::description()` so the wizard does not need to
+/// instantiate concrete audits to render the prompts.
+fn audit_description(slug: &str) -> &'static str {
+    match slug {
+        "architecture_brightline" => {
+            "file-size / module-size guidelines (architecture brightline)"
+        }
+        "architecture_consultative" => "advisory architecture findings via LLM consultation",
+        "drift_audit" => "spec ↔ code drift detection (warns when reality outgrows the spec)",
+        "missing_tests_audit" => "proposes test coverage for untested branches",
+        "security_bug_audit" => "proposes fixes for likely security bugs",
+        "spec_sync_audit" => {
+            "backfills drift between archived changes and canonical openspec/specs/ files"
+        }
+        _ => "",
+    }
+}
+
+fn cadence_label(c: Cadence) -> &'static str {
+    match c {
+        Cadence::Disabled => "disabled",
+        Cadence::Daily => "daily",
+        Cadence::Weekly => "weekly",
+        Cadence::Monthly => "monthly",
+        Cadence::Quarterly => "quarterly",
+        Cadence::EveryNDays(_) => "every-n-days",
+    }
+}
+
 /// Pre-fill values surfaced from `InstallArgs` to the wizard. In interactive
 /// mode each `Some(...)` becomes the prompt default. In non-interactive mode
 /// a missing required field is a fatal error.
@@ -104,6 +210,13 @@ pub struct WizardPrefill {
     pub chatops_channel_id: Option<String>,
     pub reviewer_provider: Option<ReviewerProviderArg>,
     pub reviewer_model: Option<String>,
+    pub audits_spec_sync: Option<AuditCadenceArg>,
+    pub audits_llm_driven: Option<LlmDrivenAuditsArg>,
+    pub audit_architecture_brightline: Option<AuditCadenceArg>,
+    pub audit_architecture_consultative: Option<AuditCadenceArg>,
+    pub audit_drift_audit: Option<AuditCadenceArg>,
+    pub audit_missing_tests_audit: Option<AuditCadenceArg>,
+    pub audit_security_bug_audit: Option<AuditCadenceArg>,
 }
 
 /// Final wizard output: everything the operator confirmed or accepted as
@@ -122,6 +235,10 @@ pub struct WizardAnswers {
     pub reviewer_provider: ReviewerProviderArg,
     pub reviewer_model: Option<String>,
     pub reviewer_api_key: Option<String>,
+    /// Resolved cadences per audit slug. Audits the operator declined are
+    /// either absent from the map or stored as `Cadence::Disabled`. The
+    /// config-assembly step drops `Disabled` entries before emitting YAML.
+    pub audits: HashMap<String, Cadence>,
 }
 
 // ----------------------------------------------------------------------------
@@ -630,6 +747,8 @@ pub async fn run_wizard(
         reviewer_api_key = if k.is_empty() { None } else { Some(k) };
     }
 
+    let audits = run_audit_prompts(io).await?;
+
     Ok(WizardAnswers {
         repo_url,
         base_branch,
@@ -643,7 +762,115 @@ pub async fn run_wizard(
         reviewer_provider,
         reviewer_model,
         reviewer_api_key,
+        audits,
     })
+}
+
+/// Walk the operator through the periodic-audit prompts. See the
+/// `Install wizard configures periodic audits` requirement for the full
+/// three-tier UX. Returns a map of audit slug → resolved cadence; absent
+/// or `Disabled` entries are dropped before YAML emit.
+async fn run_audit_prompts(io: &mut dyn WizardIo) -> Result<HashMap<String, Cadence>> {
+    let mut audits: HashMap<String, Cadence> = HashMap::new();
+
+    io.print("\nPeriodic audits\n");
+    io.print(
+        "  autocoder ships several optional audits that run on a configurable cadence.\n",
+    );
+    io.print(&format!(
+        "\n  {SPEC_SYNC_SLUG} ({}, recommended ON)\n",
+        audit_description(SPEC_SYNC_SLUG)
+    ));
+
+    let spec_sync = ask_audit_cadence(
+        io,
+        "Enable spec_sync_audit?",
+        Cadence::Daily,
+        /* show_disabled_as = */ "never",
+    )
+    .await?;
+    if spec_sync == Cadence::Disabled {
+        // Operator declined spec-sync → skip the rest entirely.
+        return Ok(audits);
+    }
+    audits.insert(SPEC_SYNC_SLUG.to_string(), spec_sync);
+
+    io.print("\n  LLM-driven audits (call the agent CLI; have token cost). Includes:\n");
+    for (slug, _) in LLM_DRIVEN_SLUGS {
+        io.print(&format!("    - {slug} ({})\n", audit_description(slug)));
+    }
+    let enable_llm = io
+        .confirm("\n  Enable the LLM-driven audits?", false)
+        .await?;
+    if !enable_llm {
+        return Ok(audits);
+    }
+
+    io.print("\n  Recommended cadences:\n");
+    for (slug, rec) in LLM_DRIVEN_SLUGS {
+        io.print(&format!("    {slug}: {}\n", cadence_label(*rec)));
+    }
+    let fast_path = io
+        .confirm("\n  Enable all five with recommended cadences?", true)
+        .await?;
+    if fast_path {
+        for (slug, rec) in LLM_DRIVEN_SLUGS {
+            audits.insert((*slug).to_string(), *rec);
+        }
+        return Ok(audits);
+    }
+
+    // Walk each LLM-driven audit individually.
+    for (slug, rec) in LLM_DRIVEN_SLUGS {
+        io.print(&format!("\n  {slug} ({})\n", audit_description(slug)));
+        let label = format!(
+            "  Cadence (recommended: {})",
+            cadence_label(*rec),
+        );
+        let chosen = ask_audit_cadence(io, &label, *rec, "never").await?;
+        if chosen != Cadence::Disabled {
+            audits.insert((*slug).to_string(), chosen);
+        }
+    }
+    Ok(audits)
+}
+
+/// Prompt for a cadence using the wizard's compact `[d]aily / [w]eekly /
+/// [m]onthly / [n]ever` shorthand. Bare-Enter accepts `default`. The
+/// `never_label` lets the caller print `never` (the wizard's operator-
+/// facing word for `Cadence::Disabled`).
+async fn ask_audit_cadence(
+    io: &mut dyn WizardIo,
+    prompt: &str,
+    default: Cadence,
+    never_label: &str,
+) -> Result<Cadence> {
+    let default_letter = match default {
+        Cadence::Daily => "d",
+        Cadence::Weekly => "w",
+        Cadence::Monthly => "m",
+        Cadence::Disabled => "n",
+        // No wizard prompt should use these as defaults; map to weekly so
+        // the cadence-key letter stays meaningful if a caller does anyway.
+        Cadence::Quarterly | Cadence::EveryNDays(_) => "w",
+    };
+    io.print(&format!(
+        "{prompt} [d]aily / [w]eekly / [m]onthly / [{never_label}n]ever (default {default_letter}): ",
+    ));
+    let line = io.read_line().await?;
+    let trimmed = line.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    match trimmed.as_str() {
+        "d" | "daily" => Ok(Cadence::Daily),
+        "w" | "weekly" => Ok(Cadence::Weekly),
+        "m" | "monthly" => Ok(Cadence::Monthly),
+        "n" | "never" | "disabled" => Ok(Cadence::Disabled),
+        other => bail!(
+            "unrecognized cadence `{other}`; expected one of d / w / m / n (or daily/weekly/monthly/never)"
+        ),
+    }
 }
 
 async fn ask_required(io: &mut dyn WizardIo, prompt: &str, prefill: Option<&str>) -> Result<String> {
@@ -821,6 +1048,25 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
         }
     };
 
+    // Audits: drop `Disabled` entries; if no audits enabled at all, the
+    // `audits:` block is omitted entirely (matching the `Option<AuditsConfig>`
+    // schema). `settings` stays empty — operators wanting `prompt_path` /
+    // `notify_on_clean` / `extra` overrides edit config.yaml after install.
+    let enabled: HashMap<String, Cadence> = answers
+        .audits
+        .iter()
+        .filter(|(_, c)| c.is_enabled())
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    cfg.audits = if enabled.is_empty() {
+        None
+    } else {
+        Some(AuditsConfig {
+            defaults: enabled,
+            settings: Default::default(),
+        })
+    };
+
     // Suppress the unused-import warning if `SecretSource` ends up only
     // being referenced behind a feature in future edits.
     let _ = std::marker::PhantomData::<SecretSource>;
@@ -903,6 +1149,13 @@ pub(crate) async fn execute_inner(
         chatops_channel_id: args.chatops_channel_id.clone(),
         reviewer_provider: args.reviewer_provider,
         reviewer_model: args.reviewer_model.clone(),
+        audits_spec_sync: args.audits_spec_sync,
+        audits_llm_driven: args.audits_llm_driven,
+        audit_architecture_brightline: args.audit_architecture_brightline,
+        audit_architecture_consultative: args.audit_architecture_consultative,
+        audit_drift_audit: args.audit_drift_audit,
+        audit_missing_tests_audit: args.audit_missing_tests_audit,
+        audit_security_bug_audit: args.audit_security_bug_audit,
     };
     if args.non_interactive {
         validate_non_interactive(&prefill)?;
@@ -1073,7 +1326,64 @@ fn prefill_to_answers(p: &WizardPrefill) -> Result<WizardAnswers> {
         reviewer_provider: p.reviewer_provider.unwrap_or(ReviewerProviderArg::None),
         reviewer_model: p.reviewer_model.clone(),
         reviewer_api_key: None,
+        audits: resolve_non_interactive_audits(p),
     })
+}
+
+/// Resolve audit cadences from `--audits-*` flags. Implements the precedence
+/// documented in the change spec:
+/// - `--audits-spec-sync` defaults to `daily` (the conservative recommended
+///   default) so existing IaC scripts that pre-date this change keep working.
+/// - `--audits-llm-driven` is the master switch. `none` (default) keeps every
+///   LLM-driven audit disabled regardless of any per-audit overrides;
+///   `all-disabled` behaves identically but prints a one-line acknowledgement
+///   to stdout (so IaC logs can distinguish explicit opt-out from "operator
+///   forgot to pass the flag"); `recommended` enables every LLM-driven audit
+///   at its recommended cadence, with per-audit `--audit-<slug>` flags
+///   overriding individual cadences.
+pub(crate) fn resolve_non_interactive_audits(p: &WizardPrefill) -> HashMap<String, Cadence> {
+    let mut out: HashMap<String, Cadence> = HashMap::new();
+    let spec_sync = p
+        .audits_spec_sync
+        .map(AuditCadenceArg::to_cadence)
+        .unwrap_or(Cadence::Daily);
+    if spec_sync != Cadence::Disabled {
+        out.insert(SPEC_SYNC_SLUG.to_string(), spec_sync);
+    }
+
+    let llm = p.audits_llm_driven.unwrap_or(LlmDrivenAuditsArg::None);
+    match llm {
+        LlmDrivenAuditsArg::None => {
+            // Master switch off — per-audit flags ignored.
+        }
+        LlmDrivenAuditsArg::AllDisabled => {
+            println!(
+                "audits: --audits-llm-driven all-disabled — every LLM-driven audit \
+                 left disabled (per-audit flags are ignored under the master switch)."
+            );
+        }
+        LlmDrivenAuditsArg::Recommended => {
+            for (slug, rec) in LLM_DRIVEN_SLUGS {
+                let override_arg = lookup_per_audit_override(p, slug);
+                let resolved = override_arg.map(AuditCadenceArg::to_cadence).unwrap_or(*rec);
+                if resolved != Cadence::Disabled {
+                    out.insert((*slug).to_string(), resolved);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn lookup_per_audit_override(p: &WizardPrefill, slug: &str) -> Option<AuditCadenceArg> {
+    match slug {
+        "architecture_brightline" => p.audit_architecture_brightline,
+        "architecture_consultative" => p.audit_architecture_consultative,
+        "drift_audit" => p.audit_drift_audit,
+        "missing_tests_audit" => p.audit_missing_tests_audit,
+        "security_bug_audit" => p.audit_security_bug_audit,
+        _ => None,
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1099,6 +1409,7 @@ mod tests {
             reviewer_provider: ReviewerProviderArg::None,
             reviewer_model: None,
             reviewer_api_key: None,
+            audits: HashMap::new(),
         }
     }
 
@@ -1123,7 +1434,9 @@ mod tests {
     #[tokio::test]
     async fn wizard_collects_minimum_essential_fields() {
         // answers in order: repo, base, agent, poll, token env, PAT,
-        // chatops choice "1" (none), reviewer choice "1" (none).
+        // chatops choice "1" (none), reviewer choice "1" (none),
+        // then the two default-path audit answers (bare-Enter on spec-sync
+        // → daily; bare-Enter on the LLM gate → no).
         let mut io = ScriptedIo::new(vec![
             "git@github.com:acme/widgets.git",
             "main",
@@ -1133,6 +1446,8 @@ mod tests {
             "ghp_test",
             "1",
             "1",
+            "",
+            "",
         ]);
         let prefill = WizardPrefill::default();
         let ans = run_wizard(&mut io, InstallMode::Dev, &prefill).await.unwrap();
@@ -1340,5 +1655,247 @@ mod tests {
             !saw_claude_install,
             "claude installer should not run when `claude` is already on PATH; calls={calls:?}"
         );
+    }
+
+    // ----- audits ---------------------------------------------------------
+
+    /// Build the minimum prompt-answer queue for the existing pre-audit
+    /// wizard prompts (repo / branches / poll / token env / PAT / chatops
+    /// "none" / reviewer "none"). Audit-prompt answers are appended by the
+    /// individual tests.
+    fn baseline_wizard_answers() -> Vec<&'static str> {
+        vec![
+            "git@github.com:acme/widgets.git",
+            "main",
+            "agent-q",
+            "300",
+            "GITHUB_TOKEN",
+            "ghp_test",
+            "1",
+            "1",
+        ]
+    }
+
+    #[tokio::test]
+    async fn wizard_audits_default_path_enables_spec_sync_only() {
+        let mut answers = baseline_wizard_answers();
+        // Bare-Enter on spec-sync cadence (→ daily), bare-Enter on LLM gate
+        // (→ no).
+        answers.push("");
+        answers.push("");
+        let mut io = ScriptedIo::new(answers);
+        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
+            .await
+            .unwrap();
+        assert_eq!(ans.audits.get(SPEC_SYNC_SLUG), Some(&Cadence::Daily));
+        assert_eq!(ans.audits.len(), 1, "only spec-sync should be present");
+
+        let cfg = assemble_config(&ans).unwrap();
+        let audits = cfg.audits.as_ref().expect("audits block present");
+        assert_eq!(audits.defaults.len(), 1);
+        assert_eq!(audits.defaults.get(SPEC_SYNC_SLUG), Some(&Cadence::Daily));
+        let yaml = serialize_config(&cfg).unwrap();
+        assert!(yaml.contains("spec_sync_audit: daily"), "YAML missing spec-sync entry:\n{yaml}");
+        for (slug, _) in LLM_DRIVEN_SLUGS {
+            assert!(
+                !yaml.contains(&format!("{slug}:")),
+                "YAML must not list {slug}:\n{yaml}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wizard_audits_fast_path_enables_all_six() {
+        let mut answers = baseline_wizard_answers();
+        // spec-sync default (daily), LLM gate yes, fast-path default Y.
+        answers.push(""); // spec-sync cadence
+        answers.push("y"); // LLM gate
+        answers.push(""); // fast-path (default Y)
+        let mut io = ScriptedIo::new(answers);
+        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
+            .await
+            .unwrap();
+        assert_eq!(ans.audits.get(SPEC_SYNC_SLUG), Some(&Cadence::Daily));
+        for (slug, rec) in LLM_DRIVEN_SLUGS {
+            assert_eq!(
+                ans.audits.get(*slug),
+                Some(rec),
+                "{slug} should be set to {:?}",
+                rec
+            );
+        }
+        let cfg = assemble_config(&ans).unwrap();
+        let audits = cfg.audits.as_ref().expect("audits block present");
+        assert_eq!(audits.defaults.len(), 6, "all six audits must be present");
+    }
+
+    #[tokio::test]
+    async fn wizard_audits_per_audit_cadence_choices_respected() {
+        let mut answers = baseline_wizard_answers();
+        // spec-sync weekly, LLM y, fast-path n, per-audit walk:
+        //   architecture_brightline: daily
+        //   drift_audit: monthly
+        //   missing_tests_audit: weekly
+        //   security_bug_audit: never
+        //   architecture_consultative: daily
+        answers.push("w");
+        answers.push("y");
+        answers.push("n");
+        answers.push("d"); // architecture_brightline
+        answers.push("m"); // drift_audit
+        answers.push("w"); // missing_tests_audit
+        answers.push("n"); // security_bug_audit (never)
+        answers.push("d"); // architecture_consultative
+        let mut io = ScriptedIo::new(answers);
+        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
+            .await
+            .unwrap();
+        assert_eq!(ans.audits.get(SPEC_SYNC_SLUG), Some(&Cadence::Weekly));
+        assert_eq!(ans.audits.get("architecture_brightline"), Some(&Cadence::Daily));
+        assert_eq!(ans.audits.get("drift_audit"), Some(&Cadence::Monthly));
+        assert_eq!(ans.audits.get("missing_tests_audit"), Some(&Cadence::Weekly));
+        // never → omitted from the map entirely.
+        assert!(ans.audits.get("security_bug_audit").is_none());
+        assert_eq!(
+            ans.audits.get("architecture_consultative"),
+            Some(&Cadence::Daily)
+        );
+    }
+
+    #[tokio::test]
+    async fn wizard_audits_decline_spec_sync_skips_all_audit_prompts() {
+        let mut answers = baseline_wizard_answers();
+        answers.push("n"); // decline spec-sync
+        let mut io = ScriptedIo::new(answers);
+        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
+            .await
+            .unwrap();
+        assert!(
+            ans.audits.is_empty(),
+            "declining spec-sync must skip every audit; got {:?}",
+            ans.audits
+        );
+        assert!(
+            io.answers.is_empty(),
+            "no further audit prompts should have been emitted; remaining queue: {:?}",
+            io.answers
+        );
+        let cfg = assemble_config(&ans).unwrap();
+        assert!(cfg.audits.is_none(), "no enabled audits → no audits: block");
+        let yaml = serialize_config(&cfg).unwrap();
+        assert!(
+            !yaml.contains("\naudits:"),
+            "YAML must omit the audits: block:\n{yaml}"
+        );
+    }
+
+    fn ni_args_audits(tmp: &TempDir) -> InstallArgs {
+        InstallArgs {
+            mode: Some(InstallMode::Dev),
+            config_dir: Some(tmp.path().to_path_buf()),
+            non_interactive: true,
+            repo_url: Some("git@github.com:acme/widgets.git".to_string()),
+            token_env_var: Some("GITHUB_TOKEN".to_string()),
+            chatops_backend: Some(ChatOpsBackendArg::None),
+            reviewer_provider: Some(ReviewerProviderArg::None),
+            ..InstallArgs::default()
+        }
+    }
+
+    fn load_yaml(tmp: &TempDir) -> String {
+        std::fs::read_to_string(tmp.path().join("config.yaml")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn non_interactive_no_audit_flags_enables_spec_sync_daily_default() {
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = ni_args_audits(&tmp);
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let yaml = load_yaml(&tmp);
+        assert!(
+            yaml.contains("spec_sync_audit: daily"),
+            "yaml must include spec-sync daily:\n{yaml}"
+        );
+        for (slug, _) in LLM_DRIVEN_SLUGS {
+            assert!(
+                !yaml.contains(&format!("{slug}:")),
+                "{slug} must NOT be in conservative default yaml:\n{yaml}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_interactive_audits_llm_driven_recommended_enables_all_six() {
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = InstallArgs {
+            audits_llm_driven: Some(LlmDrivenAuditsArg::Recommended),
+            ..ni_args_audits(&tmp)
+        };
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let yaml = load_yaml(&tmp);
+        assert!(yaml.contains("spec_sync_audit: daily"), "{yaml}");
+        for (slug, rec) in LLM_DRIVEN_SLUGS {
+            let expected = format!("{slug}: {}", cadence_label(*rec));
+            assert!(
+                yaml.contains(&expected),
+                "yaml must include `{expected}`:\n{yaml}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_interactive_per_audit_flag_overrides_recommended() {
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = InstallArgs {
+            audits_llm_driven: Some(LlmDrivenAuditsArg::Recommended),
+            audit_security_bug_audit: Some(AuditCadenceArg::Disabled),
+            ..ni_args_audits(&tmp)
+        };
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let yaml = load_yaml(&tmp);
+        assert!(
+            !yaml.contains("security_bug_audit:"),
+            "security_bug_audit must be omitted when disabled via override:\n{yaml}"
+        );
+        for (slug, rec) in LLM_DRIVEN_SLUGS {
+            if *slug == "security_bug_audit" {
+                continue;
+            }
+            let expected = format!("{slug}: {}", cadence_label(*rec));
+            assert!(yaml.contains(&expected), "missing `{expected}`:\n{yaml}");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_interactive_llm_driven_none_overrides_per_audit_flags() {
+        let tmp = TempDir::new().unwrap();
+        let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
+        let mut io = ScriptedIo::new(vec![]);
+        let args = InstallArgs {
+            audits_llm_driven: Some(LlmDrivenAuditsArg::None),
+            audit_architecture_brightline: Some(AuditCadenceArg::Weekly),
+            ..ni_args_audits(&tmp)
+        };
+        execute_inner(args, &mut io, &actions, tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let yaml = load_yaml(&tmp);
+        assert!(
+            !yaml.contains("architecture_brightline:"),
+            "master switch `none` must override per-audit flag:\n{yaml}"
+        );
+        assert!(yaml.contains("spec_sync_audit: daily"));
     }
 }

@@ -591,6 +591,9 @@ mod tests {
         fn audit_type(&self) -> &'static str {
             self.slug
         }
+        fn description(&self) -> &'static str {
+            "counting audit for tests"
+        }
         fn requires_head_change(&self) -> bool {
             self.rhc
         }

@@ -91,6 +91,10 @@ impl Audit for ArchitectureBrightlineAudit {
         Self::TYPE
     }
 
+    fn description(&self) -> &'static str {
+        "file-size / module-size guidelines (architecture brightline)"
+    }
+
     fn requires_head_change(&self) -> bool {
         true
     }

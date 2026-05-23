@@ -117,6 +117,10 @@ impl Audit for ArchitectureConsultativeAudit {
         Self::TYPE
     }
 
+    fn description(&self) -> &'static str {
+        "advisory architecture findings via LLM consultation"
+    }
+
     fn requires_head_change(&self) -> bool {
         true
     }
