@@ -8,6 +8,7 @@ use crate::audits::{
     brightline::ArchitectureBrightlineAudit,
     drift::DriftAudit,
     missing_tests::MissingTestsAudit, security_bug::SecurityBugAudit,
+    spec_sync::SpecSyncAudit,
 };
 use crate::chatops;
 use crate::code_reviewer::CodeReviewer;
@@ -165,6 +166,7 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         &audit_settings,
         &cfg.executor,
     )));
+    registry.register(Arc::new(SpecSyncAudit::new()));
     // Validate every audit type name in the operator's config is in the
     // registry. A typo here means the audit will silently never run, so
     // we fail fast at startup with the list of known names.

@@ -243,6 +243,22 @@ async fn run_one_audit(
                     );
                 }
             }
+            WritePolicy::CanonicalSpecMerge => {
+                if let Err(e) = git::reset_hard_head(workspace) {
+                    tracing::error!(
+                        url = %repo.url,
+                        audit_type,
+                        "failed `git reset --hard HEAD` after WritePolicy::CanonicalSpecMerge violation: {e:#}"
+                    );
+                }
+                if let Err(e) = git::clean_force(workspace) {
+                    tracing::error!(
+                        url = %repo.url,
+                        audit_type,
+                        "failed `git clean -fd` after WritePolicy::CanonicalSpecMerge violation: {e:#}"
+                    );
+                }
+            }
             WritePolicy::Approved => {
                 // No post-hoc enforcement.
             }
@@ -396,6 +412,25 @@ pub(crate) fn detect_write_policy_violation(
                 Some(PolicyViolation {
                     reason: format!(
                         "diff includes path(s) outside openspec/changes/: {}",
+                        bad_paths.join(", ")
+                    ),
+                })
+            }
+        }
+        WritePolicy::CanonicalSpecMerge => {
+            let mut bad_paths: Vec<String> = Vec::new();
+            for line in &lines {
+                let path = extract_porcelain_path(line);
+                if !path.starts_with("openspec/specs/") {
+                    bad_paths.push(path.to_string());
+                }
+            }
+            if bad_paths.is_empty() {
+                None
+            } else {
+                Some(PolicyViolation {
+                    reason: format!(
+                        "diff includes path(s) outside openspec/specs/: {}",
                         bad_paths.join(", ")
                     ),
                 })
@@ -1185,5 +1220,73 @@ mod tests {
     fn detect_violation_approved_always_ok() {
         let porcelain = " M anywhere/at/all.rs";
         assert!(detect_write_policy_violation(WritePolicy::Approved, porcelain).is_none());
+    }
+
+    #[test]
+    fn detect_violation_canonical_spec_merge_allows_specs_dir() {
+        let porcelain = " M openspec/specs/cap-a/spec.md\n M openspec/specs/cap-b/spec.md";
+        assert!(
+            detect_write_policy_violation(WritePolicy::CanonicalSpecMerge, porcelain).is_none()
+        );
+    }
+
+    #[test]
+    fn detect_violation_canonical_spec_merge_rejects_outside_path() {
+        let porcelain = " M openspec/specs/cap/spec.md\n M openspec/changes/foo/proposal.md";
+        let v = detect_write_policy_violation(WritePolicy::CanonicalSpecMerge, porcelain);
+        assert!(v.is_some());
+        assert!(v.unwrap().reason.contains("openspec/changes/foo/proposal.md"));
+    }
+
+    #[tokio::test]
+    async fn write_policy_canonical_spec_merge_rejects_diff_outside_specs() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(
+            CountingAudit::new("csm1")
+                .with_policy(WritePolicy::CanonicalSpecMerge)
+                .writes_file("src/forbidden.rs"),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("csm1");
+        let repo = fixture_repo();
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None)
+            .await
+            .unwrap();
+        // After the CanonicalSpecMerge violation, the file outside the
+        // allowed prefix must be gone (reset + clean -fd removes
+        // untracked).
+        assert!(
+            !ws.join("src/forbidden.rs").exists(),
+            "untracked forbidden path must be removed by clean -fd"
+        );
+        // State must NOT have been updated.
+        let state = AuditState::load_or_default(&ws);
+        assert!(
+            !state.runs.contains_key("csm1"),
+            "state must NOT record a violating run"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_policy_canonical_spec_merge_allows_diff_under_specs() {
+        let (_t, ws) = init_workspace();
+        let audit = Arc::new(
+            CountingAudit::new("csm2")
+                .with_policy(WritePolicy::CanonicalSpecMerge)
+                .writes_file("openspec/specs/cap-a/spec.md")
+                .with_outcome(AuditOutcome::Reported(vec![])),
+        );
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("csm2");
+        let repo = fixture_repo();
+        run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(
+            ws.join("openspec/specs/cap-a/spec.md").exists(),
+            "openspec/specs/ path must be preserved"
+        );
+        let state = AuditState::load_or_default(&ws);
+        assert!(state.runs.contains_key("csm2"));
     }
 }
