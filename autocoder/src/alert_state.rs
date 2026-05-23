@@ -34,6 +34,13 @@ pub enum AlertCategory {
     /// and emits a throttled alert under this category so the operator
     /// can revise tasks.md.
     SpecNeedsRevision,
+    /// A pending change's dated archive directory already exists on
+    /// disk, so `queue::archive` would fail at the end of the iteration.
+    /// autocoder pre-flights the collision before invoking the executor
+    /// and emits a throttled alert under this category so the operator
+    /// can resolve the structural condition (typically: remove the
+    /// active dir or revert the prior merge).
+    ArchiveCollision,
 }
 
 impl AlertCategory {
@@ -47,6 +54,7 @@ impl AlertCategory {
             Self::PrCreationFailure => "PR creation keeps failing",
             Self::AuditWritePolicyViolation => "audit attempted disallowed write",
             Self::SpecNeedsRevision => "spec needs revision",
+            Self::ArchiveCollision => "archive collision",
         }
     }
 }
@@ -196,6 +204,38 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // File never created.
         AlertState::clear(dir.path()).expect("clear without prior save must succeed");
+    }
+
+    #[test]
+    fn archive_collision_variant_roundtrips_through_save_and_load() {
+        let dir = TempDir::new().unwrap();
+        let mut state = AlertState::default();
+        let now = Utc::now();
+        state.alerts.insert(
+            AlertCategory::ArchiveCollision,
+            AlertEntry {
+                last_alerted_at: now,
+                last_error_excerpt: "archive destination already exists".into(),
+            },
+        );
+        state.save(dir.path()).unwrap();
+
+        let reloaded = AlertState::load_or_default(dir.path());
+        let entry = reloaded
+            .alerts
+            .get(&AlertCategory::ArchiveCollision)
+            .expect("ArchiveCollision entry must round-trip");
+        assert_eq!(entry.last_error_excerpt, "archive destination already exists");
+        let diff = (entry.last_alerted_at - now).num_milliseconds().abs();
+        assert!(diff < 5, "timestamps must roundtrip within 5ms; diff = {diff}");
+
+        // Pin the on-disk JSON key.
+        let raw = std::fs::read_to_string(dir.path().join(".alert-state.json")).unwrap();
+        assert!(
+            raw.contains("archive_collision"),
+            "archive collision must serialize as snake_case `archive_collision`; got: {raw}"
+        );
+        assert_eq!(AlertCategory::ArchiveCollision.label(), "archive collision");
     }
 
     #[test]

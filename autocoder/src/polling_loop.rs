@@ -675,6 +675,14 @@ pub async fn run_pass_through_commits(
         "polling pass starting"
     );
 
+    // Pre-flight archive-collision filter on the pending list. Any change
+    // whose dated archive path already exists on disk is excluded from the
+    // queue walk entirely (a throttled chatops alert under
+    // `AlertCategory::ArchiveCollision` is posted per excluded change) so
+    // the executor is never invoked on a change that cannot land.
+    let pending_filtered =
+        apply_archive_collision_preflight(workspace, repo, chatops_ctx, pending_at_start).await;
+
     // Process waiting (escalated) changes BEFORE pending. Each resumes if
     // a human reply has arrived. Any change that comes back as Completed
     // with a diff goes into the `processed` list and will get pushed/PR'd
@@ -723,6 +731,7 @@ pub async fn run_pass_through_commits(
             chatops_ctx,
             perma_stuck_threshold,
             remaining,
+            pending_filtered,
         )
         .await?;
         processed.extend(pending_processed);
@@ -772,6 +781,12 @@ async fn process_waiting_changes(
         None => return Ok(Vec::new()),
     };
     let waiting = queue::list_waiting(workspace)?;
+    // Pre-flight archive-collision filter: a change with a dated archive
+    // entry already on disk would fail at resume-archive time. Exclude
+    // it, alert once (subject to 24h throttle), and proceed with the
+    // rest. Same helper as the pending-side filter so behavior is
+    // identical at both call sites.
+    let waiting = apply_archive_collision_preflight(workspace, repo, chatops_ctx, waiting).await;
     let mut resumed_archived: Vec<String> = Vec::new();
 
     for change in waiting {
@@ -1052,32 +1067,14 @@ async fn walk_queue(
     chatops_ctx: Option<&ChatOpsContext>,
     perma_stuck_threshold: u32,
     max_changes: u32,
+    pending: Vec<String>,
 ) -> Result<(Vec<String>, bool)> {
-    let pending = queue::list_pending(workspace)?;
     let mut archived: Vec<String> = Vec::new();
     let mut includes_self_heal = false;
 
     for change in pending {
-        queue::lock(workspace, &change)
-            .with_context(|| format!("locking change `{change}`"))?;
-
-        tracing::info!(
-            url = %repo.url,
-            change = %change,
-            "starting work on change"
-        );
-
-        // Start-of-work notification: post a one-liner to chatops when the
-        // operator has it enabled. Suppressed entirely when chatops is not
-        // wired OR when `notifications.start_work` is false. A failed post
-        // logs at WARN and does NOT prevent the executor from running.
-        maybe_post_start_of_work(workspace, repo, chatops_ctx, &change).await;
-
-        let outcome = executor.run(workspace, &change).await;
-        let result = handle_outcome(workspace, repo, chatops_ctx, &change, outcome).await;
-        // Always unlock, even after a Completed → archive (archive moved the
-        // dir, so the lock is gone, but `queue::unlock` is idempotent).
-        let _ = queue::unlock(workspace, &change);
+        let result =
+            process_one_pending_change(workspace, repo, executor, chatops_ctx, &change).await;
 
         let outcome_label = match &result {
             Ok(QueueStep::Archived) => "archived",
@@ -1183,16 +1180,130 @@ async fn walk_queue(
                 break;
             }
             Err(e) => {
+                // The per-change processing function returned Err from a
+                // non-executor source (e.g. queue::archive collision,
+                // post-executor commit failure, lock I/O, an unlock
+                // propagated by handle_outcome). The Failed outcome path
+                // is consumed inside handle_outcome → Ok(QueueStep::Failed)
+                // and already records via handle_failure_counter, so this
+                // wrapper covers the OTHER per-change Err sources without
+                // double-counting.
+                let reason = format!("post-executor error: {e:#}");
                 tracing::error!(
                     url = repo.url.as_str(),
+                    change = %change,
                     "fatal error processing change `{change}`: {e:#}"
                 );
+                handle_failure_counter(
+                    workspace,
+                    repo,
+                    chatops_ctx,
+                    &change,
+                    &reason,
+                    perma_stuck_threshold,
+                )
+                .await;
                 break;
             }
         }
     }
 
     Ok((archived, includes_self_heal))
+}
+
+/// Per-change processing scoped to one entry of the pending queue: lock →
+/// optional start-of-work notification → executor.run → handle_outcome →
+/// unlock. Any Err this function returns is a non-executor error (the
+/// executor-Failed path is consumed inside `handle_outcome` and surfaces
+/// as `Ok(QueueStep::Failed)`) and the caller in `walk_queue` records it
+/// against the per-change counter before halting the walk.
+async fn process_one_pending_change(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    executor: &dyn Executor,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+) -> Result<QueueStep> {
+    queue::lock(workspace, change)
+        .with_context(|| format!("locking change `{change}`"))?;
+
+    tracing::info!(
+        url = %repo.url,
+        change = %change,
+        "starting work on change"
+    );
+
+    // Start-of-work notification: post a one-liner to chatops when the
+    // operator has it enabled. Suppressed entirely when chatops is not
+    // wired OR when `notifications.start_work` is false. A failed post
+    // logs at WARN and does NOT prevent the executor from running.
+    maybe_post_start_of_work(workspace, repo, chatops_ctx, change).await;
+
+    let outcome = executor.run(workspace, change).await;
+    let result = handle_outcome(workspace, repo, chatops_ctx, change, outcome).await;
+    // Always unlock, even after a Completed → archive (archive moved the
+    // dir, so the lock is gone, but `queue::unlock` is idempotent).
+    let _ = queue::unlock(workspace, change);
+    result
+}
+
+/// Pre-flight archive-collision check. For each entry in `candidates`,
+/// call `queue::would_collide_on_archive`. Colliding entries are dropped
+/// from the returned list, a WARN-level structured log fires (so
+/// journalctl tailing surfaces the diagnosis even with chatops disabled),
+/// and a chatops alert is posted under `AlertCategory::ArchiveCollision`
+/// (subject to the existing 24h per-category throttle). The executor is
+/// never invoked for an excluded change — the caller must use the
+/// returned (non-colliding) list to drive its queue walk.
+///
+/// Centralizes the check so both the pending side (`walk_queue` call) and
+/// the waiting side (`process_waiting_changes`) share one implementation.
+async fn apply_archive_collision_preflight(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    candidates: Vec<String>,
+) -> Vec<String> {
+    let mut kept = Vec::with_capacity(candidates.len());
+    for change in candidates {
+        if !queue::would_collide_on_archive(workspace, &change) {
+            kept.push(change);
+            continue;
+        }
+        let archive_path = queue::archive_collision_path(workspace, &change);
+        // WARN-level structured log: emits per iteration regardless of
+        // whether the chatops alert is throttled, so operators tailing
+        // journalctl see the diagnosis at least once per occurrence.
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            archive_path = %archive_path.display(),
+            iteration_skipped = true,
+            "archive collision detected for `{change}`: openspec/changes/{change}/ would archive to {} but that path already exists; excluding from this iteration",
+            archive_path.display(),
+        );
+        // Body shape per proposal: concrete paths + the fix workflow so
+        // the operator's chatops alert is actionable rather than
+        // "something's wrong." `handle_predictable_failure` truncates the
+        // excerpt at 200 chars when formatting; the long-form body is
+        // also captured in the WARN log above so no diagnosis is lost.
+        let err = anyhow!(
+            "archive collision for `{change}`: openspec/changes/{change}/ would archive to {} but that path already exists. This usually means the change was archived earlier (via a merged PR) and re-added to the active path without removing the prior archive entry. The change is excluded from this iteration's queue walk to avoid burning agent tokens on a run that will fail at archive time. To resolve, on the base branch: (a) if the prior implementation is final: `git rm -r openspec/changes/{change}` and push; (b) if the prior implementation should be reverted and re-done: `git revert -m 1 <merge-sha>` (the merge that landed the prior PR), keeping the revised spec via `git checkout --ours` on the conflicting spec files, then push. Iteration continues with `{change}` excluded.",
+            archive_path.display(),
+        );
+        handle_predictable_failure(
+            workspace,
+            &repo.url,
+            chatops_ctx,
+            chatops_ctx
+                .map(|c| c.failure_alerts_enabled)
+                .unwrap_or(false),
+            AlertCategory::ArchiveCollision,
+            &err,
+        )
+        .await;
+    }
+    kept
 }
 
 enum QueueStep {
@@ -6986,5 +7097,465 @@ mod tests {
         let out = truncate_reason(&input);
         assert_eq!(out.chars().count(), PERMA_STUCK_REASON_EXCERPT_MAX + 1);
         assert!(out.ends_with('…'));
+    }
+
+    // ============================================================
+    // Archive-collision pre-flight exclusion
+    // ============================================================
+
+    /// Seed a dated archive entry for `change` at today's UTC date so a
+    /// subsequent `queue::archive(workspace, change)` would collide. The
+    /// path matches `queue::archive_collision_path` exactly.
+    fn pre_create_dated_archive_entry(workspace: &Path, change: &str) {
+        let dated = format!(
+            "{}-{change}",
+            chrono::Utc::now().format("%Y-%m-%d")
+        );
+        let archive_dir = workspace
+            .join("openspec/changes/archive")
+            .join(&dated);
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(
+            archive_dir.join("proposal.md"),
+            "## Why\nprior archive entry from a merged PR\n",
+        )
+        .unwrap();
+        // Commit so the workspace stays clean for the pre-pass dirty
+        // check inside `run_pass_through_commits`.
+        let run_git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed in fixture pre-create");
+        };
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-q", "-m", &format!("seed archive entry for {change}")]);
+    }
+
+    /// Executor that PANICS if invoked. Use this in collision tests to
+    /// assert the pre-flight filter ran and excluded the change before
+    /// any executor work happened.
+    struct UnreachableExecutorForCollision;
+    #[async_trait::async_trait]
+    impl Executor for UnreachableExecutorForCollision {
+        async fn run(&self, _w: &Path, change: &str) -> Result<ExecutorOutcome> {
+            unreachable!(
+                "archive collision pre-flight must exclude `{change}` before the executor runs"
+            );
+        }
+        async fn resume(
+            &self,
+            _h: crate::executor::ResumeHandle,
+            _a: &str,
+        ) -> Result<ExecutorOutcome> {
+            unreachable!()
+        }
+    }
+
+    /// 5.1: pending change with both `openspec/changes/foo/` AND
+    /// `openspec/changes/archive/<today>-foo/` present on disk is
+    /// excluded from the queue walk. The executor is never invoked,
+    /// exactly one chatops post fires under `ArchiveCollision`, the
+    /// iteration's processed list is empty, and the per-change failure
+    /// counter is NOT incremented (collision is structural, not a
+    /// perma-stuck-counting failure).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archive_collision_excludes_change_and_alerts() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "foo", "fixture");
+        pre_create_dated_archive_entry(&ws, "foo");
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let chatops_ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        };
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+
+        let (processed, _self_heal) = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &github_cfg,
+            &UnreachableExecutorForCollision,
+            Some(&chatops_ctx),
+            u32::MAX,
+            u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("iteration should complete Ok with the change excluded");
+
+        // (a) executor never invoked — guaranteed by Unreachable*::run panic
+        //     (the test would have panicked already if it had been called).
+        // (c) processed list empty (no commits)
+        assert!(
+            processed.is_empty(),
+            "no changes processed when the only pending change collides; got {processed:?}"
+        );
+        // (b) exactly one chatops post under ArchiveCollision
+        mock.assert_async().await;
+        let state = crate::alert_state::AlertState::load_or_default(&ws);
+        assert!(
+            state
+                .alerts
+                .contains_key(&crate::alert_state::AlertCategory::ArchiveCollision),
+            "ArchiveCollision entry must be persisted after the alert post"
+        );
+        // (d) failure-state counter for `foo` is NOT incremented
+        let fs = crate::failure_state::load(&ws).unwrap();
+        assert!(
+            fs.entries.get("foo").is_none(),
+            "collision is structural, not a perma-stuck-counting failure; got: {:?}",
+            fs.entries
+        );
+    }
+
+    /// 5.2: a mixed pending set — one colliding change, one clean —
+    /// processes the clean one normally and excludes the colliding one
+    /// with a single chatops post.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archive_collision_does_not_block_other_changes() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // `bar` sorts before `foo` and gets processed first; `foo` is
+        // also added but skipped via the collision pre-flight.
+        add_committed_change(&ws, "bar", "clean change");
+        add_committed_change(&ws, "foo", "colliding change");
+        pre_create_dated_archive_entry(&ws, "foo");
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let chatops_ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: false, // disable to keep mock count to 1
+            failure_alerts_enabled: true,
+            pr_opened_enabled: false,
+        };
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+
+        /// Recording executor: succeeds on `bar`, panics on any other name.
+        /// Proves the queue walk only invoked the executor for the non-
+        /// colliding change.
+        struct RecordingExecutor;
+        #[async_trait::async_trait]
+        impl Executor for RecordingExecutor {
+            async fn run(&self, workspace: &Path, change: &str) -> Result<ExecutorOutcome> {
+                if change != "bar" {
+                    panic!("executor must only be invoked for `bar`; got `{change}`");
+                }
+                std::fs::write(
+                    workspace.join("artifact-bar.txt"),
+                    "bar contents\n",
+                )?;
+                Ok(ExecutorOutcome::Completed)
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+
+        let (processed, _) = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &github_cfg,
+            &RecordingExecutor,
+            Some(&chatops_ctx),
+            u32::MAX,
+            u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("iteration should succeed");
+
+        assert_eq!(
+            processed,
+            vec!["bar".to_string()],
+            "only the non-colliding change should be processed; got {processed:?}"
+        );
+        // `foo` excluded with the alert; `bar` archived → counter not touched.
+        mock.assert_async().await;
+        let fs = crate::failure_state::load(&ws).unwrap();
+        assert!(
+            fs.entries.get("foo").is_none(),
+            "collided change must not move the failure counter"
+        );
+        assert!(
+            fs.entries.get("bar").is_none(),
+            "successfully-archived change must not have a failure entry"
+        );
+    }
+
+    /// 5.5: regression for the myrepo incident. Both paths present →
+    /// two consecutive iterations exclude the change every time; the
+    /// chatops alert fires ONCE (24h throttle catches the second
+    /// iteration); the executor is invoked ZERO times across both; the
+    /// failure-state counter stays at 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn myrepo_regression_two_iterations_throttle_alert_and_zero_executor_invocations() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "stuck-change", "fixture");
+        pre_create_dated_archive_entry(&ws, "stuck-change");
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1) // exactly once across BOTH iterations
+            .create_async()
+            .await;
+        let chatops_ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        };
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+
+        for _ in 0..2 {
+            let (processed, _) = run_pass_through_commits(
+                &ws,
+                &fixture_repo(&ws),
+                &github_cfg,
+                &UnreachableExecutorForCollision,
+                Some(&chatops_ctx),
+                u32::MAX,
+                u32::MAX,
+                &crate::audits::AuditRegistry::default(),
+                None,
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .expect("iteration succeeds");
+            assert!(processed.is_empty(), "no commits in a pure-collision pass");
+        }
+
+        mock.assert_async().await;
+        let fs = crate::failure_state::load(&ws).unwrap();
+        assert!(
+            fs.entries.get("stuck-change").is_none(),
+            "collision is not a perma-stuck-counting event across iterations"
+        );
+    }
+
+    // ============================================================
+    // Perma-stuck counter covers all per-change errors
+    // ============================================================
+
+    /// 5.3: when the per-change processing function returns Err from a
+    /// non-executor source (here: a fixture executor that returns
+    /// Completed but the post-executor `queue::archive` fails because
+    /// the dated archive path was pre-staged during the iteration), the
+    /// failure counter for that change increments by 1.
+    ///
+    /// We exercise the wrapper directly via a small stub: the executor
+    /// creates a file BUT also pre-creates the dated archive directory
+    /// at runtime, so `handle_outcome`'s `queue::archive` call returns
+    /// Err and propagates out of `process_one_pending_change`. The Err
+    /// arm of `walk_queue` then calls `handle_failure_counter`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_executor_archive_failure_increments_counter() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "racy", "fixture");
+
+        // Sanity: no failure entries yet.
+        let fs0 = crate::failure_state::load(&ws).unwrap();
+        assert!(fs0.entries.get("racy").is_none());
+
+        /// Executor: writes a diff (so we get past the no-diff path)
+        /// AND, during its run, pre-creates the dated archive entry so
+        /// the subsequent `queue::archive` call inside `handle_outcome`
+        /// fails with "archive destination already exists".
+        struct ArchiveColliderExecutor;
+        #[async_trait::async_trait]
+        impl Executor for ArchiveColliderExecutor {
+            async fn run(&self, workspace: &Path, change: &str) -> Result<ExecutorOutcome> {
+                // Produce a real diff so we don't take the no-diff path.
+                std::fs::write(
+                    workspace.join(format!("artifact-{change}.txt")),
+                    format!("contents for {change}\n"),
+                )?;
+                // Race the archive step: create the dated dir now.
+                let collision = queue::archive_collision_path(workspace, change);
+                std::fs::create_dir_all(&collision).unwrap();
+                Ok(ExecutorOutcome::Completed)
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+
+        // No chatops, no preflight alert. The pre-flight check sees no
+        // collision at the top of the iteration (the dated dir gets
+        // created INSIDE the executor's run), so the change passes the
+        // pre-flight; the post-executor archive then collides.
+        let _ = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &github_cfg,
+            &ArchiveColliderExecutor,
+            None,
+            u32::MAX,
+            u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await;
+
+        let fs = crate::failure_state::load(&ws).unwrap();
+        let entry = fs
+            .entries
+            .get("racy")
+            .expect("post-executor archive failure must increment the per-change counter");
+        assert_eq!(
+            entry.count, 1,
+            "non-executor Err from process_one_pending_change must record exactly one failure"
+        );
+        assert!(
+            entry.last_reason.contains("post-executor")
+                || entry.last_reason.contains("already exists"),
+            "reason should name the post-executor origin; got: {}",
+            entry.last_reason
+        );
+    }
+
+    /// 5.4: an iteration-level failure (dirty-workspace recovery error)
+    /// MUST NOT increment any per-change counter — the failure is
+    /// outside `walk_queue` entirely and has its own iteration-level
+    /// `AlertCategory::WorkspaceDirtyMidIteration`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iteration_level_failure_does_not_increment_per_change_counter() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // A change that COULD trigger the per-change counter if its
+        // processing ever ran. Adding it lets us assert "no entry"
+        // unambiguously rather than just "the file doesn't exist."
+        add_committed_change(&ws, "would-be-affected", "fixture");
+        // Dirty state same as dirty_workspace_recovery_failure_still_alerts:
+        // an unstaged untracked dir under openspec/changes/ that the
+        // pre-pass dirty check will see, with a base_branch that doesn't
+        // exist on origin so recovery FAILS.
+        std::fs::create_dir_all(ws.join("openspec/changes/leftover")).unwrap();
+        std::fs::write(
+            ws.join("openspec/changes/leftover/proposal.md"),
+            "## Why\nleftover\n",
+        )
+        .unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let _mock = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .create_async()
+            .await;
+        let chatops_ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        };
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+        let mut repo = fixture_repo(&ws);
+        repo.base_branch = "nonexistent-branch".into();
+
+        let result = run_pass_through_commits(
+            &ws,
+            &repo,
+            &github_cfg,
+            &UnreachableExecutorForCollision,
+            Some(&chatops_ctx),
+            u32::MAX,
+            u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(result.is_err(), "iteration must surface the recovery failure");
+
+        // The iteration-level alert fired (WorkspaceDirtyMidIteration)…
+        let state = crate::alert_state::AlertState::load_or_default(&ws);
+        assert!(
+            state
+                .alerts
+                .contains_key(&crate::alert_state::AlertCategory::WorkspaceDirtyMidIteration),
+            "iteration-level failure must route through WorkspaceDirtyMidIteration"
+        );
+        // …but no per-change counter moved.
+        let fs = crate::failure_state::load(&ws).unwrap();
+        assert!(
+            fs.entries.is_empty(),
+            "iteration-level failure must not increment any per-change counter; got: {:?}",
+            fs.entries
+        );
     }
 }

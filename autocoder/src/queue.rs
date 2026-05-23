@@ -175,6 +175,26 @@ pub fn clear_stale_locks(workspace: &Path) -> Result<Vec<String>> {
     Ok(cleared)
 }
 
+/// Compute the dated archive path that `archive(workspace, change)` would
+/// attempt to create on today's UTC date. Returns
+/// `<workspace>/openspec/changes/archive/<UTC-YYYY-MM-DD>-<change>/`. The
+/// date format mirrors `archive` so the returned path is byte-identical to
+/// what `archive` would build at the same instant.
+pub fn archive_collision_path(workspace: &Path, change: &str) -> PathBuf {
+    let archive_root = changes_dir(workspace).join(ARCHIVE_DIR);
+    let dated_name = format!("{}-{change}", Utc::now().format("%Y-%m-%d"));
+    archive_root.join(dated_name)
+}
+
+/// True when `archive_collision_path(workspace, change)` already exists on
+/// disk — i.e. a subsequent `archive(workspace, change)` call would fail
+/// with "archive destination already exists". Thin wrapper over the path
+/// helper; the named function exists so the call site at the polling loop
+/// is self-documenting (`if queue::would_collide_on_archive(ws, c) { ... }`).
+pub fn would_collide_on_archive(workspace: &Path, change: &str) -> bool {
+    archive_collision_path(workspace, change).exists()
+}
+
 /// Move `<workspace>/openspec/changes/<change>/` to
 /// `<workspace>/openspec/changes/archive/<UTC YYYY-MM-DD>-<change>/`.
 /// Errors if the destination already exists.
@@ -552,6 +572,61 @@ mod tests {
         );
         assert!(is_needs_spec_revision_marked(ws, "beta"));
         assert!(!is_needs_spec_revision_marked(ws, "alpha"));
+    }
+
+    #[test]
+    fn would_collide_on_archive_detects_dated_entry() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+
+        // Active dir present, but no archive entry yet → no collision.
+        make_change(ws, "foo");
+        assert!(
+            !would_collide_on_archive(ws, "foo"),
+            "no collision when only the active dir exists"
+        );
+
+        // Pre-create the dated archive entry for today.
+        let dated = format!("{today}-foo");
+        let archived = ws.join(CHANGES_SUBDIR).join(ARCHIVE_DIR).join(&dated);
+        std::fs::create_dir_all(&archived).unwrap();
+        assert!(
+            would_collide_on_archive(ws, "foo"),
+            "collision must be detected when active dir AND dated archive entry both exist"
+        );
+
+        // The returned path matches exactly what `archive()` would build.
+        assert_eq!(archive_collision_path(ws, "foo"), archived);
+
+        // Remove the active dir — the dated archive entry alone is the
+        // legitimate post-archive state, not a collision (the change is
+        // not in `list_pending` either). The helper still reports `true`
+        // because the path is purely a filesystem check; the caller (the
+        // polling loop) guards entry with `list_pending`, which excludes
+        // changes that have no active dir. Verify the wrapping behavior:
+        // with no active dir, list_pending returns empty.
+        std::fs::remove_dir_all(ws.join(CHANGES_SUBDIR).join("foo")).unwrap();
+        assert!(
+            list_pending(ws).unwrap().is_empty(),
+            "with only the archive entry, list_pending must not return the change"
+        );
+
+        // Fresh workspace where only the archive entry exists for a
+        // different change name → the helper for THAT change returns
+        // true (filesystem-pure), but list_pending excludes it too.
+        let dir2 = TempDir::new().unwrap();
+        let ws2 = dir2.path();
+        let only_archive = ws2.join(CHANGES_SUBDIR).join(ARCHIVE_DIR).join(format!("{today}-bar"));
+        std::fs::create_dir_all(&only_archive).unwrap();
+        assert!(would_collide_on_archive(ws2, "bar"));
+        assert!(list_pending(ws2).unwrap().is_empty());
+
+        // And on a workspace with NO archive entry, the helper returns false.
+        let dir3 = TempDir::new().unwrap();
+        let ws3 = dir3.path();
+        make_change(ws3, "baz");
+        assert!(!would_collide_on_archive(ws3, "baz"));
     }
 
     #[test]
