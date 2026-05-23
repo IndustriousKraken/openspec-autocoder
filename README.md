@@ -26,6 +26,12 @@ curl -fsSL .../install.sh | bash -s -- --non-interactive \
 
 Prefer to build from source instead? See [Manual install from source](#manual-install-from-source) further down.
 
+#### Periodic audits during install
+
+The wizard now asks about periodic audits before writing `config.yaml`. The cheap defensive `spec_sync_audit` is recommended ON at daily cadence (bare-Enter accepts the default); the five LLM-driven audits — `architecture_brightline`, `architecture_consultative`, `drift_audit`, `missing_tests_audit`, `security_bug_audit` — are gated behind a single `[y/N]` question so operators who want to defer can answer "n" and move on. Operators who accept the gate get a fast-path prompt that enables all five at recommended cadences, falling back to an individual cadence walk-through if they decline the fast path.
+
+For non-interactive installs, the same configuration is available via `--audits-spec-sync <disabled|daily|weekly|monthly>` (defaults to `daily`), `--audits-llm-driven <none|recommended|all-disabled>` (defaults to `none`), and per-audit `--audit-<slug> <cadence>` overrides. A `--non-interactive` invocation that passes none of the `--audits-*` flags inherits the conservative default (spec-sync daily; everything else disabled), so IaC scripts that pre-date this wizard step keep working without surprise behavior changes. See the [`audits:` configuration reference](#audits-optional) for cadence syntax and the `extra` knobs each audit reads.
+
 ### Reinstalling / upgrading
 
 Re-running `install.sh` downloads the latest binary (or a specific tag — pass `--version vX.Y.Z` to the script or set `AUTOCODER_VERSION=vX.Y.Z` in the environment), verifies the checksum, and replaces `/usr/local/bin/autocoder`. The subsequent `autocoder install` detects the existing `config.yaml` and exits 0 without re-prompting: the operator's choices made on first run are preserved across binary upgrades. To force the wizard back on (e.g. to relocate the config), pass `--upgrade` after `--`.
@@ -164,6 +170,8 @@ See [ChatOps Escalation](#chatops-escalation). The block carries a required `pro
 ### `audits:` (optional)
 
 Top-level periodic-audit framework configuration. Absent block → every audit's effective cadence is `disabled` and the daemon behaves identically to a build without the framework. See [Periodic audits](#periodic-audits) for the full operational model.
+
+> **Already installed via the wizard?** The `autocoder install` flow already wrote your cadence choices into this block. This section is for operators editing `config.yaml` directly, onboarded via the [source build](#manual-install-from-source), or adjusting cadences after first install.
 
 | Field | Type | Description |
 |---|---|---|

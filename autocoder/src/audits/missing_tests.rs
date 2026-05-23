@@ -135,6 +135,10 @@ impl Audit for MissingTestsAudit {
         Self::TYPE
     }
 
+    fn description(&self) -> &'static str {
+        "proposes test coverage for untested branches"
+    }
+
     fn requires_head_change(&self) -> bool {
         true
     }

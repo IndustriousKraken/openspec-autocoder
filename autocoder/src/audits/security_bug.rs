@@ -138,6 +138,10 @@ impl Audit for SecurityBugAudit {
         Self::TYPE
     }
 
+    fn description(&self) -> &'static str {
+        "proposes fixes for likely security bugs"
+    }
+
     fn requires_head_change(&self) -> bool {
         true
     }

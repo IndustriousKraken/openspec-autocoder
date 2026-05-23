@@ -145,6 +145,10 @@ pub trait Audit: Send + Sync {
     /// and log-file name prefix. Use `snake_case`.
     fn audit_type(&self) -> &'static str;
 
+    /// One-line operator-facing description suitable for inline rendering
+    /// in the install wizard (≤ 80 chars).
+    fn description(&self) -> &'static str;
+
     /// When `true`, the scheduler skips this audit when the recorded
     /// `last_run_sha` matches the current base-branch HEAD even if the
     /// cadence interval has elapsed. Use `false` for audits whose
@@ -431,6 +435,9 @@ mod tests {
             fn audit_type(&self) -> &'static str {
                 self.0
             }
+            fn description(&self) -> &'static str {
+                "fake audit for tests"
+            }
             fn requires_head_change(&self) -> bool {
                 true
             }
@@ -472,5 +479,52 @@ mod tests {
         assert_eq!(Severity::Low.glyph(), "•");
         assert_eq!(Severity::Medium.glyph(), "⚠");
         assert_eq!(Severity::High.glyph(), "🔴");
+    }
+
+    #[test]
+    fn all_registered_audits_have_one_line_descriptions() {
+        use crate::config::AuditSettings;
+        let audit_settings: std::collections::HashMap<String, AuditSettings> =
+            std::collections::HashMap::new();
+        let executor: crate::config::ExecutorConfig = serde_yaml::from_str(
+            "kind: claude_cli\ncommand: claude\ntimeout_secs: 600\n",
+        )
+        .expect("test executor config");
+        let audits: Vec<Arc<dyn Audit>> = vec![
+            Arc::new(crate::audits::brightline::ArchitectureBrightlineAudit::new(
+                &audit_settings,
+            )),
+            Arc::new(
+                crate::audits::architecture_consultative::ArchitectureConsultativeAudit::new(
+                    &audit_settings,
+                    &executor,
+                ),
+            ),
+            Arc::new(crate::audits::drift::DriftAudit::new(&audit_settings, &executor)),
+            Arc::new(crate::audits::missing_tests::MissingTestsAudit::new(
+                &audit_settings,
+                &executor,
+            )),
+            Arc::new(crate::audits::security_bug::SecurityBugAudit::new(
+                &audit_settings,
+                &executor,
+            )),
+            Arc::new(crate::audits::spec_sync::SpecSyncAudit::new()),
+        ];
+        for a in &audits {
+            let d = a.description();
+            assert!(!d.is_empty(), "{}: description must not be empty", a.audit_type());
+            assert!(
+                d.chars().count() <= 80,
+                "{}: description must be ≤ 80 chars, got {}",
+                a.audit_type(),
+                d.chars().count()
+            );
+            assert!(
+                !d.contains('\n'),
+                "{}: description must be a single line",
+                a.audit_type()
+            );
+        }
     }
 }

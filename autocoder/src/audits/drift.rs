@@ -119,6 +119,10 @@ impl Audit for DriftAudit {
         Self::TYPE
     }
 
+    fn description(&self) -> &'static str {
+        "spec ↔ code drift detection (warns when reality outgrows the spec)"
+    }
+
     fn requires_head_change(&self) -> bool {
         true
     }

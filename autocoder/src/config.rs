@@ -61,8 +61,10 @@ pub struct Config {
     /// block is absent, every audit's effective cadence is `Disabled` and
     /// the daemon behaves exactly as it did before the framework existed.
     /// Operators opt in explicitly by listing audit type names with a
-    /// non-`disabled` cadence under `audits.defaults`.
-    #[serde(default)]
+    /// non-`disabled` cadence under `audits.defaults`. Serialized only when
+    /// some audit is enabled so the install wizard's "operator declined all
+    /// audits" path produces a YAML file without an empty `audits:` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audits: Option<AuditsConfig>,
 }
 
@@ -501,7 +503,7 @@ pub struct AuditSettings {
 /// string in one of the literal forms documented in the spec:
 /// `disabled`, `daily`, `every-N-days` (N a positive integer),
 /// `weekly`, `monthly`, `quarterly`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cadence {
     Disabled,
     Daily,
@@ -509,6 +511,30 @@ pub enum Cadence {
     Weekly,
     Monthly,
     Quarterly,
+}
+
+impl Cadence {
+    /// Canonical lowercase string form. Mirrors what `Cadence::parse`
+    /// accepts so a serialize → deserialize round trip is a fixed point.
+    pub fn as_yaml_str(&self) -> String {
+        match self {
+            Self::Disabled => "disabled".to_string(),
+            Self::Daily => "daily".to_string(),
+            Self::Weekly => "weekly".to_string(),
+            Self::Monthly => "monthly".to_string(),
+            Self::Quarterly => "quarterly".to_string(),
+            Self::EveryNDays(n) => format!("every-{n}-days"),
+        }
+    }
+}
+
+impl serde::Serialize for Cadence {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.as_yaml_str())
+    }
 }
 
 impl Cadence {
