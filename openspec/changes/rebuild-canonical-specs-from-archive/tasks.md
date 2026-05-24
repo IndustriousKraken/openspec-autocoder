@@ -72,12 +72,41 @@
 - [ ] 6.2 At iteration start (after the busy marker is acquired, before the queue walk): check `pending_rebuild`. If true:
   - Clear the flag.
   - Log INFO `"iteration: running spec rebuild instead of queue walk"`.
-  - Call `cli::sync_specs::rebuild_canonical(workspace)`.
-  - Stage all changes (`git add -A`), commit with message `spec rebuild: <N> capability(ies) rebuilt from archive history` (or "0 capability(ies) — no drift detected" if no files changed).
-  - If any commits were produced, the existing push + PR creation logic runs as normal. PR title uses the existing `informative-pr-title-and-body` logic; the commit message + the rebuild's distinctive shape gives operators a clear cue.
+  - Call `cli::sync_specs::rebuild_canonical(workspace)` and capture the `RebuildReport`.
+  - Stage all changes (`git add -A`), commit IF any files changed (commit message: `spec rebuild: <N> capability(ies) rebuilt from archive history`).
+  - If commits were produced: existing push + PR creation logic runs as normal. PR title uses the existing `informative-pr-title-and-body` logic; the commit message + the rebuild's distinctive shape gives operators a clear cue.
+  - If NO commits were produced (no drift detected): skip the push + PR step entirely.
+  - Either way, fire `maybe_post_end_of_rebuild_notification(report, pr_url_opt, chatops_ctx)` per §6b below.
   - Skip the queue walk entirely for this iteration. The next iteration resumes normal queue processing.
 - [ ] 6.3 If `pending_rebuild` is false (the normal case): iteration proceeds with queue walk as today. No behavior change.
-- [ ] 6.4 Test: a polling-loop fixture with `pending_rebuild = true` set before the iteration starts; assert the iteration calls `rebuild_canonical` once, calls the existing commit/push hooks, does NOT invoke the executor, and clears the flag before returning.
+- [ ] 6.4 Test: a polling-loop fixture with `pending_rebuild = true` set before the iteration starts; assert the iteration calls `rebuild_canonical` once, calls the existing commit/push hooks (only if drift was present), does NOT invoke the executor, and clears the flag before returning.
+
+## 6b. End-of-rebuild chatops notification
+
+- [ ] 6b.1 Add `async fn maybe_post_end_of_rebuild_notification(repo: &RepositoryConfig, report: &RebuildReport, pr_url: Option<&str>, chatops_ctx: Option<&ChatOpsContext>)` to `polling_loop.rs`, mirroring the existing `maybe_post_pr_opened` shape. Best-effort; logs WARN on post failure; never propagates.
+- [ ] 6b.2 The function emits exactly one of three messages based on the report:
+  - **Success with drift** (`report.failed == 0` AND `pr_url.is_some()`):
+    ```
+    ✓ rebuild complete for `<repo>`: PR <pr_url> opened — <N> capability(ies) updated from <M> archived change(s)
+    ```
+  - **Success no drift** (`report.failed == 0` AND `pr_url.is_none()`):
+    ```
+    ✓ rebuild complete for `<repo>`: no drift detected, canonical specs already in sync
+    ```
+  - **Partial failure** (`report.failed > 0`):
+    ```
+    ⚠️ rebuild for `<repo>` completed with <N> failure(s); PR <pr_url-or-none> opened with successful <M> change(s).
+    Failed: <comma-separated list of failed change slugs, truncated to first 10 with "and K more" suffix if longer>.
+    See journalctl -u autocoder for openspec stderr details.
+    ```
+    The PR-url segment becomes `(no PR — every change failed)` when nothing successful was committed.
+- [ ] 6b.3 Gating: the notification fires only when `chatops_ctx.is_some()`. It is NOT gated on `failure_alerts_enabled` or `pr_opened_enabled` — this is a direct response to an operator's chatops-triggered (or control-socket-triggered) command, so the operator wants the completion signal regardless of which notification toggles they have set elsewhere.
+- [ ] 6b.4 Tests:
+  - `end_of_rebuild_success_with_drift_posts_pr_url_message` — `RebuildReport { failed: 0, successful: 5, modified_files: 3 }` + `pr_url: Some(..)` → assert exactly one chatops post containing `"PR"` + `"3 capability"` + `"5 archived change"`.
+  - `end_of_rebuild_success_no_drift_posts_clean_message` — `RebuildReport { failed: 0, successful: 5, modified_files: 0 }` + `pr_url: None` → assert exactly one post containing `"no drift detected"`.
+  - `end_of_rebuild_partial_failure_lists_failed_slugs` — `RebuildReport { failed: 2, successful: 3, modified_files: 2, failed_slugs: ["a06-foo", "a07-bar"] }` + `pr_url: Some(..)` → assert post contains `"2 failure"`, `"a06-foo"`, `"a07-bar"`, and the journalctl pointer.
+  - `end_of_rebuild_no_chatops_is_noop` — chatops_ctx is None → no post attempted, function returns silently.
+  - `end_of_rebuild_failed_slugs_truncation` — `failed_slugs.len() == 15` → post contains the first 10 slugs + `"and 5 more"` suffix, doesn't include slugs 11-15 verbatim.
 
 ## 7. Chatops verb
 

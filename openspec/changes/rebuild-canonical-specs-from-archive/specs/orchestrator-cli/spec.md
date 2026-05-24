@@ -153,3 +153,71 @@ There is intentionally no incremental "sync only the missing changes" mode: incr
 - **AND** the README documents this loss-on-rebuild
   behavior so operators don't run rebuild expecting
   hand-edits to survive
+
+#### Scenario: End-of-rebuild chatops notification — success with drift
+- **WHEN** a rebuild iteration runs, every archived change
+  re-archives successfully (`report.failed == 0`), the
+  rebuild produces modified canonical files, and the
+  iteration's push + PR creation succeed
+- **THEN** exactly one chatops notification fires when
+  chatops is configured:
+  `✓ rebuild complete for <repo>: PR <pr_url> opened —
+  <N> capability(ies) updated from <M> archived change(s)`
+- **AND** the notification is NOT gated on
+  `failure_alerts_enabled` or `pr_opened_enabled` (this
+  is a direct response to an operator-triggered command;
+  the operator wants the completion signal regardless of
+  other notification toggles)
+- **AND** the existing PR-opened notification ALSO fires
+  per the established contract — operators see two posts:
+  the generic "PR opened" notification and this rebuild-
+  specific completion notification
+
+#### Scenario: End-of-rebuild chatops notification — no drift
+- **WHEN** a rebuild iteration runs AND every archived
+  change re-archives successfully AND no canonical files
+  end up modified (the rebuild reproduced the existing
+  canonical exactly — no drift was present)
+- **THEN** no commit is created (nothing to stage), no PR
+  opens, no PR-opened notification fires
+- **AND** exactly one chatops notification fires when
+  chatops is configured:
+  `✓ rebuild complete for <repo>: no drift detected,
+  canonical specs already in sync`
+- **AND** the operator gets explicit closure on the
+  rebuild they requested — no silent disappearance
+
+#### Scenario: End-of-rebuild chatops notification — partial failure
+- **WHEN** a rebuild iteration runs AND one or more
+  archived changes fail to re-archive (e.g. openspec
+  archive exits non-zero on them; per the existing
+  `Per-change failure during backfill does not abort the
+  whole run` scenario, the rebuild continues with the
+  remaining changes)
+- **THEN** if any successful changes produced canonical
+  modifications: those modifications are committed and a
+  PR opens (containing the partial result)
+- **AND** exactly one chatops notification fires:
+  `⚠️ rebuild for <repo> completed with <N> failure(s);
+  PR <pr_url-or-"(no PR — every change failed)"> opened
+  with successful <M> change(s).
+  Failed: <slug1>, <slug2>, ... [and K more].
+  See journalctl -u autocoder for openspec stderr details.`
+- **AND** the failed-slugs list truncates to the first 10
+  entries with an `"and K more"` suffix to keep the
+  notification body manageable in chat clients
+- **AND** the failed changes' directories remain at the
+  active path (`openspec/changes/<slug>/`) for the
+  operator to inspect — they are NOT moved back to
+  archive automatically
+
+#### Scenario: End-of-rebuild notification when chatops is not configured
+- **WHEN** a rebuild iteration completes AND
+  `chatops_ctx.is_none()` (the daemon has no chatops
+  configured)
+- **THEN** no chatops post is attempted
+- **AND** the rebuild iteration's outcome is unchanged
+  (the existing INFO log lines + PR-creation flow still
+  fire normally per their respective contracts)
+- **AND** the operator monitors progress via
+  `journalctl -u autocoder` as with any other iteration
