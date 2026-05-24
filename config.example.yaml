@@ -170,6 +170,24 @@ github:
 #     # Inline alternative: when `bot_token` is set, `bot_token_env` is ignored.
 #     # bot_token:
 #     #   value: "xoxb-yourtokenhere"
+#     #
+#     # OPTIONAL: Socket Mode app-level token (xapp-*). When set, autocoder
+#     # spawns an inbound listener that handles `@autocoder <verb>` operator
+#     # commands (`status`, `clear-perma-stuck`, `wipe-workspace`, etc.) and
+#     # posts threaded replies. When absent, outbound chatops still works
+#     # but the operator commands documented in the README are not handled.
+#     # See README "ChatOps operator commands" → "Setup" for the Slack app
+#     # configuration steps (Socket Mode toggle, OAuth scopes, token gen).
+#     # app_token_env: SLACK_APP_TOKEN
+#     # # Inline alternative:
+#     # # app_token:
+#     # #   value: "xapp-1-..."
+#     #
+#     # OPTIONAL: extra channel IDs the inbound listener will honor
+#     # commands in, on top of every `repositories[].chatops_channel_id`
+#     # and `chatops.default_channel_id`. Messages from channels not in
+#     # the resulting allowlist are silently dropped (no `?` reaction).
+#     # listen_channels: ["C0OPS", "C0OPS2"]
 #
 #   # Progress notifications. Each key defaults to `true` when the block is
 #   # omitted. Set any to `false` to suppress that stream.

@@ -230,6 +230,23 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     });
 
+    // Spawn the inbound ChatOps listener (Slack Socket Mode) as a
+    // sibling task. The listener is only started when:
+    //   - chatops is configured, AND
+    //   - the chosen backend supports `start_inbound_listener`, AND
+    //   - the backend has the provider-specific inbound credential
+    //     (Slack: `app_token`).
+    //
+    // Returns a (potentially empty) Vec of JoinHandles so the
+    // shutdown path awaits the listener before exiting.
+    let inbound_handles = spawn_inbound_listener(
+        &cfg,
+        chatops_holder.clone(),
+        task_map.clone(),
+        cancel.clone(),
+    )
+    .await;
+
     spawn_signal_handler(cancel.clone());
 
     // The polling tasks loop until the global cancellation token fires
@@ -251,9 +268,115 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
     if let Err(e) = control_handle.await {
         tracing::error!("control socket task panicked: {e}");
     }
+    for h in inbound_handles {
+        if let Err(e) = h.await {
+            tracing::error!("chatops inbound listener task panicked: {e}");
+        }
+    }
 
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Spawn the chatops inbound listener if the active backend supports
+/// it and the operator has supplied the inbound credential. Builds
+/// the channel allowlist from the union of every
+/// `repositories[].chatops_channel_id`, `chatops.default_channel_id`,
+/// and `chatops.slack.listen_channels`. Returns one or zero
+/// JoinHandles (so the shutdown path can `await` them uniformly).
+///
+/// WARN-and-skip cases:
+///   - no chatops config block → silent skip (already logged
+///     elsewhere at startup);
+///   - chatops configured but no Slack `app_token` → WARN + skip;
+///   - app_token present but allowlist empty → WARN + spawn anyway
+///     (the listener will drop every command silently; the operator
+///     may reload-add channels later).
+async fn spawn_inbound_listener(
+    cfg: &Config,
+    chatops_holder: ChatOpsHolder,
+    task_map: RepoTaskMap,
+    cancel: CancellationToken,
+) -> Vec<JoinHandle<()>> {
+    let slot_arc = chatops_holder.load_full();
+    let slot = match slot_arc.as_ref() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let chatops_cfg = match cfg.chatops.as_ref() {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let slack_sub = chatops_cfg.slack.as_ref();
+    let has_app_token = slack_sub
+        .map(|s| s.app_token.is_some() || s.app_token_env.is_some())
+        .unwrap_or(false);
+    if !has_app_token {
+        tracing::warn!(
+            "chatops inbound listener not started: chatops.slack.app_token not configured. \
+             Operator commands like '@<bot> status <repo>' will not receive replies. \
+             See README \"ChatOps operator commands → Setup\" for setup."
+        );
+        return Vec::new();
+    }
+
+    // Build the channel allowlist:
+    //   union(
+    //     every repositories[].chatops_channel_id,
+    //     chatops.default_channel_id (if set),
+    //     chatops.slack.listen_channels,
+    //   )
+    let mut allowed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for repo in &cfg.repositories {
+        if let Some(c) = repo.chatops_channel_id.as_deref()
+            && !c.is_empty()
+        {
+            allowed.insert(c.to_string());
+        }
+    }
+    if !chatops_cfg.default_channel_id.is_empty() {
+        allowed.insert(chatops_cfg.default_channel_id.clone());
+    }
+    if let Some(sub) = slack_sub {
+        for c in &sub.listen_channels {
+            if !c.is_empty() {
+                allowed.insert(c.clone());
+            }
+        }
+    }
+    if allowed.is_empty() {
+        tracing::warn!(
+            "chatops inbound listener: no channels in allowlist. The bot will be \
+             connected but will silently drop every command. Configure at least one \
+             chatops_channel_id on a repository, or set chatops.slack.listen_channels."
+        );
+    }
+
+    let dispatcher = Arc::new(
+        crate::chatops::operator_commands::OperatorCommandDispatcher::new(),
+    );
+    let task_map_for_provider = task_map.clone();
+    let repos: Arc<dyn crate::chatops::operator_commands::RepoIdentityProvider> =
+        Arc::new(crate::chatops::TaskMapRepoIdentities::new(move || {
+            let guard = task_map_for_provider.lock().unwrap();
+            guard
+                .values()
+                .map(|h| h.config.load_full().as_ref().clone())
+                .collect()
+        }));
+    let allowed_arc = Arc::new(allowed);
+
+    let backend = slot.backend.clone();
+    match backend
+        .start_inbound_listener(dispatcher, repos, allowed_arc, cancel)
+        .await
+    {
+        Ok(h) => vec![h],
+        Err(e) => {
+            tracing::warn!("chatops inbound listener could not start: {e:#}");
+            Vec::new()
+        }
+    }
 }
 
 /// Dependencies the daemon captures into the spawn closure so the reload

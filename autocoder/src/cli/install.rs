@@ -981,6 +981,9 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
             slack: Some(SlackProviderConfig {
                 bot_token_env: Some("SLACK_BOT_TOKEN".to_string()),
                 bot_token: None,
+                app_token_env: None,
+                app_token: None,
+                listen_channels: Vec::new(),
             }),
             discord: None,
             teams: None,

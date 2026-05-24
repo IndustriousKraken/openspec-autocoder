@@ -379,6 +379,20 @@ pub struct SlackProviderConfig {
     pub bot_token_env: Option<String>,
     #[serde(default)]
     pub bot_token: Option<SecretSource>,
+    /// App-level token used by the Socket Mode inbound listener
+    /// (`xapp-*` prefix). Optional — when absent, the inbound listener
+    /// is not started. Resolved via the same inline-or-env-var pattern
+    /// as `bot_token` / `bot_token_env`.
+    #[serde(default)]
+    pub app_token_env: Option<String>,
+    #[serde(default)]
+    pub app_token: Option<SecretSource>,
+    /// Extra channel IDs the inbound listener will honor commands in,
+    /// on top of the union of every `repositories[].chatops_channel_id`
+    /// and `chatops.default_channel_id`. Messages from channels not in
+    /// the resulting allowlist are silently dropped.
+    #[serde(default)]
+    pub listen_channels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -639,6 +653,40 @@ pub fn resolved_cadence(
 /// error listing each unknown name + the set of known names so the
 /// operator can correct the config. Called from the daemon entry point
 /// after the audit registry is built.
+/// Emit WARN-level logs when the resolved Slack token values do not have
+/// the expected provider-conventional prefix (`xoxb-` for bot tokens,
+/// `xapp-` for app-level tokens). These are advisory only — Slack could
+/// in principle change the prefix in the future — so a wrong prefix is
+/// never a hard load-time failure. Returns the pair of warn messages
+/// that were emitted (each as `Some(msg)`) so tests can assert without
+/// re-running through `tracing-subscriber`.
+pub fn warn_on_unexpected_slack_token_prefixes(
+    bot_token: Option<&str>,
+    app_token: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let bot_msg = bot_token
+        .filter(|t| !t.starts_with("xoxb-"))
+        .map(|_| {
+            let m = "chatops.slack.bot_token does not start with `xoxb-`; \
+                     Slack bot tokens conventionally use that prefix. \
+                     This is a warning, not a hard failure."
+                .to_string();
+            tracing::warn!("{m}");
+            m
+        });
+    let app_msg = app_token
+        .filter(|t| !t.starts_with("xapp-"))
+        .map(|_| {
+            let m = "chatops.slack.app_token does not start with `xapp-`; \
+                     Slack app-level tokens conventionally use that prefix. \
+                     This is a warning, not a hard failure."
+                .to_string();
+            tracing::warn!("{m}");
+            m
+        });
+    (bot_msg, app_msg)
+}
+
 pub fn validate_audit_type_names(
     cfg: &Config,
     known_audit_types: &[&str],
@@ -821,6 +869,9 @@ github:
             // `ChatOpsConfig` + provider sub-blocks + `NotificationsConfig`.
             "bot_token_env",
             "bot_token",
+            "app_token_env",
+            "app_token",
+            "listen_channels",
             "default_channel_id",
             "notifications",
             "start_work",
@@ -1648,6 +1699,119 @@ reviewer:
         let rv = cfg.reviewer.unwrap();
         assert!(rv.api_key_env.is_none());
         assert!(rv.api_key.is_some());
+    }
+
+    #[test]
+    fn loads_slack_app_token_via_env() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: slack
+  default_channel_id: C0DEFAULT
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
+    app_token_env: SLACK_APP_TOKEN
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("app_token_env should parse");
+        let slack = cfg.chatops.unwrap().slack.unwrap();
+        assert_eq!(slack.app_token_env.as_deref(), Some("SLACK_APP_TOKEN"));
+        assert!(slack.app_token.is_none());
+    }
+
+    #[test]
+    fn loads_slack_app_token_inline() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: slack
+  default_channel_id: C0DEFAULT
+  slack:
+    bot_token_env: SLACK_BOT_TOKEN
+    app_token:
+      value: "xapp-1-inline"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("inline app_token should parse");
+        let slack = cfg.chatops.unwrap().slack.unwrap();
+        assert!(slack.app_token_env.is_none());
+        match slack.app_token.unwrap() {
+            SecretSource::Inline { value } => assert_eq!(value, "xapp-1-inline"),
+            _ => panic!("expected inline app token"),
+        }
+    }
+
+    #[test]
+    fn slack_missing_app_token_env_var_errors_on_resolve() {
+        // We don't fail at load time when the env var is missing — we
+        // fail at resolve time, with a message naming the env var.
+        // SAFETY: SAFE-RUST-001 — single-threaded test, no other thread
+        // reads or writes this env var.
+        unsafe { std::env::remove_var("APP_TOKEN_NEVER_SET_RACEY") };
+        let source = SecretSource::EnvVar("APP_TOKEN_NEVER_SET_RACEY".to_string());
+        let err = source
+            .resolve("chatops.slack.app_token_env=APP_TOKEN_NEVER_SET_RACEY")
+            .expect_err("missing env var must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("APP_TOKEN_NEVER_SET_RACEY"));
+    }
+
+    #[test]
+    fn slack_unexpected_token_prefix_warns_not_errors() {
+        // Both checks are advisory: load_from succeeds, and the warn
+        // helper produces one or both messages depending on which
+        // tokens look off. Mainly we assert no hard failure.
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+chatops:
+  provider: slack
+  default_channel_id: C0DEFAULT
+  slack:
+    bot_token:
+      value: "not-xoxb-shaped"
+    app_token:
+      value: "not-xapp-shaped"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let _cfg = Config::load_from(&path).expect("non-conforming prefix must not block load");
+
+        let (bot, app) = warn_on_unexpected_slack_token_prefixes(
+            Some("not-xoxb-shaped"),
+            Some("not-xapp-shaped"),
+        );
+        assert!(bot.is_some(), "bot token mismatch must warn");
+        assert!(app.is_some(), "app token mismatch must warn");
+        assert!(bot.as_deref().unwrap().contains("xoxb-"));
+        assert!(app.as_deref().unwrap().contains("xapp-"));
+
+        // Conforming prefixes do not warn.
+        let (bot, app) = warn_on_unexpected_slack_token_prefixes(
+            Some("xoxb-fine"),
+            Some("xapp-fine"),
+        );
+        assert!(bot.is_none());
+        assert!(app.is_none());
     }
 
     #[test]

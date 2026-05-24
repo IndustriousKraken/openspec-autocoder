@@ -1792,7 +1792,7 @@ github:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn end_to_end_dispatcher_drives_full_flow_through_real_socket() {
         use crate::chatops::operator_commands::{
-            ControlSocketSubmitter, OperatorCommandDispatcher,
+            ControlSocketSubmitter, OperatorCommandDispatcher, RepoIdentity, Reply,
         };
 
         let dir = TempDir::new().unwrap();
@@ -1809,7 +1809,16 @@ github:
             fixture_listener(&local_path_yaml(&workspace)).await;
         let submitter = ControlSocketSubmitter::new(socket.clone());
         let dispatcher = OperatorCommandDispatcher::new();
-        let repos = state.last_config.load_full().repositories.clone();
+        let repos: Vec<RepoIdentity> = state
+            .last_config
+            .load_full()
+            .repositories
+            .iter()
+            .map(|r| RepoIdentity {
+                url: r.url.clone(),
+                workspace_path: crate::workspace::resolve_path(r),
+            })
+            .collect();
         let bot = "<@UBOT>";
         let reply = dispatcher
             .handle_message(
@@ -1821,7 +1830,11 @@ github:
             )
             .await
             .expect("dispatcher must produce a reply");
-        assert!(reply.starts_with("✓"), "expected success reply: {reply}");
+        let reply_text = match reply {
+            Reply::Sync(s) => s,
+            other => panic!("expected Sync reply, got {other:?}"),
+        };
+        assert!(reply_text.starts_with("✓"), "expected success reply: {reply_text}");
         assert!(
             !workspace
                 .join("openspec/changes/a06-foo/.perma-stuck.json")

@@ -414,17 +414,50 @@ Deleting `.alert-state.json` by hand is harmless: it just resets the alert throt
 
 ### ChatOps operator commands
 
-A small set of operator-issued commands lets you handle the common SSH-and-edit recovery actions from chat instead of switching to a terminal. The bot recognises:
+A small set of operator-issued commands lets you handle the common SSH-and-edit recovery actions from chat instead of switching to a terminal. Every reply is posted as a **threaded reply** to your original `@<bot> <verb>` message — the channel stays clean and the conversation stays grouped near the request. Messages that don't parse as a known verb get a `?`-emoji reaction on the original message rather than a text reply, so typos and drive-by mentions do not spam the channel.
+
+The bot recognises:
 
 | Verb | Syntax | What it does |
 | --- | --- | --- |
-| `status` | `@<bot> status <repo-substring>` | Posts a multi-line summary: active markers, currently-engaged 24h alert throttles, last-iteration timestamp + next-iteration estimate, queue snapshot. |
+| `status` | `@<bot> status <repo-substring>` | Posts a multi-line threaded reply: active markers, currently-engaged 24h alert throttles, last-iteration timestamp + next-iteration estimate, queue snapshot. |
 | `clear-perma-stuck` | `@<bot> clear-perma-stuck <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.perma-stuck.json`. The next iteration will retry the change. |
 | `clear-revision` | `@<bot> clear-revision <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.needs-spec-revision.json`. Use after you've edited `tasks.md` to remove or revise the unimplementable tasks. |
 | `wipe-workspace` | `@<bot> wipe-workspace <repo-substring>` | Destructive: removes the entire `/tmp/workspaces/<sanitized-url>/` directory so the next iteration re-clones. Requires two-step confirmation (see below). |
 | `rebuild-specs` | `@<bot> rebuild-specs <repo-substring>` | Schedules a full canonical-spec rebuild from archive history. The rebuild runs on the next polling iteration; the resulting commits land via the usual push + PR flow. See [Rebuilding canonical specs from archive history](#rebuilding-canonical-specs-from-archive-history). |
+| `help` | `@<bot> help` | Posts a threaded synopsis of every recognised verb with its syntax and a one-line description. |
 
 The `clear-perma-stuck` and `clear-revision` verbs are the in-chat equivalent of the SSH-and-rm-the-file workflow described above — the same marker files that [perma-stuck](#operator-escape-hatches-for-a-stuck-waiting-change) and [needs-spec-revision](#what-gets-posted) recovery uses, deleted via a chat reply instead.
+
+#### Setup (Slack)
+
+The outbound chatops surface (notifications, AskUser questions) needs only the bot token configured in [Configuring Slack](#configuring-slack-officially-supported). The inbound listener that receives `@<bot>` commands additionally requires a Slack **app-level token** with Socket Mode enabled. Without it, the daemon logs one WARN line at startup and the verbs in the table above do nothing — operator commands typed in chat will receive no reply and no reaction.
+
+To enable the inbound listener:
+
+1. In the Slack app dashboard for your bot, open **Settings → Socket Mode** and toggle it on. Slack will prompt you to generate an app-level token; give it the `connections:write` scope and copy the resulting `xapp-*` value.
+2. In **Features → OAuth & Permissions → Bot Token Scopes**, ensure the bot has:
+   - `app_mentions:read` — receive `app_mention` events over Socket Mode (the only event subscription you need).
+   - `chat:write` — post the threaded reply.
+   - `reactions:write` — add the `?` reaction on unrecognised messages.
+   - the channel-history scope your channel deployment requires (`groups:history` for private channels, `channels:history` for public).
+3. In **Features → Event Subscriptions**, enable events and subscribe the bot to `app_mention` only.
+4. Reinstall the app to your workspace so the updated scopes apply.
+5. Export the app-level token alongside the bot token and reference it from your config:
+
+   ```yaml
+   chatops:
+     provider: slack
+     default_channel_id: C0123456789
+     slack:
+       bot_token_env: SLACK_BOT_TOKEN
+       app_token_env: SLACK_APP_TOKEN  # NEW — Socket Mode app-level token
+   ```
+
+   Inline values also work via the `{ value: "..." }` form, matching the existing `bot_token` pattern.
+6. Restart the daemon. You should see the log line `slack inbound: connected` shortly after startup.
+
+By default the inbound listener honours commands in any channel already used by the outbound side — the union of every `repositories[].chatops_channel_id` plus `chatops.default_channel_id`. Operators who want a separate listen-only channel add it to the optional `chatops.slack.listen_channels` list. Messages from channels outside this allowlist are silently dropped (no `?` reaction either — silent drop keeps the bot's presence invisible in channels it is not authorized to command from).
 
 #### Repo substring matching
 
@@ -450,9 +483,9 @@ Success replies are one line beginning with `✓`. Error replies are one line be
 ✗ no repo matched 'gibberish'; configured: myrepo, widgets
 ```
 
-#### Unrecognised verbs are silently ignored
+#### Unrecognised verbs get a `?` reaction, no text reply
 
-Random chat that happens to mention the bot but doesn't match a known verb (typos, drive-by mentions, AskUser-thread replies, etc.) is ignored — no error reply. This keeps the channel quiet during normal use and reserves the `✗` shape for actionable, operator-initiated failures.
+Random chat that happens to mention the bot but doesn't match a known verb (typos, drive-by mentions, AskUser-thread replies, etc.) gets a single `?`-emoji reaction on the original message — no text reply, no thread spam. The reaction is a quiet "this didn't parse" signal: discoverable for the operator who typed the command, ignorable for everyone else. Type `@<bot> help` for the current verb list.
 
 The verbs `pause`, `resume`, and `clear-alert-throttle` are intentionally not in this initial set. If your operator workflow needs them, file a follow-up issue describing the usage pattern.
 

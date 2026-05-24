@@ -10,10 +10,16 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
-use crate::config::{ChatOpsConfig, ChatOpsProvider, SecretSource};
+use crate::chatops::operator_commands::{
+    OperatorCommandDispatcher, RepoIdentity, RepoIdentityProvider,
+};
+use crate::config::{ChatOpsConfig, ChatOpsProvider, RepositoryConfig, SecretSource};
 
 pub mod discord;
 pub mod matrix;
@@ -85,6 +91,112 @@ pub trait ChatOpsBackend: Send + Sync {
     /// Post a plain-text notification (no question prefix, no reply
     /// threading). Used for start-of-work and throttled failure alerts.
     async fn post_notification(&self, channel: &str, text: &str) -> Result<()>;
+
+    /// Post `text` as a threaded reply to the message at `(channel,
+    /// thread_ts)`. Used by the inbound operator-commands listener so
+    /// `Sync` replies stay grouped under the original `@bot <verb>`
+    /// message rather than spilling into channel-level chatter.
+    ///
+    /// Default impl returns an error whose text names the provider —
+    /// only backends that override `start_inbound_listener` need to
+    /// implement this.
+    #[allow(dead_code)] // trait method called only via inbound-listener override
+    async fn post_threaded_reply(
+        &self,
+        _channel: &str,
+        _thread_ts: &str,
+        _text: &str,
+    ) -> Result<()> {
+        Err(anyhow!(
+            "backend `{}` does not support threaded replies",
+            self.provider_name()
+        ))
+    }
+
+    /// Add the reaction emoji `name` (without surrounding colons) to
+    /// the message at `(channel, message_ts)`. Used by the inbound
+    /// operator-commands listener to react with `?` on unrecognized
+    /// messages instead of posting a text reply.
+    ///
+    /// Default impl returns an error whose text names the provider.
+    #[allow(dead_code)] // trait method called only via inbound-listener override
+    async fn add_reaction(
+        &self,
+        _channel: &str,
+        _message_ts: &str,
+        _name: &str,
+    ) -> Result<()> {
+        Err(anyhow!(
+            "backend `{}` does not support reactions",
+            self.provider_name()
+        ))
+    }
+
+    /// Spawn the inbound listener task for this backend. The default
+    /// implementation returns an error naming the provider so backends
+    /// that have not opted in to inbound listening continue to compile
+    /// and run unchanged.
+    ///
+    /// The listener:
+    ///   - subscribes to provider-native mention events
+    ///   - applies the drop-before-dispatch filters (channel allowlist,
+    ///     self-author, bot-author, leading-mention)
+    ///   - calls `dispatcher.handle_message` on every surviving event
+    ///   - routes the returned `Option<Reply>` through
+    ///     `post_threaded_reply` (text replies) or `add_reaction`
+    ///     (unrecognized → `?`)
+    ///   - exits when `cancel` fires (or earlier on unrecoverable error)
+    async fn start_inbound_listener(
+        &self,
+        _dispatcher: Arc<OperatorCommandDispatcher>,
+        _repos: Arc<dyn RepoIdentityProvider>,
+        _allowed_channels: Arc<HashSet<String>>,
+        _cancel: CancellationToken,
+    ) -> Result<JoinHandle<()>> {
+        Err(anyhow!(
+            "backend `{}` does not support inbound messages",
+            self.provider_name()
+        ))
+    }
+}
+
+/// `RepoIdentityProvider` newtype over the daemon's per-repo
+/// `Arc<ArcSwap<RepositoryConfig>>` map. The projection from
+/// `RepositoryConfig` to `RepoIdentity` (URL + workspace_path only)
+/// lives inside `snapshot()` so the inbound listener — and any code
+/// the listener calls — can never observe tokens, channel IDs, or
+/// any other config field. Any future field added to
+/// `RepositoryConfig` is not automatically widened into the listener's
+/// view.
+pub struct TaskMapRepoIdentities {
+    inner: Arc<dyn Fn() -> Vec<RepositoryConfig> + Send + Sync>,
+}
+
+impl TaskMapRepoIdentities {
+    /// Construct from a closure that returns the current list of
+    /// `RepositoryConfig` values. The closure is invoked once per
+    /// `snapshot()` call (i.e. once per inbound command), so it should
+    /// be cheap — typically an `ArcSwap` load.
+    pub fn new<F>(snapshotter: F) -> Self
+    where
+        F: Fn() -> Vec<RepositoryConfig> + Send + Sync + 'static,
+    {
+        Self {
+            inner: Arc::new(snapshotter),
+        }
+    }
+}
+
+impl RepoIdentityProvider for TaskMapRepoIdentities {
+    fn snapshot(&self) -> Vec<RepoIdentity> {
+        (self.inner)()
+            .iter()
+            .map(|r| RepoIdentity {
+                url: r.url.clone(),
+                workspace_path: crate::workspace::resolve_path(r),
+            })
+            .collect()
+    }
 }
 
 /// Resolve a secret from an inline value or an env var name, honoring the
@@ -132,9 +244,25 @@ pub async fn from_config(cfg: &ChatOpsConfig) -> Result<Arc<dyn ChatOpsBackend>>
                 sub.bot_token_env.as_deref(),
                 "chatops.slack.bot_token",
             )?;
-            let backend = SlackBackend::new(token)
+            let app_token = if sub.app_token.is_some() || sub.app_token_env.is_some() {
+                Some(resolve_inline_or_env(
+                    sub.app_token.as_ref(),
+                    sub.app_token_env.as_deref(),
+                    "chatops.slack.app_token",
+                )?)
+            } else {
+                None
+            };
+            crate::config::warn_on_unexpected_slack_token_prefixes(
+                Some(token.as_str()),
+                app_token.as_deref(),
+            );
+            let mut backend = SlackBackend::new(token)
                 .await
                 .context("initializing Slack backend from config")?;
+            if let Some(at) = app_token {
+                backend = backend.with_app_token(at);
+            }
             Ok(Arc::new(backend))
         }
         ChatOpsProvider::Discord => {
@@ -384,5 +512,150 @@ mod tests {
         assert_eq!(urlencode("abc_DEF-1.2~"), "abc_DEF-1.2~");
         assert_eq!(urlencode("a b"), "a%20b");
         assert_eq!(urlencode("$abc:server.tld"), "%24abc%3Aserver.tld");
+    }
+
+    // ====================================================================
+    // ChatOpsBackend default trait method tests
+    // ====================================================================
+
+    use std::collections::HashSet;
+    use std::sync::Arc as StdArc;
+
+    /// A minimal `ChatOpsBackend` impl that does not override any of
+    /// the inbound-listener / threaded-reply / reaction methods. Used
+    /// to assert the default impls return an `unsupported` error whose
+    /// text contains the provider name.
+    struct StubBackend(&'static str);
+
+    #[async_trait]
+    impl ChatOpsBackend for StubBackend {
+        fn provider_name(&self) -> &'static str {
+            self.0
+        }
+        fn is_experimental(&self) -> bool {
+            true
+        }
+        async fn post_question(
+            &self,
+            _channel: &str,
+            _change: &str,
+            _question: &str,
+        ) -> Result<String> {
+            unreachable!()
+        }
+        async fn poll_thread_for_human_reply(
+            &self,
+            _channel: &str,
+            _handle: &str,
+        ) -> Result<Option<HumanReply>> {
+            unreachable!()
+        }
+        async fn post_notification(&self, _channel: &str, _text: &str) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn default_inbound_listener_errors_with_provider_name() {
+        let backend = StubBackend("stubbo");
+        let dispatcher = StdArc::new(OperatorCommandDispatcher::new());
+        let repos: StdArc<dyn RepoIdentityProvider> =
+            StdArc::new(TaskMapRepoIdentities::new(Vec::new));
+        let channels = StdArc::new(HashSet::<String>::new());
+        let err = backend
+            .start_inbound_listener(
+                dispatcher,
+                repos,
+                channels,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect_err("stub backend has no inbound listener");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("stubbo"), "error names backend: {msg}");
+        assert!(msg.to_lowercase().contains("unsupported") || msg.contains("not support"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn default_post_threaded_reply_errors_with_provider_name() {
+        let backend = StubBackend("stubbo");
+        let err = backend
+            .post_threaded_reply("C", "1.0", "x")
+            .await
+            .expect_err("default impl must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("stubbo"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn default_add_reaction_errors_with_provider_name() {
+        let backend = StubBackend("stubbo");
+        let err = backend
+            .add_reaction("C", "1.0", "question")
+            .await
+            .expect_err("default impl must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("stubbo"), "{msg}");
+    }
+
+    // ====================================================================
+    // RepoIdentityProvider projection tests
+    // ====================================================================
+
+    fn fixture_repo_config(url: &str) -> RepositoryConfig {
+        RepositoryConfig {
+            url: url.to_string(),
+            local_path: Some(PathBuf::from("/tmp/ws/fixture")),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: Some("C_SECRET_NEVER_VISIBLE".into()),
+            max_changes_per_pr: None,
+            audits: None,
+        }
+    }
+
+    #[test]
+    fn repo_identity_provider_only_exposes_url_and_workspace_path() {
+        let provider = TaskMapRepoIdentities::new(|| {
+            vec![
+                fixture_repo_config("git@github.com:acme/a.git"),
+                fixture_repo_config("git@github.com:acme/b.git"),
+            ]
+        });
+        let snapshot: Vec<RepoIdentity> = provider.snapshot();
+        assert_eq!(snapshot.len(), 2);
+
+        // Compile-time guarantee: the type is RepoIdentity, NOT
+        // RepositoryConfig. We can only read `url` and
+        // `workspace_path`. The `chatops_channel_id`, `poll_interval_sec`,
+        // and `audits` fields from RepositoryConfig do not exist on
+        // RepoIdentity. The two-field shape is enforced by the type
+        // system, so this assertion is partly redundant — but it also
+        // catches a future regression where someone widens RepoIdentity
+        // and writes the chatops_channel_id into it.
+        assert_eq!(snapshot[0].url, "git@github.com:acme/a.git");
+        assert_eq!(snapshot[0].workspace_path, PathBuf::from("/tmp/ws/fixture"));
+        assert_eq!(snapshot[1].url, "git@github.com:acme/b.git");
+    }
+
+    #[test]
+    fn repo_identity_provider_reflects_underlying_state_changes() {
+        // The closure is invoked once per snapshot, so updating shared
+        // state changes the result. This models the production case
+        // where the daemon's `ArcSwap` holds the latest config.
+        use std::sync::Mutex as StdMutex;
+        let state: StdArc<StdMutex<Vec<RepositoryConfig>>> =
+            StdArc::new(StdMutex::new(vec![fixture_repo_config(
+                "git@github.com:acme/a.git",
+            )]));
+        let state_for_closure = state.clone();
+        let provider = TaskMapRepoIdentities::new(move || {
+            state_for_closure.lock().unwrap().clone()
+        });
+        assert_eq!(provider.snapshot().len(), 1);
+
+        state.lock().unwrap().push(fixture_repo_config("git@github.com:acme/b.git"));
+        assert_eq!(provider.snapshot().len(), 2);
     }
 }
