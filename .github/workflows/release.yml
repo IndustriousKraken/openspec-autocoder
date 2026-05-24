@@ -25,7 +25,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Lint workflows with actionlint
-        uses: rhysd/actionlint@v1
+        shell: bash
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
 
   test:
     name: cargo test
