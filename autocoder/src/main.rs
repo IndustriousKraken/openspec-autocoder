@@ -21,7 +21,6 @@ mod perma_stuck;
 mod polling_loop;
 mod queue;
 mod spec_revision;
-mod spec_sync;
 mod workspace;
 
 #[tokio::main]

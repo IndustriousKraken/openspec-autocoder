@@ -67,11 +67,6 @@ pub struct InstallArgs {
     pub reviewer_model: Option<String>,
 
     // ---------- audits ----------
-    /// Cadence for `spec_sync_audit`. Default `daily` (the conservative
-    /// recommended default — cheap, defensive, no LLM cost).
-    #[arg(long, value_enum)]
-    pub audits_spec_sync: Option<AuditCadenceArg>,
-
     /// Master switch for the LLM-driven audits (architecture_brightline,
     /// architecture_consultative, drift_audit, missing_tests_audit,
     /// security_bug_audit). Default `none`.
@@ -157,7 +152,6 @@ impl AuditCadenceArg {
 
 /// Slugs of the audits the wizard knows about. The order is the order they
 /// appear in the per-audit walk-through.
-pub const SPEC_SYNC_SLUG: &str = "spec_sync_audit";
 pub const LLM_DRIVEN_SLUGS: &[(&str, Cadence)] = &[
     ("architecture_brightline", Cadence::Weekly),
     ("drift_audit", Cadence::Weekly),
@@ -178,9 +172,6 @@ fn audit_description(slug: &str) -> &'static str {
         "drift_audit" => "spec ↔ code drift detection (warns when reality outgrows the spec)",
         "missing_tests_audit" => "proposes test coverage for untested branches",
         "security_bug_audit" => "proposes fixes for likely security bugs",
-        "spec_sync_audit" => {
-            "backfills drift between archived changes and canonical openspec/specs/ files"
-        }
         _ => "",
     }
 }
@@ -210,7 +201,6 @@ pub struct WizardPrefill {
     pub chatops_channel_id: Option<String>,
     pub reviewer_provider: Option<ReviewerProviderArg>,
     pub reviewer_model: Option<String>,
-    pub audits_spec_sync: Option<AuditCadenceArg>,
     pub audits_llm_driven: Option<LlmDrivenAuditsArg>,
     pub audit_architecture_brightline: Option<AuditCadenceArg>,
     pub audit_architecture_consultative: Option<AuditCadenceArg>,
@@ -748,6 +738,7 @@ pub async fn run_wizard(
     }
 
     let audits = run_audit_prompts(io).await?;
+    print_openspec_sync_prereq(io);
 
     Ok(WizardAnswers {
         repo_url,
@@ -766,10 +757,12 @@ pub async fn run_wizard(
     })
 }
 
-/// Walk the operator through the periodic-audit prompts. See the
-/// `Install wizard configures periodic audits` requirement for the full
-/// three-tier UX. Returns a map of audit slug → resolved cadence; absent
-/// or `Disabled` entries are dropped before YAML emit.
+/// Walk the operator through the LLM-driven-audit prompts. Returns a map of
+/// audit slug → resolved cadence; absent or `Disabled` entries are dropped
+/// before YAML emit. The canonical-spec sync step is no longer represented
+/// here — autocoder's archive operation shells out to `openspec archive`,
+/// which performs the spec merge directly when the host's openspec profile
+/// has the `sync` workflow enabled (see [`print_openspec_sync_prereq`]).
 async fn run_audit_prompts(io: &mut dyn WizardIo) -> Result<HashMap<String, Cadence>> {
     let mut audits: HashMap<String, Cadence> = HashMap::new();
 
@@ -777,23 +770,6 @@ async fn run_audit_prompts(io: &mut dyn WizardIo) -> Result<HashMap<String, Cade
     io.print(
         "  autocoder ships several optional audits that run on a configurable cadence.\n",
     );
-    io.print(&format!(
-        "\n  {SPEC_SYNC_SLUG} ({}, recommended ON)\n",
-        audit_description(SPEC_SYNC_SLUG)
-    ));
-
-    let spec_sync = ask_audit_cadence(
-        io,
-        "Enable spec_sync_audit?",
-        Cadence::Daily,
-        /* show_disabled_as = */ "never",
-    )
-    .await?;
-    if spec_sync == Cadence::Disabled {
-        // Operator declined spec-sync → skip the rest entirely.
-        return Ok(audits);
-    }
-    audits.insert(SPEC_SYNC_SLUG.to_string(), spec_sync);
 
     io.print("\n  LLM-driven audits (call the agent CLI; have token cost). Includes:\n");
     for (slug, _) in LLM_DRIVEN_SLUGS {
@@ -833,6 +809,23 @@ async fn run_audit_prompts(io: &mut dyn WizardIo) -> Result<HashMap<String, Cade
         }
     }
     Ok(audits)
+}
+
+/// Print the openspec-sync prerequisite note. autocoder's archive operation
+/// shells out to `openspec archive`, which only merges change deltas into
+/// canonical capability specs when the host's openspec profile has the
+/// `sync` workflow enabled.
+fn print_openspec_sync_prereq(io: &mut dyn WizardIo) {
+    io.print(
+        "\nOpenSpec sync prerequisite\n  \
+         autocoder's archive step shells out to `openspec archive`, which performs\n  \
+         both the file move AND the merge of change deltas into canonical capability\n  \
+         specs — but the merge step is only available when the `Sync specs` workflow\n  \
+         is enabled in the openspec profile. Run `openspec config profile` once on\n  \
+         this host and enable `Sync specs`. Without it, `openspec archive` still\n  \
+         moves the change directory, but canonical specs under `openspec/specs/` are\n  \
+         not updated and drift accumulates over iterations.\n",
+    );
 }
 
 /// Prompt for a cadence using the wizard's compact `[d]aily / [w]eekly /
@@ -1149,7 +1142,6 @@ pub(crate) async fn execute_inner(
         chatops_channel_id: args.chatops_channel_id.clone(),
         reviewer_provider: args.reviewer_provider,
         reviewer_model: args.reviewer_model.clone(),
-        audits_spec_sync: args.audits_spec_sync,
         audits_llm_driven: args.audits_llm_driven,
         audit_architecture_brightline: args.audit_architecture_brightline,
         audit_architecture_consultative: args.audit_architecture_consultative,
@@ -1330,27 +1322,20 @@ fn prefill_to_answers(p: &WizardPrefill) -> Result<WizardAnswers> {
     })
 }
 
-/// Resolve audit cadences from `--audits-*` flags. Implements the precedence
-/// documented in the change spec:
-/// - `--audits-spec-sync` defaults to `daily` (the conservative recommended
-///   default) so existing IaC scripts that pre-date this change keep working.
-/// - `--audits-llm-driven` is the master switch. `none` (default) keeps every
-///   LLM-driven audit disabled regardless of any per-audit overrides;
-///   `all-disabled` behaves identically but prints a one-line acknowledgement
-///   to stdout (so IaC logs can distinguish explicit opt-out from "operator
-///   forgot to pass the flag"); `recommended` enables every LLM-driven audit
-///   at its recommended cadence, with per-audit `--audit-<slug>` flags
-///   overriding individual cadences.
+/// Resolve audit cadences from `--audits-*` flags. The canonical-spec
+/// sync step is no longer represented as an audit; it is performed by
+/// `openspec archive` itself when the host has the `sync` workflow
+/// enabled (see [`print_openspec_sync_prereq`]).
+///
+/// `--audits-llm-driven` is the master switch. `none` (default) keeps every
+/// LLM-driven audit disabled regardless of any per-audit overrides;
+/// `all-disabled` behaves identically but prints a one-line acknowledgement
+/// to stdout (so IaC logs can distinguish explicit opt-out from "operator
+/// forgot to pass the flag"); `recommended` enables every LLM-driven audit
+/// at its recommended cadence, with per-audit `--audit-<slug>` flags
+/// overriding individual cadences.
 pub(crate) fn resolve_non_interactive_audits(p: &WizardPrefill) -> HashMap<String, Cadence> {
     let mut out: HashMap<String, Cadence> = HashMap::new();
-    let spec_sync = p
-        .audits_spec_sync
-        .map(AuditCadenceArg::to_cadence)
-        .unwrap_or(Cadence::Daily);
-    if spec_sync != Cadence::Disabled {
-        out.insert(SPEC_SYNC_SLUG.to_string(), spec_sync);
-    }
-
     let llm = p.audits_llm_driven.unwrap_or(LlmDrivenAuditsArg::None);
     match llm {
         LlmDrivenAuditsArg::None => {
@@ -1435,8 +1420,8 @@ mod tests {
     async fn wizard_collects_minimum_essential_fields() {
         // answers in order: repo, base, agent, poll, token env, PAT,
         // chatops choice "1" (none), reviewer choice "1" (none),
-        // then the two default-path audit answers (bare-Enter on spec-sync
-        // → daily; bare-Enter on the LLM gate → no).
+        // then the single default-path audit answer (bare-Enter on the
+        // LLM gate → no).
         let mut io = ScriptedIo::new(vec![
             "git@github.com:acme/widgets.git",
             "main",
@@ -1446,7 +1431,6 @@ mod tests {
             "ghp_test",
             "1",
             "1",
-            "",
             "",
         ]);
         let prefill = WizardPrefill::default();
@@ -1677,45 +1661,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wizard_audits_default_path_enables_spec_sync_only() {
+    async fn wizard_audits_default_path_enables_no_audits() {
         let mut answers = baseline_wizard_answers();
-        // Bare-Enter on spec-sync cadence (→ daily), bare-Enter on LLM gate
-        // (→ no).
-        answers.push("");
+        // Bare-Enter on the LLM gate (→ no audits enabled by default).
         answers.push("");
         let mut io = ScriptedIo::new(answers);
         let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
             .await
             .unwrap();
-        assert_eq!(ans.audits.get(SPEC_SYNC_SLUG), Some(&Cadence::Daily));
-        assert_eq!(ans.audits.len(), 1, "only spec-sync should be present");
-
+        assert!(
+            ans.audits.is_empty(),
+            "default path must enable no audits; got {:?}",
+            ans.audits
+        );
         let cfg = assemble_config(&ans).unwrap();
-        let audits = cfg.audits.as_ref().expect("audits block present");
-        assert_eq!(audits.defaults.len(), 1);
-        assert_eq!(audits.defaults.get(SPEC_SYNC_SLUG), Some(&Cadence::Daily));
+        assert!(cfg.audits.is_none(), "no enabled audits → no audits: block");
         let yaml = serialize_config(&cfg).unwrap();
-        assert!(yaml.contains("spec_sync_audit: daily"), "YAML missing spec-sync entry:\n{yaml}");
+        assert!(
+            !yaml.contains("spec_sync_audit"),
+            "YAML must not reference the removed spec_sync_audit slug:\n{yaml}"
+        );
         for (slug, _) in LLM_DRIVEN_SLUGS {
             assert!(
                 !yaml.contains(&format!("{slug}:")),
                 "YAML must not list {slug}:\n{yaml}"
             );
         }
+        // The wizard prints the openspec-sync prerequisite note.
+        let printed = io.output_str();
+        assert!(
+            printed.contains("openspec config profile"),
+            "wizard should print the openspec sync prerequisite note; got:\n{printed}"
+        );
     }
 
     #[tokio::test]
-    async fn wizard_audits_fast_path_enables_all_six() {
+    async fn wizard_audits_fast_path_enables_all_five() {
         let mut answers = baseline_wizard_answers();
-        // spec-sync default (daily), LLM gate yes, fast-path default Y.
-        answers.push(""); // spec-sync cadence
+        // LLM gate yes, fast-path default Y.
         answers.push("y"); // LLM gate
         answers.push(""); // fast-path (default Y)
         let mut io = ScriptedIo::new(answers);
         let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
             .await
             .unwrap();
-        assert_eq!(ans.audits.get(SPEC_SYNC_SLUG), Some(&Cadence::Daily));
         for (slug, rec) in LLM_DRIVEN_SLUGS {
             assert_eq!(
                 ans.audits.get(*slug),
@@ -1726,19 +1715,18 @@ mod tests {
         }
         let cfg = assemble_config(&ans).unwrap();
         let audits = cfg.audits.as_ref().expect("audits block present");
-        assert_eq!(audits.defaults.len(), 6, "all six audits must be present");
+        assert_eq!(audits.defaults.len(), 5, "all five LLM audits must be present");
     }
 
     #[tokio::test]
     async fn wizard_audits_per_audit_cadence_choices_respected() {
         let mut answers = baseline_wizard_answers();
-        // spec-sync weekly, LLM y, fast-path n, per-audit walk:
+        // LLM y, fast-path n, per-audit walk:
         //   architecture_brightline: daily
         //   drift_audit: monthly
         //   missing_tests_audit: weekly
         //   security_bug_audit: never
         //   architecture_consultative: daily
-        answers.push("w");
         answers.push("y");
         answers.push("n");
         answers.push("d"); // architecture_brightline
@@ -1750,7 +1738,6 @@ mod tests {
         let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
             .await
             .unwrap();
-        assert_eq!(ans.audits.get(SPEC_SYNC_SLUG), Some(&Cadence::Weekly));
         assert_eq!(ans.audits.get("architecture_brightline"), Some(&Cadence::Daily));
         assert_eq!(ans.audits.get("drift_audit"), Some(&Cadence::Monthly));
         assert_eq!(ans.audits.get("missing_tests_audit"), Some(&Cadence::Weekly));
@@ -1759,33 +1746,6 @@ mod tests {
         assert_eq!(
             ans.audits.get("architecture_consultative"),
             Some(&Cadence::Daily)
-        );
-    }
-
-    #[tokio::test]
-    async fn wizard_audits_decline_spec_sync_skips_all_audit_prompts() {
-        let mut answers = baseline_wizard_answers();
-        answers.push("n"); // decline spec-sync
-        let mut io = ScriptedIo::new(answers);
-        let ans = run_wizard(&mut io, InstallMode::Dev, &WizardPrefill::default())
-            .await
-            .unwrap();
-        assert!(
-            ans.audits.is_empty(),
-            "declining spec-sync must skip every audit; got {:?}",
-            ans.audits
-        );
-        assert!(
-            io.answers.is_empty(),
-            "no further audit prompts should have been emitted; remaining queue: {:?}",
-            io.answers
-        );
-        let cfg = assemble_config(&ans).unwrap();
-        assert!(cfg.audits.is_none(), "no enabled audits → no audits: block");
-        let yaml = serialize_config(&cfg).unwrap();
-        assert!(
-            !yaml.contains("\naudits:"),
-            "YAML must omit the audits: block:\n{yaml}"
         );
     }
 
@@ -1807,7 +1767,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_interactive_no_audit_flags_enables_spec_sync_daily_default() {
+    async fn non_interactive_no_audit_flags_enables_no_audits_by_default() {
         let tmp = TempDir::new().unwrap();
         let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
         let mut io = ScriptedIo::new(vec![]);
@@ -1817,8 +1777,8 @@ mod tests {
             .unwrap();
         let yaml = load_yaml(&tmp);
         assert!(
-            yaml.contains("spec_sync_audit: daily"),
-            "yaml must include spec-sync daily:\n{yaml}"
+            !yaml.contains("spec_sync_audit"),
+            "yaml must not reference removed spec_sync_audit slug:\n{yaml}"
         );
         for (slug, _) in LLM_DRIVEN_SLUGS {
             assert!(
@@ -1829,7 +1789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_interactive_audits_llm_driven_recommended_enables_all_six() {
+    async fn non_interactive_audits_llm_driven_recommended_enables_all_five() {
         let tmp = TempDir::new().unwrap();
         let actions = RecordingActions::new().with_which("claude", Some(PathBuf::from("/c")));
         let mut io = ScriptedIo::new(vec![]);
@@ -1841,7 +1801,10 @@ mod tests {
             .await
             .unwrap();
         let yaml = load_yaml(&tmp);
-        assert!(yaml.contains("spec_sync_audit: daily"), "{yaml}");
+        assert!(
+            !yaml.contains("spec_sync_audit"),
+            "yaml must not reference removed spec_sync_audit slug:\n{yaml}"
+        );
         for (slug, rec) in LLM_DRIVEN_SLUGS {
             let expected = format!("{slug}: {}", cadence_label(*rec));
             assert!(
@@ -1896,6 +1859,9 @@ mod tests {
             !yaml.contains("architecture_brightline:"),
             "master switch `none` must override per-audit flag:\n{yaml}"
         );
-        assert!(yaml.contains("spec_sync_audit: daily"));
+        assert!(
+            !yaml.contains("spec_sync_audit"),
+            "yaml must not reference removed spec_sync_audit slug:\n{yaml}"
+        );
     }
 }

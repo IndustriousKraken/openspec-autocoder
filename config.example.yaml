@@ -210,13 +210,12 @@ github:
 #   #   access_token_env: MATRIX_ACCESS_TOKEN
 
 # Periodic audits — long-cycle background checks orchestrated by the
-# daemon between regular polling iterations. Six audits ship today:
+# daemon between regular polling iterations. Five audits ship today:
 #   - architecture_brightline    — flags files exceeding a line-count threshold
 #   - drift_audit                — detects spec/code drift via LLM scan
 #   - missing_tests_audit        — proposes test coverage for untested code
 #   - security_bug_audit         — LLM scan for security smells
 #   - architecture_consultative  — LLM architectural-health review
-#   - spec_sync_audit            — merges archived-change deltas into canonical specs
 #
 # Cadence vocabulary (per audit; default `disabled`):
 #   disabled | daily | every-N-days | weekly | monthly | quarterly
@@ -234,7 +233,6 @@ github:
 #     missing_tests_audit: monthly
 #     security_bug_audit: weekly
 #     architecture_consultative: quarterly
-#     spec_sync_audit: daily
 #
 #   # Per-audit knobs. `prompt_path` overrides the audit's embedded LLM
 #   # prompt template. `notify_on_clean` toggles a brief "no findings"
@@ -265,7 +263,3 @@ github:
 #       # prompt_path: /etc/autocoder/prompts/arch-consult.md
 #       notify_on_clean: false
 #       extra: {}
-#     spec_sync_audit:
-#       # No `extra` knobs in v1; the empty mapping signals the audit
-#       # takes default settings.
-#       {}
