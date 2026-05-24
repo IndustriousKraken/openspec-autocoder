@@ -20,7 +20,6 @@ pub mod drift;
 pub mod missing_tests;
 pub mod scheduler;
 pub mod security_bug;
-pub mod spec_sync;
 pub mod specs_writing;
 pub mod state;
 
@@ -50,14 +49,6 @@ pub enum WritePolicy {
     /// `openspec/changes/`. Violations revert the entire diff via
     /// `git reset --hard HEAD` + `git clean -fd` + chatops alert.
     OpenSpecOnly,
-    /// Canonical-spec merge audit. Sandbox allows `Write`/`Edit`.
-    /// Post-hoc check requires every modified or new path to begin
-    /// with `openspec/specs/`. Violations revert the entire diff via
-    /// `git reset --hard HEAD` + `git clean -fd` + chatops alert.
-    /// This is a strict, narrow grant for audits whose only legal
-    /// output is updates to canonical capability specs (see
-    /// `spec_sync_audit`).
-    CanonicalSpecMerge,
     /// Full write access. Reserved for future audits with broader
     /// scope; not used by any audit landing in the foundation.
     Approved,
@@ -509,7 +500,6 @@ mod tests {
                 &audit_settings,
                 &executor,
             )),
-            Arc::new(crate::audits::spec_sync::SpecSyncAudit::new()),
         ];
         for a in &audits {
             let d = a.description();

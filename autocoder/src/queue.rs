@@ -269,9 +269,13 @@ pub fn would_collide_on_archive(workspace: &Path, change: &str) -> bool {
     archive_collision_path(workspace, change).exists()
 }
 
-/// Move `<workspace>/openspec/changes/<change>/` to
-/// `<workspace>/openspec/changes/archive/<UTC YYYY-MM-DD>-<change>/`.
-/// Errors if the destination already exists.
+/// Archive `<change>` by invoking `openspec archive <change> -y` as a
+/// subprocess in `workspace`. The subprocess both moves the change
+/// directory to `openspec/changes/archive/<UTC YYYY-MM-DD>-<change>/` AND
+/// merges the change's deltas into the canonical `openspec/specs/<cap>/`
+/// files (when the host's openspec profile has the `sync` workflow
+/// enabled). Returns Err with the openspec stderr on non-zero exit; the
+/// source directory is left in place for the operator to investigate.
 pub fn archive(workspace: &Path, change: &str) -> Result<()> {
     let src = change_dir(workspace, change);
     if !src.is_dir() {
@@ -280,20 +284,27 @@ pub fn archive(workspace: &Path, change: &str) -> Result<()> {
             src.display()
         ));
     }
-    let archive_root = changes_dir(workspace).join(ARCHIVE_DIR);
-    std::fs::create_dir_all(&archive_root)
-        .with_context(|| format!("creating archive dir {}", archive_root.display()))?;
-    let dated_name = format!("{}-{change}", Utc::now().format("%Y-%m-%d"));
-    let dst = archive_root.join(&dated_name);
-    if dst.exists() {
-        return Err(anyhow!(
-            "archive destination already exists: {}",
-            dst.display()
-        ));
+    let output = std::process::Command::new("openspec")
+        .args(["archive", change, "-y"])
+        .current_dir(workspace)
+        .output();
+    match output {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(anyhow!(
+                "openspec archive `{change}` exited {code:?}: {stderr}",
+                code = out.status.code(),
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
+            "openspec not found on PATH while archiving `{change}`; \
+             install openspec and ensure the daemon's PATH covers its install directory"
+        )),
+        Err(e) => Err(anyhow!(
+            "spawning `openspec archive {change} -y` errored: {e}"
+        )),
     }
-    std::fs::rename(&src, &dst)
-        .with_context(|| format!("renaming {} to {}", src.display(), dst.display()))?;
-    Ok(())
 }
 
 /// Move the most-recently-archived directory matching
@@ -459,7 +470,33 @@ mod tests {
     }
 
     #[test]
-    fn archive_round_trip() {
+    fn archive_missing_source_errors_without_invoking_openspec() {
+        // Pure input-validation check: if the active change directory
+        // doesn't exist, `archive` returns Err before spawning openspec.
+        // This unit-tests the only Err branch reachable without a real
+        // openspec binary on PATH.
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        let err = archive(ws, "never-existed").expect_err("missing source must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("never-existed"),
+            "error must name the change: {msg}"
+        );
+        assert!(
+            msg.contains("not found"),
+            "error must explain why: {msg}"
+        );
+    }
+
+    /// End-to-end archive via the real `openspec` binary. Requires
+    /// openspec on PATH and the host's profile to have the `sync`
+    /// workflow enabled for the canonical-spec merge to fire. Marked
+    /// `#[ignore]` so `cargo test` skips it on hosts without openspec;
+    /// run with `cargo test -- --ignored` to exercise.
+    #[test]
+    #[ignore]
+    fn archive_round_trip_via_openspec_cli() {
         let dir = TempDir::new().unwrap();
         let ws = dir.path();
         make_change(ws, "feature-a");
@@ -479,22 +516,6 @@ mod tests {
             regex.is_match(name),
             "archived name should be date-prefixed: {name}"
         );
-    }
-
-    #[test]
-    fn archive_collision_errors() {
-        let dir = TempDir::new().unwrap();
-        let ws = dir.path();
-        make_change(ws, "feature-a");
-        // Pre-create a collision in the archive.
-        let dated = format!("{}-feature-a", Utc::now().format("%Y-%m-%d"));
-        let pre = ws.join(CHANGES_SUBDIR).join(ARCHIVE_DIR).join(&dated);
-        std::fs::create_dir_all(&pre).unwrap();
-        let err = archive(ws, "feature-a").expect_err("collision should fail");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("already exists"), "got: {msg}");
-        // Source must still be in place (not deleted).
-        assert!(ws.join(CHANGES_SUBDIR).join("feature-a").exists());
     }
 
     #[test]
