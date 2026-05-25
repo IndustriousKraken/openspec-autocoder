@@ -45,6 +45,12 @@ pub struct BusyMarker {
     pub comm: String,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub stage: Stage,
+    /// Slug of the OpenSpec change the daemon is currently working on.
+    /// Set via `busy_marker::update_change` after the queue walk picks a
+    /// change; empty between acquire and first change-selection (when
+    /// the `status` peek will fall back to `currently: idle`).
+    #[serde(default)]
+    pub change: String,
 }
 
 /// Outcome of `try_acquire`. Acquired means the caller owns the marker and
@@ -78,6 +84,7 @@ impl BusyGuard {
         self.contents.stage = stage;
         write_atomic(&self.path, &self.contents)
     }
+
 }
 
 impl Drop for BusyGuard {
@@ -143,6 +150,77 @@ pub fn write_subprocess_marker(workspace: &Path, pid: u32) -> Result<()> {
         )
     })?;
     Ok(())
+}
+
+/// Best-effort update of the `change` field on the existing busy
+/// marker for `workspace`. Used by the per-iteration change-processing
+/// loop to record which change is currently running so the chatops
+/// `status` reply can show `currently: working on <change>`.
+///
+/// Implementation: read the JSON, mutate the field, write atomically.
+/// The daemon holds exactly one in-flight pass per repo (the polling
+/// task is single-threaded), so the read-modify-write is race-free
+/// against the same daemon's own writes. A missing or malformed marker
+/// is logged at DEBUG and ignored — the status reply gracefully
+/// degrades to `currently: idle`.
+pub fn update_change(workspace: &Path, change: &str) {
+    let path = marker_path(workspace);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(
+                path = %path.display(),
+                "busy_marker::update_change: read failed (marker absent?): {e}"
+            );
+            return;
+        }
+    };
+    let mut marker: BusyMarker = match serde_json::from_str(&raw) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(
+                path = %path.display(),
+                "busy_marker::update_change: parse failed: {e}"
+            );
+            return;
+        }
+    };
+    change.clone_into(&mut marker.change);
+    if let Err(e) = write_atomic(&path, &marker) {
+        tracing::debug!(
+            path = %path.display(),
+            "busy_marker::update_change: write failed: {e:#}"
+        );
+    }
+}
+
+/// Read-only peek at the busy-marker file for `workspace`. Returns
+/// `Some(BusySummary)` with the recorded change slug and the marker
+/// file's mtime as `started_at` when a marker file exists AND has a
+/// non-empty `change` field; returns `None` when the file is absent,
+/// unreadable, malformed, or its `change` field is empty (acquired but
+/// no change selected yet).
+///
+/// Does NOT take, hold, or release the marker — purely informational.
+/// Used by the chatops `status <repo>` verb to render the
+/// `currently: working on <change>` line.
+pub fn current(
+    workspace: &Path,
+) -> Option<crate::chatops::operator_commands::BusySummary> {
+    let path = marker_path(workspace);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let marker: BusyMarker = serde_json::from_str(&raw).ok()?;
+    if marker.change.trim().is_empty() {
+        return None;
+    }
+    let mtime = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()?;
+    let started_at: chrono::DateTime<chrono::Utc> = mtime.into();
+    Some(crate::chatops::operator_commands::BusySummary {
+        change: marker.change,
+        started_at,
+    })
 }
 
 /// Best-effort read of the subprocess-sidecar file. Returns `None` if the
@@ -223,6 +301,7 @@ pub fn try_acquire_with(
                     comm,
                     started_at: chrono::Utc::now(),
                     stage: Stage::Executor,
+                    change: String::new(),
                 };
                 drop(file); // we'll use write_atomic for the actual content
                 write_atomic(&path, &marker)?;
@@ -532,6 +611,7 @@ mod tests {
             comm: comm.into(),
             started_at: started,
             stage: Stage::Executor,
+            change: String::new(),
         };
         write_atomic(&path, &marker).unwrap();
     }
@@ -801,6 +881,65 @@ mod tests {
             }
             _ => panic!("expected Acquired after clearing stale-dead marker"),
         }
+    }
+
+    #[test]
+    fn current_returns_none_when_marker_absent() {
+        let (_dir, ws) = fixture_workspace();
+        assert!(current(&ws).is_none());
+    }
+
+    #[test]
+    fn current_returns_none_when_change_empty() {
+        let (_dir, ws) = fixture_workspace();
+        // Acquire to drop a marker; change defaults to empty.
+        let _guard = match try_acquire(&ws, "git@github.com:test/repo.git", 1800).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            _ => panic!("acquire failed"),
+        };
+        // Marker exists but change is empty → peek returns None so the
+        // status formatter renders `currently: idle`.
+        assert!(current(&ws).is_none());
+    }
+
+    #[test]
+    fn current_reports_change_and_mtime_when_set() {
+        let (_dir, ws) = fixture_workspace();
+        let _guard = match try_acquire(&ws, "git@github.com:test/repo.git", 1800).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            _ => panic!("acquire failed"),
+        };
+        update_change(&ws, "a05-foo");
+        let summary = current(&ws).expect("current must return Some after update_change");
+        assert_eq!(summary.change, "a05-foo");
+        // mtime is "very recent" — within the last minute should be a
+        // safe wide window for CI clock skew.
+        let now = chrono::Utc::now();
+        let delta = now - summary.started_at;
+        assert!(
+            delta.num_seconds().abs() < 60,
+            "started_at should be ~now (mtime of marker); delta = {delta}"
+        );
+    }
+
+    #[test]
+    fn current_does_not_take_marker() {
+        let (_dir, ws) = fixture_workspace();
+        let guard = match try_acquire(&ws, "git@github.com:test/repo.git", 1800).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            _ => panic!("acquire failed"),
+        };
+        update_change(&ws, "a05-foo");
+        let marker_before = marker_path(&ws);
+        assert!(marker_before.exists());
+        let _ = current(&ws);
+        // Peek MUST NOT remove the marker.
+        assert!(
+            marker_before.exists(),
+            "current() is a read-only peek and must not delete the marker"
+        );
+        // Guard still holds the marker; dropping it cleans up normally.
+        drop(guard);
     }
 
     #[test]

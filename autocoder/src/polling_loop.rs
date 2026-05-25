@@ -930,6 +930,9 @@ async fn process_one_waiting(
     chatops::delete_question_file(workspace, change)?;
 
     let handle = ResumeHandle(question.resume_handle.clone());
+    // Record the resumed change in the busy marker so chatops `status`
+    // reflects this iteration's active work.
+    busy_marker::update_change(workspace, change);
     tracing::info!(
         url = %repo.url,
         change = %change,
@@ -1308,6 +1311,12 @@ async fn process_one_pending_change(
 ) -> Result<QueueStep> {
     queue::lock(workspace, change)
         .with_context(|| format!("locking change `{change}`"))?;
+
+    // Record which change this iteration is working on so the chatops
+    // `status` reply can render `currently: working on <change>`. The
+    // marker is held by the caller; best-effort update — failures are
+    // logged at DEBUG and don't abort the iteration.
+    busy_marker::update_change(workspace, change);
 
     tracing::info!(
         url = %repo.url,

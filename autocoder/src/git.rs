@@ -278,6 +278,65 @@ pub fn diff_three_dot(workspace: &Path, base: &str, head: &str) -> Result<String
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Read the latest commit on `branch` and return a `CommitSummary` (short
+/// SHA, subject, age). Returns `Ok(None)` when the branch does not exist
+/// (e.g. fresh clone, agent branch not yet created) — git emits
+/// `unknown revision` / `bad revision` on stderr for that case and the
+/// caller can render `(none)` without distinguishing from "branch exists
+/// but has no commits."
+///
+/// The git invocation uses `%h%x09%ct%x09%s`: short-sha, committer
+/// timestamp (Unix epoch seconds), subject. The first two fields are
+/// fixed-shape (no tabs), so a tab character inside the subject is
+/// preserved by splitting on the first two tabs only.
+pub fn last_commit_summary(
+    workspace: &Path,
+    branch: &str,
+) -> Result<Option<crate::chatops::operator_commands::CommitSummary>> {
+    let output = Command::new("git")
+        .args([
+            "log",
+            "-1",
+            "--pretty=format:%h%x09%ct%x09%s",
+            branch,
+            "--",
+        ])
+        .current_dir(workspace)
+        .output()
+        .with_context(|| format!("spawning `git log -1` for branch {branch}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        if stderr.contains("unknown revision")
+            || stderr.contains("bad revision")
+            || stderr.contains("does not have any commits")
+        {
+            return Ok(None);
+        }
+        let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!("git log -1 failed: {stderr_raw}"));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = trimmed.splitn(3, '\t');
+    let short_sha = parts.next().unwrap_or("").to_string();
+    let ts_str = parts.next().unwrap_or("");
+    let subject = parts.next().unwrap_or("").to_string();
+    let ts: i64 = ts_str
+        .parse()
+        .with_context(|| format!("parsing committer timestamp from `git log` output: {ts_str:?}"))?;
+    let when = chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+        .ok_or_else(|| anyhow!("committer timestamp out of range: {ts}"))?;
+    let age = chrono::Utc::now() - when;
+    Ok(Some(crate::chatops::operator_commands::CommitSummary {
+        short_sha,
+        subject,
+        age,
+    }))
+}
+
 /// Return the name-only file list for the three-dot diff between `base`
 /// and `head`. Equivalent to `git diff --name-only <base>...<head>`.
 /// Empty lines are filtered. Each entry is a workspace-relative path.
@@ -655,6 +714,69 @@ mod tests {
             !fork_probe.stdout.is_empty(),
             "fork MUST have agent-q after push"
         );
+    }
+
+    #[test]
+    fn last_commit_summary_happy_path() {
+        let (_dir, path) = fixture_repo();
+        let summary = last_commit_summary(&path, "main")
+            .expect("query succeeds")
+            .expect("commit exists on main");
+        assert_eq!(summary.short_sha.len(), 7, "default short sha is 7 chars");
+        assert!(
+            summary.short_sha.chars().all(|c| c.is_ascii_hexdigit()),
+            "short sha should be hex: {}",
+            summary.short_sha
+        );
+        assert_eq!(summary.subject, "initial");
+        // The commit was just made, so age is small but non-negative.
+        assert!(
+            summary.age.num_seconds() >= 0,
+            "age must be non-negative: {:?}",
+            summary.age
+        );
+    }
+
+    #[test]
+    fn last_commit_summary_nonexistent_branch_returns_none() {
+        let (_dir, path) = fixture_repo();
+        // The branch doesn't exist (fresh clone, agent branch not yet created).
+        // We must NOT propagate this as an error — the status formatter
+        // renders `(none)` in this case.
+        let res = last_commit_summary(&path, "definitely-not-a-branch")
+            .expect("nonexistent branch should be Ok(None), not Err");
+        assert!(res.is_none(), "expected None for missing branch");
+    }
+
+    #[test]
+    fn last_commit_summary_preserves_tab_in_subject() {
+        let (_dir, path) = fixture_repo();
+        // A subject with a tab character. The git format is
+        // `%h\t%ct\t%s`; the splitter must split only on the FIRST two
+        // tabs so a tab inside the subject survives.
+        run_init(
+            &path,
+            &["commit", "-q", "--allow-empty", "-m", "before\tafter"],
+        );
+        let summary = last_commit_summary(&path, "main")
+            .expect("query succeeds")
+            .expect("commit exists");
+        assert_eq!(
+            summary.subject, "before\tafter",
+            "tab inside subject must survive splitting"
+        );
+    }
+
+    #[test]
+    fn last_commit_summary_repo_with_no_commits_returns_none() {
+        // `git init` only — no commits at all. HEAD is unborn; `git log -1`
+        // exits non-zero with "does not have any commits" / "bad revision".
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        run_init(&path, &["init", "-q", "-b", "main"]);
+        let res = last_commit_summary(&path, "HEAD")
+            .expect("empty repo should be Ok(None), not Err");
+        assert!(res.is_none(), "expected None for unborn HEAD");
     }
 
     #[test]

@@ -371,12 +371,55 @@ pub fn match_repo<'a>(substring: &str, configured: &'a [RepoIdentity]) -> RepoMa
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoStatusResponse {
     pub url: String,
+    #[serde(default)]
+    pub base_branch: String,
+    #[serde(default)]
+    pub agent_branch: String,
+    #[serde(default)]
+    pub last_commit_base: Option<CommitSummary>,
+    #[serde(default)]
+    pub last_commit_agent: Option<CommitSummary>,
+    #[serde(default)]
+    pub latest_pr: Option<PrSummary>,
+    #[serde(default)]
+    pub currently_busy: Option<BusySummary>,
     pub perma_stuck_changes: Vec<MarkerEntry>,
     pub revision_marked_changes: Vec<MarkerEntry>,
     pub throttled_alerts: Vec<ThrottledAlertEntry>,
     pub pending_changes: Vec<String>,
     pub waiting_changes: Vec<String>,
     pub last_iteration: Option<LastIteration>,
+}
+
+/// One-line summary of the latest commit on a branch (sourced from
+/// `git log -1`). `age` is `Utc::now() - committer_timestamp`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitSummary {
+    pub short_sha: String,
+    pub subject: String,
+    pub age: chrono::Duration,
+}
+
+/// One-line summary of the most recent PR opened from the daemon's agent
+/// branch. `state` is `"open" | "closed" | "merged"`; `age` is
+/// `Utc::now() - created_at`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrSummary {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    pub head_branch: String,
+    pub url: String,
+    pub age: chrono::Duration,
+}
+
+/// One-line summary of the per-repo busy marker, when held. `started_at`
+/// is the marker file's mtime — close enough to "when this iteration
+/// began" for the status display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusySummary {
+    pub change: String,
+    pub started_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,11 +450,95 @@ pub struct LastIteration {
 // Reply formatters
 // ====================================================================
 
+/// Escape Slack-special characters (`&`, `<`, `>`) so user-controlled
+/// strings (commit subjects, PR titles, change names) can be embedded in
+/// the status reply without inadvertently invoking Slack's mention syntax
+/// (e.g. a malicious commit subject `<!channel> ping` would otherwise
+/// notify every member of the channel).
+///
+/// Order matters: `&` is substituted FIRST. Doing it last would
+/// double-escape the substitutions produced by `<`→`&lt;` and `>`→`&gt;`.
+fn slack_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Render a `CommitSummary` (or its absence) as the `<sha> "<subject>"
+/// (<age> ago)` shape used by the `last commit on <branch>:` lines.
+/// Returns `(none)` for `None`. The subject is Slack-escaped.
+fn format_commit_summary(summary: Option<&CommitSummary>) -> String {
+    match summary {
+        Some(s) => {
+            let age = human_age_duration(s.age);
+            format!(
+                "{} \"{}\" ({age} ago)",
+                s.short_sha,
+                slack_escape(&s.subject)
+            )
+        }
+        None => "(none)".to_string(),
+    }
+}
+
 /// Format the status response into the multi-line chat reply shape
-/// from the proposal. Empty sections are omitted entirely.
+/// from the proposal. The five always-present sections (branches, last
+/// commits, latest PR, currently-busy, next-iteration) come first;
+/// existing marker / throttled-alert / queue sections collapse when
+/// empty exactly as before.
 pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
     let mut out = String::new();
     out.push_str(&format!("📊 {}\n", resp.url));
+
+    // ---- Always-present block ----
+    if !resp.base_branch.is_empty() || !resp.agent_branch.is_empty() {
+        out.push_str(&format!(
+            "\nbranches: base={}, agent={}\n",
+            resp.base_branch, resp.agent_branch
+        ));
+        out.push_str(&format!(
+            "last commit on {}: {}\n",
+            resp.base_branch,
+            format_commit_summary(resp.last_commit_base.as_ref())
+        ));
+        out.push_str(&format!(
+            "last commit on {}: {}\n",
+            resp.agent_branch,
+            format_commit_summary(resp.last_commit_agent.as_ref())
+        ));
+
+        out.push('\n');
+        match &resp.latest_pr {
+            Some(pr) => {
+                let age = human_age_duration(pr.age);
+                out.push_str(&format!(
+                    "latest PR: #{} \"{}\"  {} · head={} · {age} ago\n",
+                    pr.number,
+                    slack_escape(&pr.title),
+                    pr.state,
+                    pr.head_branch
+                ));
+                out.push_str(&format!("           {}\n", pr.url));
+            }
+            None => {
+                out.push_str("latest PR: (none)\n");
+            }
+        }
+
+        out.push('\n');
+        match &resp.currently_busy {
+            Some(b) => {
+                let age = human_age_since(b.started_at);
+                out.push_str(&format!(
+                    "currently: working on {} (started {age} ago)\n",
+                    slack_escape(&b.change)
+                ));
+            }
+            None => {
+                out.push_str("currently: idle\n");
+            }
+        }
+    }
 
     let has_markers =
         !resp.perma_stuck_changes.is_empty() || !resp.revision_marked_changes.is_empty();
@@ -419,23 +546,23 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
         out.push_str("\nactive markers (excluded from list_pending):\n");
         for m in &resp.perma_stuck_changes {
             let age = human_age_since(m.marked_at);
+            let change = slack_escape(&m.change);
             if m.detail.is_empty() {
                 out.push_str(&format!(
-                    "  • {} (.perma-stuck.json — marked {age} ago)\n",
-                    m.change
+                    "  • {change} (.perma-stuck.json — marked {age} ago)\n"
                 ));
             } else {
                 out.push_str(&format!(
-                    "  • {} (.perma-stuck.json — {}, marked {age} ago)\n",
-                    m.change, m.detail
+                    "  • {change} (.perma-stuck.json — {}, marked {age} ago)\n",
+                    m.detail
                 ));
             }
         }
         for m in &resp.revision_marked_changes {
             let age = human_age_since(m.marked_at);
+            let change = slack_escape(&m.change);
             out.push_str(&format!(
-                "  • {} (.needs-spec-revision.json — marked {age} ago)\n",
-                m.change
+                "  • {change} (.needs-spec-revision.json — marked {age} ago)\n"
             ));
         }
     }
@@ -485,35 +612,61 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
         }
     }
 
+    let excluded: Vec<String> = resp
+        .perma_stuck_changes
+        .iter()
+        .chain(resp.revision_marked_changes.iter())
+        .map(|m| m.change.clone())
+        .collect();
     let queue_has_content = !resp.pending_changes.is_empty()
         || !resp.waiting_changes.is_empty()
-        || !resp.perma_stuck_changes.is_empty()
-        || !resp.revision_marked_changes.is_empty();
+        || !excluded.is_empty();
     if queue_has_content {
-        out.push_str("\nqueue snapshot:\n");
-        if !resp.pending_changes.is_empty() {
-            out.push_str(&format!(
-                "  pending: {}\n",
-                resp.pending_changes.join(", ")
+        // One-liner form when ALL three lists are small (≤5).
+        let small =
+            resp.pending_changes.len() <= 5
+                && resp.waiting_changes.len() <= 5
+                && excluded.len() <= 5;
+        if small {
+            out.push('\n');
+            out.push_str(&format_queue_one_liner(
+                &resp.pending_changes,
+                &resp.waiting_changes,
+                &excluded,
             ));
-        }
-        if !resp.waiting_changes.is_empty() {
-            out.push_str(&format!(
-                "  waiting: {}\n",
-                resp.waiting_changes.join(", ")
-            ));
-        }
-        let excluded: Vec<String> = resp
-            .perma_stuck_changes
-            .iter()
-            .chain(resp.revision_marked_changes.iter())
-            .map(|m| m.change.clone())
-            .collect();
-        if !excluded.is_empty() {
-            out.push_str(&format!(
-                "  excluded: {} (see markers above)\n",
-                excluded.join(", ")
-            ));
+            out.push('\n');
+        } else {
+            out.push_str("\nqueue snapshot:\n");
+            if !resp.pending_changes.is_empty() {
+                out.push_str(&format!(
+                    "  pending: {}\n",
+                    resp.pending_changes
+                        .iter()
+                        .map(|c| slack_escape(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !resp.waiting_changes.is_empty() {
+                out.push_str(&format!(
+                    "  waiting: {}\n",
+                    resp.waiting_changes
+                        .iter()
+                        .map(|c| slack_escape(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !excluded.is_empty() {
+                out.push_str(&format!(
+                    "  excluded: {} (see markers above)\n",
+                    excluded
+                        .iter()
+                        .map(|c| slack_escape(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
         }
     }
 
@@ -523,6 +676,38 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
         out.pop();
     }
     out
+}
+
+/// Render the compact-queue one-liner used when every list is ≤5
+/// entries: `queue: N pending (<list>), M waiting (<list>), K excluded`.
+/// Empty lists render as the count alone (`0 pending`) — no empty
+/// parenthetical. Change names pass through `slack_escape` belt-and-
+/// braces; the parser's allowlist already restricts them to
+/// `[a-zA-Z0-9_-]`.
+fn format_queue_one_liner(
+    pending: &[String],
+    waiting: &[String],
+    excluded: &[String],
+) -> String {
+    fn render(label: &str, list: &[String]) -> String {
+        let n = list.len();
+        if n == 0 {
+            format!("{n} {label}")
+        } else {
+            let items: Vec<String> = list.iter().map(|c| slack_escape(c)).collect();
+            format!("{n} {label} ({})", items.join(", "))
+        }
+    }
+    // Excluded never gets a parenthetical — operators reference the
+    // dedicated markers section above for details. For the one-liner
+    // form the count is what matters.
+    let excluded_part = format!("{} excluded", excluded.len());
+    format!(
+        "queue: {}, {}, {}",
+        render("pending", pending),
+        render("waiting", waiting),
+        excluded_part,
+    )
 }
 
 /// Reply when the operator-supplied substring resolves to more than one
@@ -1540,6 +1725,10 @@ mod tests {
 
     #[test]
     fn format_status_collapses_empty_sections() {
+        // No branches configured → the always-present block is skipped
+        // (this represents the "data-shape only" default — production
+        // callers always populate base/agent branch). Marker / throttle
+        // / queue / last_iteration sections also collapse when empty.
         let resp = RepoStatusResponse {
             url: "git@github.com:owner/repo.git".into(),
             ..RepoStatusResponse::default()
@@ -1547,20 +1736,272 @@ mod tests {
         let out = format_status_reply(&resp);
         // Header is always present.
         assert!(out.starts_with("📊 git@github.com:owner/repo.git"));
-        // No "active markers" / "throttled alerts" / "queue snapshot" /
-        // "last iteration" lines appear since every section is empty.
         for label in [
             "active markers",
             "throttled alerts",
             "queue snapshot",
+            "queue:",
             "last iteration",
             "(none)",
+            "branches:",
+            "currently:",
         ] {
             assert!(
                 !out.contains(label),
                 "empty status reply must not contain `{label}`; got: {out}"
             );
         }
+    }
+
+    #[test]
+    fn format_status_healthy_repo_includes_all_always_present_sections() {
+        // Healthy snapshot: both branches with commits, an open PR, idle
+        // daemon, empty queue, no markers/throttles.
+        let resp = RepoStatusResponse {
+            url: "git@github.com:owner/repo.git".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            last_commit_base: Some(CommitSummary {
+                short_sha: "abcd123".into(),
+                subject: "base subject".into(),
+                age: chrono::Duration::minutes(15),
+            }),
+            last_commit_agent: Some(CommitSummary {
+                short_sha: "def4567".into(),
+                subject: "agent subject".into(),
+                age: chrono::Duration::minutes(5),
+            }),
+            latest_pr: Some(PrSummary {
+                number: 42,
+                title: "agent work".into(),
+                state: "open".into(),
+                head_branch: "agent-q".into(),
+                url: "https://github.com/owner/repo/pull/42".into(),
+                age: chrono::Duration::hours(3),
+            }),
+            currently_busy: None,
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(out.contains("branches: base=main, agent=agent-q"), "{out}");
+        assert!(
+            out.contains("last commit on main: abcd123 \"base subject\" (15m ago)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("last commit on agent-q: def4567 \"agent subject\" (5m ago)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("latest PR: #42 \"agent work\"  open · head=agent-q · 3h ago"),
+            "{out}"
+        );
+        assert!(out.contains("https://github.com/owner/repo/pull/42"), "{out}");
+        assert!(out.contains("currently: idle"), "{out}");
+    }
+
+    #[test]
+    fn format_status_absent_data_renders_none_not_blank() {
+        // Fresh clone: branches set in config, but no commits on agent
+        // branch yet, no PR ever opened, daemon idle.
+        let resp = RepoStatusResponse {
+            url: "git@github.com:owner/repo.git".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            last_commit_base: Some(CommitSummary {
+                short_sha: "abc1234".into(),
+                subject: "init".into(),
+                age: chrono::Duration::hours(2),
+            }),
+            last_commit_agent: None,
+            latest_pr: None,
+            currently_busy: None,
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(
+            out.contains("last commit on agent-q: (none)"),
+            "(none) must be present on absent agent-branch commit; got: {out}"
+        );
+        assert!(out.contains("latest PR: (none)"), "{out}");
+        assert!(out.contains("currently: idle"), "{out}");
+    }
+
+    #[test]
+    fn format_status_currently_busy_shows_change_and_age() {
+        let resp = RepoStatusResponse {
+            url: "git@github.com:owner/repo.git".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            currently_busy: Some(BusySummary {
+                change: "a05-foo".into(),
+                started_at: Utc::now() - chrono::Duration::minutes(2),
+            }),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(
+            out.contains("currently: working on a05-foo (started 2m ago)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn slack_escape_substitutes_ampersand_first() {
+        // Order matters: `&` must be substituted before `<`/`>` so the
+        // emitted `&lt;` / `&gt;` do NOT get re-escaped to `&amp;lt;`.
+        assert_eq!(slack_escape("&<"), "&amp;&lt;");
+        assert_ne!(slack_escape("&<"), "&amp;lt;");
+    }
+
+    #[test]
+    fn slack_escape_handles_all_three_chars() {
+        assert_eq!(slack_escape("<>&"), "&lt;&gt;&amp;");
+    }
+
+    #[test]
+    fn format_status_escapes_commit_subject() {
+        let resp = RepoStatusResponse {
+            url: "u".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            last_commit_base: Some(CommitSummary {
+                short_sha: "abc".into(),
+                subject: "<!channel> ping everyone".into(),
+                age: chrono::Duration::minutes(1),
+            }),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(
+            out.contains("&lt;!channel&gt; ping everyone"),
+            "subject must be escaped; got: {out}"
+        );
+        assert!(
+            !out.contains("<!channel>"),
+            "raw `<!channel>` must NOT leak (would ping the channel): {out}"
+        );
+    }
+
+    #[test]
+    fn format_status_escapes_pr_title() {
+        let resp = RepoStatusResponse {
+            url: "u".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            latest_pr: Some(PrSummary {
+                number: 1,
+                title: "<@U123> ping".into(),
+                state: "open".into(),
+                head_branch: "agent-q".into(),
+                url: "https://example".into(),
+                age: chrono::Duration::seconds(30),
+            }),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(out.contains("&lt;@U123&gt; ping"), "{out}");
+        assert!(!out.contains("<@U123>"), "{out}");
+    }
+
+    #[test]
+    fn format_status_escapes_ampersand_in_subject() {
+        let resp = RepoStatusResponse {
+            url: "u".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            last_commit_base: Some(CommitSummary {
+                short_sha: "abc".into(),
+                subject: "foo & bar".into(),
+                age: chrono::Duration::seconds(1),
+            }),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(out.contains("foo &amp; bar"), "{out}");
+    }
+
+    #[test]
+    fn format_status_queue_one_liner_for_small_lists() {
+        let resp = RepoStatusResponse {
+            url: "u".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            pending_changes: vec!["a06-foo".into(), "a07-bar".into()],
+            waiting_changes: vec!["a10-secrets".into()],
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(
+            out.contains(
+                "queue: 2 pending (a06-foo, a07-bar), 1 waiting (a10-secrets), 0 excluded"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn format_status_queue_per_line_when_list_exceeds_five() {
+        let pending: Vec<String> = (0..6).map(|i| format!("a0{i}-x")).collect();
+        let resp = RepoStatusResponse {
+            url: "u".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            pending_changes: pending.clone(),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        // Per-line fallback: the multi-line `queue snapshot:` header is
+        // present.
+        assert!(out.contains("queue snapshot:"), "{out}");
+        assert!(
+            out.contains(&format!("pending: {}", pending.join(", "))),
+            "{out}"
+        );
+        // Must NOT be the one-liner form.
+        assert!(
+            !out.contains("queue: 6 pending"),
+            "should use per-line format for >5 entries: {out}"
+        );
+    }
+
+    #[test]
+    fn format_status_queue_empty_lists_render_count_only() {
+        // No queue entries, no markers — the queue section is omitted
+        // entirely (queue_has_content = false). This is the spec's
+        // "omitted entirely" alternative.
+        let resp = RepoStatusResponse {
+            url: "u".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(!out.contains("queue:"), "empty queue is omitted: {out}");
+
+        // With markers-only (excluded > 0, pending/waiting = 0), the
+        // one-liner form appears and renders empty lists as count-only
+        // (no empty parens).
+        let resp = RepoStatusResponse {
+            url: "u".into(),
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            perma_stuck_changes: vec![MarkerEntry {
+                change: "a06-foo".into(),
+                marked_at: Utc::now() - chrono::Duration::hours(1),
+                detail: String::new(),
+            }],
+            ..RepoStatusResponse::default()
+        };
+        let out = format_status_reply(&resp);
+        assert!(
+            out.contains("queue: 0 pending, 0 waiting, 1 excluded"),
+            "empty lists render count-only (no `()`): {out}"
+        );
+        assert!(
+            !out.contains("0 pending ()"),
+            "empty list must NOT emit empty parens: {out}"
+        );
     }
 
     #[test]
@@ -1586,8 +2027,13 @@ mod tests {
         assert!(out.contains("consecutive_failures: 2"));
         assert!(out.contains("a07-bar"));
         assert!(out.contains(".needs-spec-revision.json"));
-        // The queue snapshot's "excluded" line lists both markers.
-        assert!(out.contains("excluded: a06-foo, a07-bar"));
+        // Two markers + no pending/waiting → totals are small (≤5),
+        // so the queue one-liner form is used: `K excluded` (no list,
+        // operators reference the markers section above for detail).
+        assert!(
+            out.contains("queue: 0 pending, 0 waiting, 2 excluded"),
+            "small queue + 2 excluded must use one-liner form: {out}"
+        );
     }
 
     #[test]
@@ -1754,7 +2200,9 @@ mod tests {
             .expect("dispatcher must produce a reply");
         let text = unwrap_sync(reply);
         assert!(text.contains("git@github.com:acme/myrepo.git"));
-        assert!(text.contains("pending: a08-deploy"));
+        // Single-pending one-liner form (≤5 entries triggers compact
+        // queue line).
+        assert!(text.contains("queue: 1 pending (a08-deploy)"), "{text}");
     }
 
     #[tokio::test]

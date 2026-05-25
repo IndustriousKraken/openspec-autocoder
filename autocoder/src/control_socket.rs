@@ -6,10 +6,14 @@
 //! sections. Only the `executor` section requires a process restart.
 
 use crate::alert_state::AlertState;
+use crate::busy_marker;
 use crate::chatops::ChatOpsBackend;
 use crate::chatops::operator_commands::{
     LastIteration, MarkerEntry, RepoStatusResponse, ThrottledAlertEntry,
 };
+use crate::git;
+use crate::github;
+use crate::github_credentials;
 use crate::code_reviewer::CodeReviewer;
 use crate::config::{
     ChatOpsConfig, Config, GithubConfig, NotificationsConfig, RepositoryConfig, ReviewerConfig,
@@ -255,7 +259,7 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
     };
     match action.as_str() {
         "reload" => handle_reload(state).await,
-        "repo_status" => handle_repo_status(&parsed, state),
+        "repo_status" => handle_repo_status(&parsed, state).await,
         "clear_perma_stuck_marker" => handle_clear_perma_stuck(&parsed, state),
         "clear_revision_marker" => handle_clear_revision(&parsed, state),
         "wipe_workspace" => handle_wipe_workspace(&parsed, state),
@@ -287,7 +291,7 @@ fn require_str(parsed: &Value, field: &str) -> std::result::Result<String, Strin
         .ok_or_else(|| format!("missing `{field}` field"))
 }
 
-fn handle_repo_status(parsed: &Value, state: &ControlState) -> Value {
+async fn handle_repo_status(parsed: &Value, state: &ControlState) -> Value {
     let url = match require_str(parsed, "url") {
         Ok(u) => u,
         Err(e) => return json!({"ok": false, "error": e}),
@@ -297,7 +301,8 @@ fn handle_repo_status(parsed: &Value, state: &ControlState) -> Value {
         Err(e) => return json!({"ok": false, "error": e}),
     };
     let workspace_path = workspace::resolve_path(&repo);
-    match build_repo_status(&workspace_path, &repo) {
+    let github_cfg = state.github.load_full();
+    match build_repo_status(&workspace_path, &repo, &github_cfg).await {
         Ok(resp) => match serde_json::to_value(&resp) {
             Ok(body) => json!({"ok": true, "status": body}),
             Err(e) => json!({"ok": false, "error": format!("serializing status: {e}")}),
@@ -308,22 +313,70 @@ fn handle_repo_status(parsed: &Value, state: &ControlState) -> Value {
 
 /// Build the `RepoStatusResponse` for one repo by reading the workspace's
 /// failure-state, alert-state, marker files, and queue state. Pure
-/// filesystem reads + config snapshot — does not interrogate the live
+/// filesystem reads + config snapshot, plus one outbound GitHub API call
+/// for the "latest PR by the daemon" line. Does not interrogate the live
 /// polling-task map for `last_iteration` (no central record exists yet);
 /// the field is populated from the most recent failure-state timestamp
 /// when available.
-fn build_repo_status(workspace_path: &Path, repo: &RepositoryConfig) -> Result<RepoStatusResponse> {
+///
+/// Per the status-enrichment spec, a GitHub or local-git failure is
+/// log-and-degrade: the affected field becomes `None` and the reply
+/// still ships every other section. An operator hitting `status <repo>`
+/// during a GitHub incident still gets the local-state half.
+async fn build_repo_status(
+    workspace_path: &Path,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+) -> Result<RepoStatusResponse> {
     let mut resp = RepoStatusResponse {
         url: repo.url.clone(),
+        base_branch: repo.base_branch.clone(),
+        agent_branch: repo.agent_branch.clone(),
         ..RepoStatusResponse::default()
     };
 
+    // Currently-busy peek is workspace-relative but does not require the
+    // workspace dir to exist (the marker lives under <tempdir>/autocoder/busy),
+    // so populate it before the early-return.
+    resp.currently_busy = busy_marker::current(workspace_path);
+
     // Workspace may not exist yet (e.g. a freshly added repo whose initial
-    // clone hasn't run). Treat that as "everything empty" — the URL header
-    // is still useful and operators won't see a false error.
+    // clone hasn't run). Treat that as "everything empty for the
+    // workspace-derived fields" — the URL header + branches + busy-marker
+    // peek are still useful, and operators won't see a false error.
     if !workspace_path.is_dir() {
+        // Try the GitHub PR call anyway — it does not depend on the local
+        // workspace.
+        resp.latest_pr = fetch_latest_pr(repo, github_cfg).await;
         return Ok(resp);
     }
+
+    // Last-commit lines: best-effort. On error, log and keep the field
+    // as None so the formatter renders `(none)`.
+    match git::last_commit_summary(workspace_path, &repo.base_branch) {
+        Ok(s) => resp.last_commit_base = s,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                branch = %repo.base_branch,
+                "status: last_commit_summary failed: {e:#}"
+            );
+        }
+    }
+    match git::last_commit_summary(workspace_path, &repo.agent_branch) {
+        Ok(s) => resp.last_commit_agent = s,
+        Err(e) => {
+            tracing::warn!(
+                url = %repo.url,
+                branch = %repo.agent_branch,
+                "status: last_commit_summary failed: {e:#}"
+            );
+        }
+    }
+
+    // Latest PR by the daemon (one outbound GitHub call). Failure is
+    // log-and-degrade.
+    resp.latest_pr = fetch_latest_pr(repo, github_cfg).await;
 
     // Marker-excluded changes — pull marked_at + detail from the marker
     // JSON files where possible.
@@ -409,6 +462,45 @@ fn build_repo_status(workspace_path: &Path, repo: &RepositoryConfig) -> Result<R
     }
 
     Ok(resp)
+}
+
+/// Resolve owner / repo / token for `repo` and call
+/// `github::latest_pr_for_head`. Any failure (parse, token-resolve, HTTP)
+/// is logged at WARN and converted to `None`. Per spec: the status reply
+/// MUST NOT fail because GitHub is rate-limited or briefly down.
+async fn fetch_latest_pr(
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+) -> Option<crate::chatops::operator_commands::PrSummary> {
+    let (owner, repo_name) = match github::parse_repo_url(&repo.url) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(url = %repo.url, "status: parse_repo_url failed: {e:#}");
+            return None;
+        }
+    };
+    let token = match github_credentials::resolve_token(github_cfg, &owner) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(url = %repo.url, "status: github token resolve failed: {e:#}");
+            return None;
+        }
+    };
+    match github::latest_pr_for_head(
+        github::DEFAULT_API_BASE,
+        &token,
+        &owner,
+        &repo_name,
+        &repo.agent_branch,
+    )
+    .await
+    {
+        Ok(pr) => pr,
+        Err(e) => {
+            tracing::warn!(url = %repo.url, "status: latest_pr_for_head failed: {e:#}");
+            None
+        }
+    }
 }
 
 fn read_perma_marker(path: &Path) -> (DateTime<Utc>, String) {

@@ -420,7 +420,7 @@ The bot recognises:
 
 | Verb | Syntax | What it does |
 | --- | --- | --- |
-| `status` | `@<bot> status <repo-substring>` | Posts a multi-line threaded reply: active markers, currently-engaged 24h alert throttles, last-iteration timestamp + next-iteration estimate, queue snapshot. |
+| `status` | `@<bot> status <repo-substring>` | Posts a multi-line threaded reply with five always-present sections — branches, last commit on each branch, latest PR from the agent branch, currently-busy state (`idle` or `working on <change>`), and the next-iteration estimate — followed by any active markers, currently-engaged 24h alert throttles, and the queue snapshot (compact one-liner when small, per-line when any list exceeds five entries). |
 | `clear-perma-stuck` | `@<bot> clear-perma-stuck <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.perma-stuck.json`. The next iteration will retry the change. |
 | `clear-revision` | `@<bot> clear-revision <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.needs-spec-revision.json`. Use after you've edited `tasks.md` to remove or revise the unimplementable tasks. |
 | `wipe-workspace` | `@<bot> wipe-workspace <repo-substring>` | Destructive: removes the entire `/tmp/workspaces/<sanitized-url>/` directory so the next iteration re-clones. Requires two-step confirmation (see below). |
@@ -482,6 +482,24 @@ Success replies are one line beginning with `✓`. Error replies are one line be
 ✗ no perma-stuck marker for change a99-nonexistent on myrepo
 ✗ no repo matched 'gibberish'; configured: myrepo, widgets
 ```
+
+The `status` reply for a healthy repo looks like:
+
+```
+📊 git@github.com:acme/myrepo.git
+
+branches: base=main, agent=agent-q
+last commit on main: 9f2c1aa "Merge pull request #41" (3h ago)
+last commit on agent-q: 4d77b82 "implement a08-foo" (12m ago)
+
+latest PR: #42 "a08-foo: add deployment hook"  open · head=agent-q · 11m ago
+           https://github.com/acme/myrepo/pull/42
+
+currently: working on a09-bar (started 2m ago)
+queue: 1 pending (a10-baz), 0 waiting, 0 excluded
+```
+
+Branches and the busy-marker line are always present. `(none)` fills any always-present field whose underlying data is absent (fresh clone, no PR ever opened, etc.). If the GitHub API call fails or local `git log` errors, the affected line falls back to `(none)` and a WARN is logged — the reply still ships every other section so an operator can read the local-state half during a GitHub incident. The queue line uses the compact one-liner form when each of `pending` / `waiting` / `excluded` has ≤5 entries; larger lists fall back to the multi-line `queue snapshot:` format. Commit subjects and PR titles pass through a Slack-escape pass so author-supplied text like `<!channel>` cannot trigger channel-wide mentions when echoed into the reply.
 
 #### Unrecognised verbs get a `?` reaction, no text reply
 

@@ -96,6 +96,92 @@ async fn list_open_prs_at(
     Ok(parsed)
 }
 
+/// Fetch the most-recently-created PR whose head equals `head_branch`
+/// in the qualified `owner:branch` form. Used by the operator-status
+/// reply to show "latest PR by the daemon."
+///
+/// Returns `Ok(Some(PrSummary))` on a 200 with a non-empty list,
+/// `Ok(None)` on a 200 with an empty list (no PR ever opened from this
+/// branch), and `Err` on any other condition (network, 4xx, 5xx, decode
+/// failure). The status path swallows the `Err` and renders `(none)` —
+/// see `control_socket::build_repo_status`.
+pub async fn latest_pr_for_head(
+    api_base: &str,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    head_branch: &str,
+) -> Result<Option<crate::chatops::operator_commands::PrSummary>> {
+    use chrono::{DateTime, Utc};
+    #[derive(Deserialize)]
+    struct PrHead {
+        #[serde(rename = "ref")]
+        ref_: String,
+    }
+    #[derive(Deserialize)]
+    struct PrListItem {
+        number: u64,
+        title: String,
+        state: String,
+        html_url: String,
+        created_at: DateTime<Utc>,
+        #[serde(default)]
+        merged_at: Option<DateTime<Utc>>,
+        head: PrHead,
+    }
+
+    let url = format!("{api_base}/repos/{owner}/{repo}/pulls");
+    let head_qualified = format!("{owner}:{head_branch}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .query(&[
+            ("head", head_qualified.as_str()),
+            ("state", "all"),
+            ("sort", "created"),
+            ("direction", "desc"),
+            ("per_page", "1"),
+        ])
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .send()
+        .await
+        .map_err(|e| anyhow!("github latest-pr GET failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_snippet = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github latest-pr GET {owner}/{repo} returned {status}: {body_snippet}"
+        ));
+    }
+    let parsed: Vec<PrListItem> = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("github latest-pr response decode failed: {e}"))?;
+    let item = match parsed.into_iter().next() {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+    let mapped_state = if item.state == "closed" && item.merged_at.is_some() {
+        "merged".to_string()
+    } else {
+        item.state
+    };
+    let age = Utc::now() - item.created_at;
+    Ok(Some(crate::chatops::operator_commands::PrSummary {
+        number: item.number,
+        title: item.title,
+        state: mapped_state,
+        head_branch: item.head.ref_,
+        url: item.html_url,
+        age,
+    }))
+}
+
 /// Create a fork of the upstream repo via the GitHub REST API. The fork's
 /// destination is implicit from the PAT's owner — GitHub forks to the
 /// authenticated user's account by default. Returns Ok on 2xx (including
@@ -1110,6 +1196,166 @@ mod tests {
         .expect_err("404 must surface as Err");
         let msg = format!("{err:#}");
         assert!(msg.contains("404"), "error must name status code; got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn latest_pr_for_head_parses_open_pr() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("head".into(), "owner:agent-q".into()),
+                mockito::Matcher::UrlEncoded("state".into(), "all".into()),
+                mockito::Matcher::UrlEncoded("sort".into(), "created".into()),
+                mockito::Matcher::UrlEncoded("direction".into(), "desc".into()),
+                mockito::Matcher::UrlEncoded("per_page".into(), "1".into()),
+            ]))
+            .with_status(200)
+            .with_body(
+                r#"[{
+                    "number": 42,
+                    "title": "Agent PR",
+                    "state": "open",
+                    "html_url": "https://github.com/owner/repo/pull/42",
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "merged_at": null,
+                    "head": {"ref": "agent-q"}
+                }]"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let pr = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+            .await
+            .expect("call should succeed");
+        let pr = pr.expect("response with one PR should yield Some");
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.title, "Agent PR");
+        assert_eq!(pr.state, "open");
+        assert_eq!(pr.head_branch, "agent-q");
+        assert_eq!(pr.url, "https://github.com/owner/repo/pull/42");
+        // age must be non-negative; the created_at is in the past.
+        assert!(pr.age.num_seconds() >= 0);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn latest_pr_for_head_maps_merged_state() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"[{
+                    "number": 7,
+                    "title": "Merged PR",
+                    "state": "closed",
+                    "html_url": "https://github.com/owner/repo/pull/7",
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "merged_at": "2025-01-02T00:00:00Z",
+                    "head": {"ref": "agent-q"}
+                }]"#,
+            )
+            .create_async()
+            .await;
+        let pr = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+            .await
+            .expect("call should succeed")
+            .expect("one PR");
+        assert_eq!(pr.state, "merged", "closed+merged_at must map to merged");
+    }
+
+    #[tokio::test]
+    async fn latest_pr_for_head_closed_without_merge_stays_closed() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"[{
+                    "number": 8,
+                    "title": "Closed",
+                    "state": "closed",
+                    "html_url": "https://github.com/owner/repo/pull/8",
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "merged_at": null,
+                    "head": {"ref": "agent-q"}
+                }]"#,
+            )
+            .create_async()
+            .await;
+        let pr = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+            .await
+            .expect("call should succeed")
+            .expect("one PR");
+        assert_eq!(pr.state, "closed", "closed without merge stays closed");
+    }
+
+    #[tokio::test]
+    async fn latest_pr_for_head_empty_list_returns_none() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        let pr = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+            .await
+            .expect("empty list should be Ok(None)");
+        assert!(pr.is_none());
+    }
+
+    #[tokio::test]
+    async fn latest_pr_for_head_returns_err_on_404() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+        let err = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+            .await
+            .expect_err("404 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("404"), "error must name the status: {msg}");
+    }
+
+    #[tokio::test]
+    async fn latest_pr_for_head_returns_err_on_rate_limit_403() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(403)
+            .with_body(r#"{"message":"API rate limit exceeded"}"#)
+            .create_async()
+            .await;
+        let err = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+            .await
+            .expect_err("rate-limit 403 must surface as Err so caller can swallow");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("403"));
+    }
+
+    #[tokio::test]
+    async fn latest_pr_for_head_returns_err_on_decode_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            // Missing required `head` field → decode fails.
+            .with_body(
+                r#"[{"number":1,"title":"x","state":"open","html_url":"u","created_at":"2025-01-01T00:00:00Z"}]"#,
+            )
+            .create_async()
+            .await;
+        let err = latest_pr_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+            .await
+            .expect_err("missing required field must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("decode"), "error must mention decode: {msg}");
     }
 
     #[tokio::test]
