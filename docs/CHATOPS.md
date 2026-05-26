@@ -63,6 +63,42 @@ All three keys are optional. An absent `notifications:` block parses to "all tru
 
 If `post_notification` itself fails (network blip, channel renamed, scope revoked), the failure is logged to stderr but is NEVER re-routed back through chatops — there is no recursive alert cascade.
 
+**Proposal-created audit notifications.** LLM-driven audits that
+generate OpenSpec change proposals (`missing_tests_audit`,
+`security_bug_audit`) post a `🔍` notification immediately after the
+proposal passes `openspec validate --strict` AND before the audit's
+`git commit` ships it to the agent branch:
+
+```
+🔍 <repo-url>: <audit-type> created proposal `<change-slug>` — <first line of ## Why>
+```
+
+When the proposal validated only after one or more retries, the text
+gains the same parenthetical the success log line uses:
+
+```
+🔍 <repo-url>: <audit-type> created proposal `<change-slug>` — <summary> (validated on retry 1 of 2)
+```
+
+This **always fires** when an LLM-driven audit produces a valid
+proposal; it is **not** gated by `notify_on_clean`. The two switches
+operate on opposite signal classes: `notify_on_clean` suppresses
+"nothing to do" messages, whereas `🔍` is the "audit found something
+worth doing" signal — suppressing it would defeat the purpose. The
+operator's next chatops message about that change is the existing
+`🚀 starting work on …` line; the `🔍` provides the provenance for it.
+
+The pure-data `architecture_brightline` audit does NOT fire this
+notification (it does not generate an LLM proposal). The advisory
+`architecture_consultative` and `drift_audit` audits also do not fire
+it — they emit findings via the existing `📋` chatops dispatch and
+never write `openspec/changes/<slug>/`.
+
+If the chatops backend is unconfigured OR `post_notification` errors
+when this notification is posted, the failure is logged at WARN and
+the audit's success outcome (proposal commit, queue insertion) is
+unaffected.
+
 **Validation-exhausted audit notifications.** LLM-driven audits that
 generate OpenSpec change proposals run each proposal through
 `openspec validate --strict` before committing. When validation fails and

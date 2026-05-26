@@ -23,7 +23,8 @@ use tokio::process::Command;
 
 use super::{
     AuditContext, AuditLogWriter, AuditOutcome, build_validation_addendum,
-    format_validation_exhausted_message, write_sandbox_settings,
+    format_validation_exhausted_message, post_proposal_created_notification,
+    read_proposal_why_first_line, write_sandbox_settings,
 };
 use crate::config::ResolvedSandbox;
 
@@ -261,6 +262,28 @@ pub(crate) async fn run_specs_writing_audit(
                         "failed to remove invalid change dir: {rm_err}"
                     );
                 }
+            }
+            // `🔍 created proposal` notification (per
+            // `a02-audit-proposal-created-notification`). Fires AFTER
+            // per-change validation succeeds AND BEFORE the git commit
+            // that ships the proposal, so operators see the audit's
+            // signal in the channel ahead of the implementer's
+            // `🚀 starting work on …` message on the next iteration.
+            // One notification per validated change; failures are
+            // logged inside the helper and do not affect the audit's
+            // `SpecsWritten` outcome.
+            for name in &validated {
+                let why_excerpt = read_proposal_why_first_line(ctx.workspace, name);
+                post_proposal_created_notification(
+                    ctx.chatops_ctx,
+                    &ctx.repo.url,
+                    audit_type,
+                    name,
+                    &why_excerpt,
+                    attempt,
+                    max_retries,
+                )
+                .await;
             }
             git_add_openspec_changes(ctx.workspace)
                 .with_context(|| format!("staging {audit_type}'s openspec/changes/ for commit"))?;

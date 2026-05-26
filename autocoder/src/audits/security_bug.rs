@@ -743,4 +743,361 @@ mod tests {
             let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
         }
     }
+
+    // ------------- 🔍 proposal-created notification scenarios -------------
+    //
+    // Exercises the `a02-audit-proposal-created-notification` wiring:
+    // when an LLM-driven specs-writing audit produces a valid proposal,
+    // a `🔍` chatops notification fires AFTER validation passes and
+    // BEFORE the proposal is committed to git. The notification's text,
+    // its retry-count parenthetical, and the no-fire-on-exhaustion +
+    // chatops-absent + chatops-failure paths are all covered here.
+
+    use super::super::test_support::{RecordingBackend, make_recording_ctx};
+    use std::sync::Arc;
+
+    fn write_valid_proposal_script(ws: &Path, slug: &str, why: &str) -> PathBuf {
+        let new = ws.join("openspec/changes").join(slug).display().to_string();
+        write_script(
+            ws,
+            "fake-claude.sh",
+            &format!(
+                "#!/bin/sh\nmkdir -p '{new}'\ncat > '{new}/proposal.md' <<'EOF'\n## Why\n\n{why}\n\n## What Changes\n- thing\nEOF\nexit 0\n"
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn proposal_created_notification_fires_on_first_attempt_success() {
+        let (_t, ws) = init_workspace_with(&[]);
+        let why = "Operator must know that the security audit created this proposal";
+        let script = write_valid_proposal_script(&ws, "secure-fire-on-success", why);
+        let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
+
+        let backend = Arc::new(RecordingBackend::new());
+        let chatops = make_recording_ctx(backend.clone());
+
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(ok_validator.to_string_lossy().to_string());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: Some(&chatops),
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        match outcome {
+            AuditOutcome::SpecsWritten { changes, retries_used } => {
+                assert_eq!(changes, vec!["secure-fire-on-success".to_string()]);
+                assert_eq!(retries_used, 0);
+            }
+            other => panic!("expected SpecsWritten, got {other:?}"),
+        }
+
+        let calls = backend.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one 🔍 notification per validated proposal: {calls:?}"
+        );
+        let text = &calls[0].text;
+        assert!(text.starts_with('🔍'), "documented glyph: {text}");
+        assert!(text.contains("security_bug_audit"), "audit type: {text}");
+        assert!(text.contains("`secure-fire-on-success`"), "slug: {text}");
+        assert!(text.contains(why), "why excerpt: {text}");
+        assert!(
+            !text.contains("validated on retry"),
+            "first-attempt success must omit retry parenthetical: {text}"
+        );
+
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    #[tokio::test]
+    async fn proposal_created_notification_includes_retry_clause_after_retry() {
+        let (_t, ws) = init_workspace_with(&[]);
+        let why = "Retried because the first attempt was rejected";
+        let script =
+            write_valid_proposal_script(&ws, "secure-after-retry", why);
+        // Validator: fails first invocation, passes second.
+        let toggle = ws.join(".validator-toggle-retry-test");
+        let validator = write_script(
+            &ws,
+            "fake-openspec-toggle-retry.sh",
+            &format!(
+                "#!/bin/sh\nMARK='{}'\nif [ ! -f \"$MARK\" ]; then\n  touch \"$MARK\"\n  echo 'missing SHALL keyword' >&2\n  exit 2\nfi\nexit 0\n",
+                toggle.display()
+            ),
+        );
+
+        let backend = Arc::new(RecordingBackend::new());
+        let chatops = make_recording_ctx(backend.clone());
+
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(validator.to_string_lossy().to_string());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: Some(&chatops),
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 2,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        assert!(
+            matches!(outcome, AuditOutcome::SpecsWritten { retries_used: 1, .. }),
+            "expected SpecsWritten with one retry, got {outcome:?}"
+        );
+
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1, "one 🔍 per validated change: {calls:?}");
+        let text = &calls[0].text;
+        assert!(
+            text.contains("(validated on retry 1 of 2)"),
+            "retry parenthetical must reach the channel verbatim: {text}"
+        );
+
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_exhausted_does_not_fire_proposal_created_notification() {
+        let (_t, ws) = init_workspace_with(&[]);
+        let script =
+            write_valid_proposal_script(&ws, "secure-never-valid", "ignored");
+        let bad_validator = write_script(
+            &ws,
+            "always-fail.sh",
+            "#!/bin/sh\necho 'MODIFIED header not found' >&2\nexit 2\n",
+        );
+
+        let backend = Arc::new(RecordingBackend::new());
+        let chatops = make_recording_ctx(backend.clone());
+
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(bad_validator.to_string_lossy().to_string());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: Some(&chatops),
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        assert!(
+            matches!(outcome, AuditOutcome::ValidationExhausted { .. }),
+            "expected ValidationExhausted, got {outcome:?}"
+        );
+
+        let calls = backend.calls();
+        // The `❌ validation-exhausted` notification still fires, but
+        // the `🔍 created proposal` notification must NOT — it is
+        // strictly the success-path counterpart.
+        let any_proposal_created =
+            calls.iter().any(|c| c.text.starts_with('🔍'));
+        assert!(
+            !any_proposal_created,
+            "🔍 created-proposal notification must NOT fire on exhaustion; calls: {calls:?}"
+        );
+        let exhausted_fired = calls.iter().any(|c| c.text.starts_with('❌'));
+        assert!(
+            exhausted_fired,
+            "❌ validation-exhausted notification SHOULD still fire: {calls:?}"
+        );
+
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    #[tokio::test]
+    async fn proposal_created_notification_fires_before_audit_commit() {
+        // Order verification: the chatops backend snapshots the
+        // workspace HEAD at the moment `post_notification` is called.
+        // If the snapshot matches the pre-audit HEAD, the notification
+        // fired before the audit's `git commit` ran — which is the
+        // ordering the spec mandates.
+        let (_t, ws) = init_workspace_with(&[]);
+        let pre_audit_head = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        let pre_audit_head = String::from_utf8_lossy(&pre_audit_head.stdout)
+            .trim()
+            .to_string();
+
+        let why = "Ordering matters: 🔍 must precede the audit commit";
+        let script = write_valid_proposal_script(&ws, "secure-ordering", why);
+        let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
+
+        let backend =
+            Arc::new(RecordingBackend::new().with_workspace(ws.clone()));
+        let chatops = make_recording_ctx(backend.clone());
+
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(ok_validator.to_string_lossy().to_string());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: Some(&chatops),
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        assert!(matches!(outcome, AuditOutcome::SpecsWritten { .. }));
+
+        // After the audit completes, HEAD has moved — the audit committed.
+        let post_audit_head = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        let post_audit_head = String::from_utf8_lossy(&post_audit_head.stdout)
+            .trim()
+            .to_string();
+        assert_ne!(
+            pre_audit_head, post_audit_head,
+            "audit must have advanced HEAD via its `git commit` step"
+        );
+
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1, "one 🔍 per validated change");
+        let snapshot = calls[0]
+            .head_at_post
+            .as_deref()
+            .expect("recording backend captured HEAD at post time");
+        assert_eq!(
+            snapshot, pre_audit_head,
+            "the 🔍 notification fired BEFORE the audit commit (HEAD at post must match pre-audit HEAD)"
+        );
+
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    #[tokio::test]
+    async fn proposal_created_chatops_error_does_not_break_audit() {
+        let (_t, ws) = init_workspace_with(&[]);
+        let script = write_valid_proposal_script(
+            &ws,
+            "secure-chatops-down",
+            "Channel down; audit must commit anyway",
+        );
+        let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
+
+        let backend = Arc::new(RecordingBackend::failing("simulated down"));
+        let chatops = make_recording_ctx(backend);
+
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(ok_validator.to_string_lossy().to_string());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: Some(&chatops),
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        assert!(
+            matches!(outcome, AuditOutcome::SpecsWritten { .. }),
+            "audit success outcome must be unaffected by a failed chatops post: {outcome:?}"
+        );
+        // The proposal commit must have landed regardless.
+        let head_log = StdCommand::new("git")
+            .args(["log", "--oneline", "-n", "5"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        let log_str = String::from_utf8_lossy(&head_log.stdout);
+        assert!(
+            log_str.contains("security-bug proposals"),
+            "proposal commit must land even when chatops post fails: {log_str}"
+        );
+
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    #[tokio::test]
+    async fn proposal_created_silent_when_chatops_absent() {
+        let (_t, ws) = init_workspace_with(&[]);
+        let script = write_valid_proposal_script(
+            &ws,
+            "secure-no-chatops",
+            "No chatops configured; audit still commits",
+        );
+        let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
+
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = SecurityBugAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(ok_validator.to_string_lossy().to_string());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        assert!(
+            matches!(outcome, AuditOutcome::SpecsWritten { .. }),
+            "audit success outcome is unaffected by absent chatops: {outcome:?}"
+        );
+        let head_log = StdCommand::new("git")
+            .args(["log", "--oneline", "-n", "5"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        let log_str = String::from_utf8_lossy(&head_log.stdout);
+        assert!(
+            log_str.contains("security-bug proposals"),
+            "proposal commit must land without chatops: {log_str}"
+        );
+
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
 }

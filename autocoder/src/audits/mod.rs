@@ -22,6 +22,8 @@ pub mod scheduler;
 pub mod security_bug;
 pub mod specs_writing;
 pub mod state;
+#[cfg(test)]
+pub mod test_support;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -704,6 +706,116 @@ pub fn format_validation_exhausted_message(
     )
 }
 
+/// Cap on the `why_excerpt` rendered into the `🔍 created proposal`
+/// chatops notification. Longer excerpts are truncated to this many
+/// characters and have `…` appended.
+pub const PROPOSAL_CREATED_WHY_EXCERPT_CAP: usize = 200;
+
+/// Render the documented `🔍` notification text shown when an LLM-
+/// driven audit's just-written proposal passes `openspec validate
+/// --strict`. The `why_excerpt` is truncated to
+/// [`PROPOSAL_CREATED_WHY_EXCERPT_CAP`] characters with an ellipsis
+/// when longer. When `retries_used > 0`, a trailing parenthetical
+/// names the retry that landed it; on first-attempt success the
+/// parenthetical is omitted.
+pub fn format_proposal_created_message(
+    repo_url: &str,
+    audit_type: &str,
+    change_slug: &str,
+    why_excerpt: &str,
+    retries_used: u32,
+    max_retries: u32,
+) -> String {
+    let excerpt = truncate_chars(why_excerpt, PROPOSAL_CREATED_WHY_EXCERPT_CAP);
+    let mut out = format!(
+        "🔍 {repo_url}: {audit_type} created proposal `{change_slug}` — {excerpt}"
+    );
+    if retries_used > 0 {
+        out.push_str(&format!(
+            " (validated on retry {retries_used} of {max_retries})"
+        ));
+    }
+    out
+}
+
+/// Post the `🔍 created proposal` chatops notification documented in
+/// `a02-audit-proposal-created-notification`. Fires after the audit's
+/// just-written proposal validates and BEFORE the proposal is committed
+/// to git / returned to the scheduler. When `chatops_ctx` is `None`
+/// (chatops not configured), the function returns silently — mirroring
+/// every other chatops-optional notification site in the daemon. When
+/// `post_notification` itself errors, the failure is logged at WARN
+/// and the function returns; the audit's success outcome is unaffected.
+pub async fn post_proposal_created_notification(
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo_url: &str,
+    audit_type: &str,
+    change_slug: &str,
+    why_excerpt: &str,
+    retries_used: u32,
+    max_retries: u32,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    let text = format_proposal_created_message(
+        repo_url,
+        audit_type,
+        change_slug,
+        why_excerpt,
+        retries_used,
+        max_retries,
+    );
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            audit_type = audit_type,
+            slug = %change_slug,
+            "proposal-created chatops post failed: {e:#}"
+        );
+    }
+}
+
+/// Read `<workspace>/openspec/changes/<slug>/proposal.md`, extract its
+/// `## Why` section, and return the first non-empty line. Returns an
+/// empty string when the file is missing, unreadable, or has no
+/// non-empty body under the `## Why` heading — callers feed the empty
+/// string through to the notification (the formatted text degrades
+/// gracefully to "— "). Mirrors the logic the polling loop uses for
+/// the start-of-work notification; kept here so the audit framework
+/// does not have to depend on a polling-loop-private helper.
+pub fn read_proposal_why_first_line(workspace: &Path, slug: &str) -> String {
+    let proposal = workspace
+        .join("openspec/changes")
+        .join(slug)
+        .join("proposal.md");
+    let raw = match std::fs::read_to_string(&proposal) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    first_line_of_why(&raw).unwrap_or_default()
+}
+
+/// Pull the first non-empty line out of the `## Why` section in a
+/// `proposal.md` body. Returns `None` when no `## Why` heading is
+/// present OR the section has no non-empty body line. Matches the
+/// shape of `polling_loop::first_line_of_section(_, "## Why")` so the
+/// two helpers stay in lock-step.
+fn first_line_of_why(text: &str) -> Option<String> {
+    let mut in_section = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if line.trim_start().starts_with("## ") {
+            in_section = line.trim_start() == "## Why";
+            continue;
+        }
+        if in_section {
+            let stripped = line.trim();
+            if !stripped.is_empty() {
+                return Some(stripped.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Spawn a child process, retrying briefly on `ETXTBSY`.
 ///
 /// Linux returns `ETXTBSY` when a `Command::spawn` execve targets a file
@@ -745,8 +857,183 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{RecordingBackend, make_recording_ctx};
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn format_proposal_created_message_first_attempt_omits_parenthetical() {
+        let msg = format_proposal_created_message(
+            "git@github.com:o/r.git",
+            "security_bug_audit",
+            "secure-bound-arp-step-count",
+            "Operator must know which audit generated a queue-bound change",
+            0,
+            1,
+        );
+        assert!(msg.starts_with('🔍'));
+        assert!(msg.contains("git@github.com:o/r.git"));
+        assert!(msg.contains("security_bug_audit"));
+        assert!(msg.contains("`secure-bound-arp-step-count`"));
+        assert!(msg.contains("Operator must know"));
+        assert!(
+            !msg.contains("validated on retry"),
+            "first-attempt success must omit retry parenthetical: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_proposal_created_message_after_retry_appends_parenthetical() {
+        let msg = format_proposal_created_message(
+            "u",
+            "missing_tests_audit",
+            "tests-add-poller-edge-cases",
+            "Cover the timeout race",
+            2,
+            3,
+        );
+        assert!(
+            msg.contains("(validated on retry 2 of 3)"),
+            "retry case must include the documented parenthetical: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_proposal_created_message_truncates_long_why_excerpt() {
+        let long = "x".repeat(500);
+        let msg = format_proposal_created_message(
+            "u",
+            "security_bug_audit",
+            "secure-x",
+            &long,
+            0,
+            1,
+        );
+        assert!(
+            msg.contains('…'),
+            "long excerpt must be truncated with an ellipsis: {msg}"
+        );
+        // Cap is PROPOSAL_CREATED_WHY_EXCERPT_CAP chars + 1 for the
+        // ellipsis; the rest of the message header is bounded so the
+        // total stays under 500.
+        assert!(msg.chars().count() < 500, "truncated msg should fit: {}", msg.chars().count());
+    }
+
+    #[tokio::test]
+    async fn post_proposal_created_notification_is_no_op_when_chatops_absent() {
+        // No panic, no log assertion harness — just confirm the call
+        // returns and does not blow up when the daemon has no chatops
+        // backend configured.
+        post_proposal_created_notification(
+            None,
+            "u",
+            "security_bug_audit",
+            "secure-x",
+            "why",
+            0,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn post_proposal_created_notification_posts_documented_text_with_chatops() {
+        let backend = Arc::new(RecordingBackend::new());
+        let ctx = make_recording_ctx(backend.clone());
+        post_proposal_created_notification(
+            Some(&ctx),
+            "git@github.com:o/r.git",
+            "security_bug_audit",
+            "secure-bound-arp-step-count",
+            "Operator must know which audit produced a change",
+            0,
+            1,
+        )
+        .await;
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1, "exactly one notification per call: {calls:?}");
+        assert_eq!(calls[0].channel, "C_AUDIT_TEST", "posts to the resolved channel");
+        let text = &calls[0].text;
+        assert!(text.starts_with('🔍'));
+        assert!(text.contains("security_bug_audit"));
+        assert!(text.contains("`secure-bound-arp-step-count`"));
+        assert!(text.contains("Operator must know"));
+        assert!(!text.contains("validated on retry"));
+    }
+
+    #[tokio::test]
+    async fn post_proposal_created_notification_retry_clause_appears_in_post() {
+        let backend = Arc::new(RecordingBackend::new());
+        let ctx = make_recording_ctx(backend.clone());
+        post_proposal_created_notification(
+            Some(&ctx),
+            "u",
+            "missing_tests_audit",
+            "tests-foo",
+            "y",
+            1,
+            2,
+        )
+        .await;
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].text.contains("(validated on retry 1 of 2)"),
+            "retry parenthetical must reach the channel: {}",
+            calls[0].text
+        );
+    }
+
+    #[tokio::test]
+    async fn post_proposal_created_notification_swallows_backend_errors() {
+        // The chatops post fails; the helper must not propagate. Audit
+        // success is unaffected by missed channel signals.
+        let backend = Arc::new(RecordingBackend::failing("simulated chatops failure"));
+        let ctx = make_recording_ctx(backend);
+        post_proposal_created_notification(
+            Some(&ctx),
+            "u",
+            "security_bug_audit",
+            "secure-x",
+            "y",
+            0,
+            1,
+        )
+        .await;
+    }
+
+    #[test]
+    fn read_proposal_why_first_line_extracts_first_nonblank_line() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let slug = "feature-a";
+        let dir = ws.join("openspec/changes").join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("proposal.md"),
+            "## Why\n\nWhy line one with detail\n\n## What Changes\n",
+        )
+        .unwrap();
+        let got = read_proposal_why_first_line(ws, slug);
+        assert_eq!(got, "Why line one with detail");
+    }
+
+    #[test]
+    fn read_proposal_why_first_line_returns_empty_when_file_missing() {
+        let tmp = TempDir::new().unwrap();
+        assert!(read_proposal_why_first_line(tmp.path(), "no-such-change").is_empty());
+    }
+
+    #[test]
+    fn read_proposal_why_first_line_returns_empty_when_section_absent() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let slug = "feature-b";
+        let dir = ws.join("openspec/changes").join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proposal.md"), "## What Changes\n- x\n").unwrap();
+        assert!(read_proposal_why_first_line(ws, slug).is_empty());
+    }
 
     #[test]
     fn log_writer_creates_dir_and_writes() {

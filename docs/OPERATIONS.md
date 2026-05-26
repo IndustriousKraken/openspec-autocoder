@@ -341,7 +341,7 @@ The log contains: the audit type, workspace path, start/end timestamps, the reso
 **Outcome dispatch:**
 
 - `AuditOutcome::Reported(findings)` → chatops post with header `📋 <repo>: <audit_type> — N finding(s)` and a bullet list of severity-glyphed subjects (low: `•`, medium: `⚠`, high: `🔴`). Default per-finding excerpt is 200 chars; full bodies live in the audit-run log. Empty findings vector is silent unless `notify_on_clean: true`.
-- `AuditOutcome::SpecsWritten(names)` → no chatops post (the existing start-of-work + PR-opened notifications cover the subsequent flow). The framework logs an info line naming each created change.
+- `AuditOutcome::SpecsWritten(names)` → one `🔍 <repo-url>: <audit_type> created proposal \`<change-slug>\` — <first line of ## Why>` chatops post per validated change (see [CHATOPS.md → Proposal-created audit notifications](CHATOPS.md#progress-notifications)). The notification fires AFTER `openspec validate --strict` passes for each proposal AND BEFORE the audit's `git commit` ships it, so operators see provenance for the `🚀 starting work on …` line that follows on the next polling iteration. The framework also logs an info line naming each created change. The notification is always sent (not gated by `notify_on_clean`); brightline + the advisory `Reported`-only audits never fire it.
 - `AuditOutcome::NoFindings` → silent.
 
 **Failure modes:**

@@ -680,4 +680,65 @@ mod tests {
             let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
         }
     }
+
+    /// Parity check with `security_bug_audit`: the proposal-created
+    /// `🔍` notification fires from the missing-tests audit too,
+    /// because both delegate to `run_specs_writing_audit`. The full
+    /// matrix (retry parenthetical, ValidationExhausted no-fire,
+    /// ordering vs. commit, chatops-down/absent) is exercised in
+    /// `security_bug.rs`; this test confirms the wiring is reached
+    /// from the missing-tests entry point.
+    #[tokio::test]
+    async fn proposal_created_notification_fires_from_missing_tests_audit() {
+        use super::super::test_support::{RecordingBackend, make_recording_ctx};
+        use std::sync::Arc;
+
+        let (_t, ws) = init_workspace_with(&[]);
+        let new = ws
+            .join("openspec/changes/tests-fire")
+            .display()
+            .to_string();
+        let why = "Missing-tests audit must also signal proposal creation";
+        let script = write_script(
+            &ws,
+            "fake-claude.sh",
+            &format!(
+                "#!/bin/sh\nmkdir -p '{new}'\ncat > '{new}/proposal.md' <<'EOF'\n## Why\n\n{why}\n\n## What Changes\n- thing\nEOF\nexit 0\n"
+            ),
+        );
+        let ok_validator = write_script(&ws, "ok.sh", "#!/bin/sh\nexit 0\n");
+
+        let backend = Arc::new(RecordingBackend::new());
+        let chatops = make_recording_ctx(backend.clone());
+
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = MissingTestsAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_openspec_command(ok_validator.to_string_lossy().to_string());
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace: &ws,
+            repo: &repo,
+            chatops_ctx: Some(&chatops),
+            log_writer: make_log_writer(&ws),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+
+        let outcome = audit.run(&mut ctx).await.expect("run succeeds");
+        assert!(matches!(outcome, AuditOutcome::SpecsWritten { .. }));
+
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1);
+        let text = &calls[0].text;
+        assert!(text.starts_with('🔍'));
+        assert!(text.contains("missing_tests_audit"));
+        assert!(text.contains("`tests-fire`"));
+        assert!(text.contains(why));
+
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
 }

@@ -6,6 +6,12 @@
 //! files. The set is intentionally small in the foundation change;
 //! future audits can plug in more checks via additional `Audit`
 //! implementations or by extending this module's metric list.
+//!
+//! The `🔍 created proposal` chatops notification documented in
+//! `a02-audit-proposal-created-notification` does NOT fire from this
+//! audit — brightline produces pure-data findings and does not
+//! generate an LLM proposal under `openspec/changes/<slug>/`, so
+//! there is no proposal-creation event to signal.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -568,5 +574,75 @@ mod tests {
             .unwrap();
         assert_eq!(&captures[1], "do_thing");
         assert_eq!(captures[2].trim(), "a: u32");
+    }
+
+    /// Regression guard for `a02-audit-proposal-created-notification`.
+    /// `architecture_brightline` does NOT generate an LLM proposal, so
+    /// the `🔍 created proposal` chatops notification must NEVER fire
+    /// from this audit — even when it produces a non-empty findings
+    /// set. The test runs the full `Audit::run` entry point through
+    /// the trait and asserts that the recording chatops backend
+    /// captured zero notifications.
+    #[tokio::test]
+    async fn brightline_does_not_post_proposal_created_notification() {
+        use super::super::test_support::{RecordingBackend, make_recording_ctx};
+        use crate::audits::{AuditContext, AuditLogWriter};
+        use crate::config::RepositoryConfig;
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        // Force at least one finding (size + duplicate signature) so
+        // the audit returns Reported with non-empty findings.
+        let big: String = (0..1500)
+            .map(|i| format!("fn shared_name() {{ /* {i} */ }}\n"))
+            .collect();
+        write(&ws.join("src/giant.rs"), &big);
+        write(&ws.join("src/other.rs"), "fn shared_name() {}\n");
+
+        let backend = Arc::new(RecordingBackend::new());
+        let chatops = make_recording_ctx(backend.clone());
+
+        let audit = ArchitectureBrightlineAudit::new(&HashMap::new());
+        let repo = RepositoryConfig {
+            url: "git@github.com:test/repo.git".into(),
+            local_path: None,
+            base_branch: "main".into(),
+            agent_branch: "agent-q".into(),
+            poll_interval_sec: 60,
+            chatops_channel_id: None,
+            max_changes_per_pr: None,
+            audits: None,
+        };
+        let log_writer =
+            AuditLogWriter::open(ws, ArchitectureBrightlineAudit::TYPE)
+                .expect("log writer opens");
+        let log_path = log_writer.path().to_path_buf();
+        let mut ctx = AuditContext {
+            workspace: ws,
+            repo: &repo,
+            chatops_ctx: Some(&chatops),
+            log_writer,
+            max_validation_retries: 0,
+        };
+        let outcome = audit.run(&mut ctx).await.expect("brightline runs");
+        match outcome {
+            AuditOutcome::Reported { findings, .. } => {
+                assert!(
+                    !findings.is_empty(),
+                    "fixture must produce findings so the no-fire assertion is meaningful"
+                );
+            }
+            other => panic!("brightline must return Reported, got {other:?}"),
+        }
+        let calls = backend.calls();
+        assert!(
+            calls.is_empty(),
+            "🔍 created proposal must NOT fire from architecture_brightline; got: {calls:?}"
+        );
+
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
     }
 }

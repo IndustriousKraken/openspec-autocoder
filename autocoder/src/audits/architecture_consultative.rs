@@ -215,6 +215,13 @@ impl Audit for ArchitectureConsultativeAudit {
         // `audits::validate_with_retry` is unnecessary here: there is no
         // proposal to validate. `retries_used` is therefore always 0.
         // (See change `a01-audit-proposal-self-validation`.)
+        //
+        // The `🔍 created proposal` chatops notification documented in
+        // `a02-audit-proposal-created-notification` therefore does NOT
+        // fire from this audit: there is no proposal-creation event to
+        // signal. Operators still see the existing `📋` findings post
+        // (or `✅` when `notify_on_clean` is set) through the scheduler's
+        // `Reported`-outcome dispatch.
         Ok(AuditOutcome::reported(findings))
     }
 }
