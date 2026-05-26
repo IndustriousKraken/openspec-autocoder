@@ -426,3 +426,47 @@ A repo cancelled mid-iteration finishes its in-flight pass normally. The cancell
 If you remove a repo and re-add it (or change a setting) before the previous task has fully exited (e.g. it is mid-push when the reload lands), the response logs a WARN and reports the URL as unchanged for that reload. Run `autocoder reload` again after a brief wait; the second reload sees the URL as absent and re-adds it cleanly.
 
 ---
+
+## Revising an open PR via comment
+
+autocoder treats a PR comment of the form `@<bot> revise <free-text>` as a
+revision request against the agent branch the PR was opened from. On the
+next polling iteration, the daemon:
+
+1. Fetches the comment, parses the revision text (everything after `revise`).
+2. Re-invokes the executor in revision mode with the original change
+   material, the current PR diff, and the operator's text.
+3. On `Completed`: commits the workspace, force-pushes (`--force-with-lease`)
+   to the agent branch, and posts a reply comment starting with
+   `✅ Revision applied:`. The PR's diff updates in place; no PR close /
+   re-open is required.
+4. On `Failed`: posts `✗ Revision attempt failed: <reason>`. The PR is
+   unchanged; the operator can reply with another `@<bot> revise ...` to
+   retry or close the PR.
+5. On `AskUser` (executor needs clarification): no commit, no reply.
+   The question is escalated via the existing ChatOps channel; once the
+   operator answers in that thread, the next polling iteration resumes
+   the revision against the same trigger comment.
+
+The trigger pattern is strict: the comment body's first non-whitespace
+token must be `@<bot>` (case-insensitive on the username) and the next
+token must be `revise` (case-insensitive). Comments like `@<bot> looks
+good` are conversational and are ignored. Anyone with GitHub write access
+to the repo can post a revision — the trust boundary matches the existing
+ChatOps channel.
+
+**Revision cap.** Each PR has a per-PR cap (default `5`; configurable via
+`executor.max_revisions_per_pr`, hard-clamped at `20`). When the cap is
+reached, the daemon posts a one-time decline comment starting with
+`🛑 Revision cap reached` AND a ChatOps notification, then silently
+ignores subsequent triggering comments on that PR. Close + re-open or
+merge as-is to reset the cap.
+
+**State persistence.** Per-PR state (last-seen-timestamp, revision count,
+cap-decline flag) lives at `<workspace>/.autocoder/revisions/<pr-number>.json`.
+Files for closed/merged PRs are pruned automatically at iteration start.
+
+**Disabling.** Set `executor.max_revisions_per_pr: 0` to opt out of the
+PR-comment revision channel entirely.
+
+---

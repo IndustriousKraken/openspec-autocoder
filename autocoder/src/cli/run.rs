@@ -138,6 +138,17 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     }
 
+    // Per-PR revision cap. Values above the ceiling are clamped down in
+    // `max_revisions_per_pr_clamped()`; we WARN once here so the operator
+    // notices the bogus value.
+    if cfg.executor.max_revisions_per_pr > crate::config::MAX_REVISIONS_PER_PR_CEILING {
+        tracing::warn!(
+            configured = cfg.executor.max_revisions_per_pr,
+            ceiling = crate::config::MAX_REVISIONS_PER_PR_CEILING,
+            "executor.max_revisions_per_pr is set above the ceiling; clamping (a runaway revision loop would otherwise burn tokens — fix your config)"
+        );
+    }
+
     // Build the audit registry once at startup. Operators wire the
     // architecture-brightline audit by listing its slug under
     // `audits.defaults` (and optionally setting `extra` knobs under
@@ -176,6 +187,7 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
     let task_map: RepoTaskMap = Arc::new(Mutex::new(HashMap::new()));
     let task_map_changed = Arc::new(tokio::sync::Notify::new());
     let executor_max_changes_per_pr = cfg.executor.max_changes_per_pr;
+    let revision_cap = cfg.executor.max_revisions_per_pr_clamped();
     let startup_jitter_max_secs = cfg.executor.startup_jitter_max_secs();
     let inter_iteration_jitter_pct = cfg.executor.inter_iteration_jitter_pct();
     let spawn_repo = build_spawn_repo_fn(SpawnDeps {
@@ -186,6 +198,7 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         stuck_threshold_secs,
         perma_stuck_threshold,
         executor_max_changes_per_pr,
+        revision_cap,
         startup_jitter_max_secs,
         inter_iteration_jitter_pct,
         audit_registry: audit_registry.clone(),
@@ -389,6 +402,7 @@ struct SpawnDeps {
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
+    revision_cap: u32,
     startup_jitter_max_secs: u64,
     inter_iteration_jitter_pct: u8,
     audit_registry: Arc<AuditRegistry>,
@@ -436,6 +450,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let stuck = deps.stuck_threshold_secs;
         let perma = deps.perma_stuck_threshold;
         let exec_max = deps.executor_max_changes_per_pr;
+        let revision_cap_for_task = deps.revision_cap;
         let startup_jitter = deps.startup_jitter_max_secs;
         let iter_jitter = deps.inter_iteration_jitter_pct;
         let registry_for_task = deps.audit_registry.clone();
@@ -454,6 +469,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 stuck,
                 perma,
                 exec_max,
+                revision_cap_for_task,
                 startup_jitter,
                 iter_jitter,
                 registry_for_task,

@@ -20,6 +20,7 @@ mod mcp_askuser_server;
 mod perma_stuck;
 mod polling_loop;
 mod queue;
+mod revisions;
 mod spec_revision;
 mod workspace;
 

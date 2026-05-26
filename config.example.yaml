@@ -90,6 +90,12 @@ executor:
   # Values above 100 are clamped to 100.
   # inter_iteration_jitter_pct: 10
 
+  # Maximum number of `@<bot> revise ...` rounds applied to a single
+  # open PR before further triggering comments are silently ignored.
+  # Default `5`. `0` disables the PR-comment revision channel entirely.
+  # Values above `20` are clamped to `20` with a WARN log at startup.
+  # max_revisions_per_pr: 5
+
 github:
   # Name of the env var holding the GitHub PAT. The token is read once
   # per PR creation; never logged.

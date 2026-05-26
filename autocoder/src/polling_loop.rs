@@ -62,6 +62,7 @@ pub struct ChatOpsContext {
 /// per-repo PR cap); the snapshot captured at the start of an iteration is
 /// used consistently for the rest of that iteration. The next iteration
 /// picks up any swap that happened during the previous sleep.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     repo: Arc<ArcSwap<RepositoryConfig>>,
     executor: Arc<dyn Executor>,
@@ -71,6 +72,7 @@ pub async fn run(
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
+    revision_cap: u32,
     startup_jitter_max_secs: u64,
     inter_iteration_jitter_pct: u8,
     audit_registry: Arc<AuditRegistry>,
@@ -88,6 +90,7 @@ pub async fn run(
         stuck_threshold_secs,
         perma_stuck_threshold,
         executor_max_changes_per_pr,
+        revision_cap,
         startup_jitter_max_secs,
         inter_iteration_jitter_pct,
         audit_registry,
@@ -114,6 +117,7 @@ pub struct RunHooks {
 }
 
 /// Same as `run` but accepts a `RunHooks` for test-only synchronization.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_with_hooks(
     repo: Arc<ArcSwap<RepositoryConfig>>,
     executor: Arc<dyn Executor>,
@@ -123,6 +127,7 @@ pub async fn run_with_hooks(
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
     executor_max_changes_per_pr: Option<u32>,
+    revision_cap: u32,
     startup_jitter_max_secs: u64,
     inter_iteration_jitter_pct: u8,
     audit_registry: Arc<AuditRegistry>,
@@ -228,6 +233,7 @@ pub async fn run_with_hooks(
             stuck_threshold_secs,
             perma_stuck_threshold,
             max_changes_per_pr,
+            revision_cap,
             audit_registry.as_ref(),
             audits_cfg.as_deref(),
             audit_settings.as_ref(),
@@ -320,6 +326,7 @@ fn build_chatops_ctx(repo: &RepositoryConfig, slot: &ChatOpsSlot) -> ChatOpsCont
 /// Single-pass workflow: workspace init → stale-lock cleanup → dirty-workspace
 /// check → branch recreation → queue walk → push + PR if commits were
 /// produced.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_one_pass(
     workspace: &Path,
     repo: &RepositoryConfig,
@@ -330,6 +337,7 @@ pub async fn execute_one_pass(
     stuck_threshold_secs: u64,
     perma_stuck_threshold: u32,
     max_changes_per_pr: u32,
+    revision_cap: u32,
     audit_registry: &AuditRegistry,
     audits_cfg: Option<&AuditsConfig>,
     audit_settings: &HashMap<String, AuditSettings>,
@@ -364,6 +372,32 @@ pub async fn execute_one_pass(
             return Err(e);
         }
     };
+
+    // Run the PR-comment revision dispatcher BEFORE the open-PR
+    // short-circuit so revisions reach open PRs. A v1 simplification:
+    // when `revision_cap` is `0`, the feature is disabled entirely.
+    if revision_cap > 0 {
+        let chatops_ctx_for_revisions = chatops_ctx.map(|c| crate::revisions::ChatOpsCtx {
+            chatops: c.chatops.as_ref(),
+            channel: c.channel.as_str(),
+        });
+        if let Err(e) = crate::revisions::process_revision_requests(
+            workspace,
+            repo,
+            github_cfg,
+            executor,
+            chatops_ctx_for_revisions,
+            revision_cap,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        {
+            tracing::warn!(
+                url = %repo.url,
+                "revision dispatcher errored (iteration continues): {e:#}"
+            );
+        }
+    }
 
     // Before doing any iteration work, check whether an open PR already
     // exists on the agent branch. If yes, this iteration would burn
@@ -4568,6 +4602,7 @@ mod tests {
                 2400,
                 u32::MAX,
                 Some(u32::MAX),
+                0, // revision_cap: disabled in tests
                 0, // startup_jitter_max_secs: deterministic for tests
                 0, // inter_iteration_jitter_pct: deterministic for tests
                 std::sync::Arc::new(crate::audits::AuditRegistry::default()),
@@ -4683,6 +4718,7 @@ mod tests {
                 2400,
                 u32::MAX,
                 Some(u32::MAX),
+                0, // revision_cap: disabled in tests
                 0, // startup_jitter_max_secs: deterministic for tests
                 0, // inter_iteration_jitter_pct: deterministic for tests
                 std::sync::Arc::new(crate::audits::AuditRegistry::default()),
@@ -5050,6 +5086,7 @@ mod tests {
             stuck_secs,
             u32::MAX,
             u32::MAX,
+            0, // revision_cap: disabled in tests
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
@@ -5148,6 +5185,7 @@ mod tests {
             stuck_secs,
             u32::MAX,
             u32::MAX,
+            0, // revision_cap: disabled in tests
             &crate::audits::AuditRegistry::default(),
             None,
             &std::collections::HashMap::new(),
@@ -7916,6 +7954,7 @@ mod tests {
                 1_000_000,
                 u32::MAX,
                 None,
+                0,  // revision_cap: disabled in tests
                 60, // startup_jitter_max_secs: large window
                 0,  // inter_iteration_jitter_pct: irrelevant
                 std::sync::Arc::new(crate::audits::AuditRegistry::default()),

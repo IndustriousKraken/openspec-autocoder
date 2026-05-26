@@ -2,6 +2,7 @@
 
 use crate::code_reviewer::ReviewReport;
 use anyhow::{Result, anyhow};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 pub const DEFAULT_API_BASE: &str = "https://api.github.com";
@@ -632,6 +633,213 @@ fn split_owner_repo(rest: &str, original: &str) -> Result<(String, String)> {
         ));
     }
     Ok((owner.to_string(), repo.to_string()))
+}
+
+/// One element of a `GET /pulls?head=...` response used by the revision
+/// dispatcher. Only the fields the dispatcher consults are deserialized.
+/// The `#[allow(dead_code)]` covers fields parsed for forward-compat or
+/// included in tests but not yet read at the call site.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PrSummary {
+    pub number: u64,
+    pub title: String,
+    #[serde(rename = "html_url")]
+    pub url: String,
+    pub state: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub head: PrRefSummary,
+    pub base: PrRefSummary,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PrRefSummary {
+    #[serde(rename = "ref")]
+    pub ref_: String,
+}
+
+/// One element of a `GET /repos/{owner}/{repo}/issues/{n}/comments`
+/// response. Only the fields the revision dispatcher consults are
+/// deserialized.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct IssueComment {
+    pub id: u64,
+    pub body: String,
+    #[serde(default)]
+    pub user: Option<IssueCommentUser>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueCommentUser {
+    pub login: String,
+}
+
+impl IssueComment {
+    /// Convenience accessor for the comment author's `user.login` field,
+    /// returning an empty string when the field is absent (deleted users).
+    pub fn user_login(&self) -> &str {
+        self.user.as_ref().map(|u| u.login.as_str()).unwrap_or("")
+    }
+}
+
+/// Look up the authenticated user (the bot) via `GET /user`. Used at
+/// startup to learn the bot's GitHub username so the revision dispatcher
+/// can filter the bot's own comments and recognize mentions.
+pub async fn self_bot_username(api_base: &str, token: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    struct UserResponse {
+        login: String,
+    }
+    let url = format!("{api_base}/user");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("token {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .send()
+        .await
+        .map_err(|e| anyhow!("github /user GET failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_snippet = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github /user GET returned {status}: {body_snippet}"
+        ));
+    }
+    let parsed: UserResponse = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("github /user response decode failed: {e}"))?;
+    Ok(parsed.login)
+}
+
+/// List open PRs whose head is `<owner>:<head_branch>`. Used by the
+/// revision dispatcher to find the set of bot-opened PRs to poll for
+/// comment triggers. Pagination beyond 100 is out of scope — a repo with
+/// >100 open PRs from a single agent branch is unrealistic.
+pub async fn list_open_prs_for_head(
+    api_base: &str,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    head_branch: &str,
+) -> Result<Vec<PrSummary>> {
+    let url = format!("{api_base}/repos/{owner}/{repo}/pulls");
+    let head_qualified = format!("{owner}:{head_branch}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .query(&[
+            ("state", "open"),
+            ("head", head_qualified.as_str()),
+            ("per_page", "100"),
+        ])
+        .header("Authorization", format!("token {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .send()
+        .await
+        .map_err(|e| anyhow!("github list-open-prs GET failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_snippet = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github list-open-prs GET {owner}/{repo} returned {status}: {body_snippet}"
+        ));
+    }
+    let parsed: Vec<PrSummary> = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("github list-open-prs response decode failed: {e}"))?;
+    Ok(parsed)
+}
+
+/// List issue comments on `pr_number` whose `created_at` is at or after
+/// `since`. GitHub's `since` parameter is inclusive on `updated_at`; for
+/// the purpose of the revision dispatcher we treat it as "new since".
+pub async fn list_issue_comments_since(
+    api_base: &str,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    since: DateTime<Utc>,
+) -> Result<Vec<IssueComment>> {
+    let url = format!("{api_base}/repos/{owner}/{repo}/issues/{pr_number}/comments");
+    let since_str = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .query(&[("since", since_str.as_str()), ("per_page", "100")])
+        .header("Authorization", format!("token {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .send()
+        .await
+        .map_err(|e| anyhow!("github list-issue-comments GET failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_snippet = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github list-issue-comments GET {owner}/{repo}#{pr_number} returned {status}: {body_snippet}"
+        ));
+    }
+    let parsed: Vec<IssueComment> = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("github list-issue-comments response decode failed: {e}"))?;
+    Ok(parsed)
+}
+
+/// Post an issue comment with `body` to `pr_number`. Used by the revision
+/// dispatcher to post success/failure/cap-decline replies. Returns Err
+/// with the HTTP status and a 500-char body snippet on non-2xx.
+pub async fn post_issue_comment(
+    api_base: &str,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    body: &str,
+) -> Result<()> {
+    let url = format!("{api_base}/repos/{owner}/{repo}/issues/{pr_number}/comments");
+    let payload = serde_json::json!({ "body": body });
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("Authorization", format!("token {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "openspec-autocoder")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| anyhow!("github post-issue-comment POST failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let snippet: String = resp
+            .text()
+            .await
+            .map(|t| t.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "github post-issue-comment POST {owner}/{repo}#{pr_number} returned {status}: {snippet}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1381,5 +1589,367 @@ mod tests {
         assert!(result.is_err(), "non-2xx must surface as Err");
         let msg = format!("{:#}", result.unwrap_err());
         assert!(msg.contains("500"), "error must name status code: {msg}");
+    }
+
+    // -------- new helpers for the revision-loop dispatcher --------
+
+    #[tokio::test]
+    async fn self_bot_username_parses_login() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/user")
+            .match_header("authorization", "token testtoken")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"login":"my-bot","id":1,"extra":"ignored"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let got = self_bot_username(&server.url(), "testtoken")
+            .await
+            .expect("self_bot_username should succeed");
+        assert_eq!(got, "my-bot");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn self_bot_username_errors_on_401() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/user")
+            .with_status(401)
+            .with_body(r#"{"message":"Bad credentials"}"#)
+            .create_async()
+            .await;
+        let err = self_bot_username(&server.url(), "bad")
+            .await
+            .expect_err("401 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("401"), "error must name status: {msg}");
+    }
+
+    #[tokio::test]
+    async fn self_bot_username_errors_on_404() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/user")
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+        let err = self_bot_username(&server.url(), "t")
+            .await
+            .expect_err("404 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("404"));
+    }
+
+    #[tokio::test]
+    async fn self_bot_username_errors_on_500() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/user")
+            .with_status(500)
+            .with_body("upstream error")
+            .create_async()
+            .await;
+        let err = self_bot_username(&server.url(), "t")
+            .await
+            .expect_err("500 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("500"));
+    }
+
+    #[tokio::test]
+    async fn list_open_prs_for_head_parses_response() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("state".into(), "open".into()),
+                mockito::Matcher::UrlEncoded("head".into(), "owner:agent-q".into()),
+                mockito::Matcher::UrlEncoded("per_page".into(), "100".into()),
+            ]))
+            .match_header("authorization", "token testtoken")
+            .with_status(200)
+            .with_body(
+                r#"[{
+                    "number": 42,
+                    "title": "Agent PR",
+                    "state": "open",
+                    "html_url": "https://github.com/owner/repo/pull/42",
+                    "body": "Some body text",
+                    "created_at": "2026-05-25T10:00:00Z",
+                    "head": {"ref": "agent-q"},
+                    "base": {"ref": "main"}
+                }]"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let prs = list_open_prs_for_head(&server.url(), "testtoken", "owner", "repo", "agent-q")
+            .await
+            .expect("call should succeed");
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 42);
+        assert_eq!(prs[0].title, "Agent PR");
+        assert_eq!(prs[0].head.ref_, "agent-q");
+        assert_eq!(prs[0].base.ref_, "main");
+        assert_eq!(prs[0].body.as_deref(), Some("Some body text"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_open_prs_for_head_empty_list() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        let prs = list_open_prs_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+            .await
+            .expect("empty list");
+        assert!(prs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_open_prs_for_head_errors_on_404() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+        let err = list_open_prs_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+            .await
+            .expect_err("404 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("404"));
+    }
+
+    #[tokio::test]
+    async fn list_open_prs_for_head_errors_on_500() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(500)
+            .with_body("server error")
+            .create_async()
+            .await;
+        let err = list_open_prs_for_head(&server.url(), "t", "owner", "repo", "agent-q")
+            .await
+            .expect_err("500 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("500"));
+    }
+
+    #[tokio::test]
+    async fn list_open_prs_for_head_errors_on_401() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(401)
+            .with_body(r#"{"message":"Bad credentials"}"#)
+            .create_async()
+            .await;
+        let err = list_open_prs_for_head(&server.url(), "bad", "owner", "repo", "agent-q")
+            .await
+            .expect_err("401 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("401"));
+    }
+
+    #[tokio::test]
+    async fn list_issue_comments_since_parses_response() {
+        let mut server = mockito::Server::new_async().await;
+        let since = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            chrono::NaiveDateTime::new(
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 25).unwrap(),
+                chrono::NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
+            ),
+            chrono::Utc,
+        );
+        let mock = server
+            .mock("GET", "/repos/owner/repo/issues/42/comments")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("since".into(), "2026-05-25T10:00:00Z".into()),
+                mockito::Matcher::UrlEncoded("per_page".into(), "100".into()),
+            ]))
+            .match_header("authorization", "token testtoken")
+            .with_status(200)
+            .with_body(
+                r#"[
+                  {
+                    "id": 1001,
+                    "body": "@bot revise drop error info",
+                    "user": {"login": "operator"},
+                    "created_at": "2026-05-25T10:01:00Z"
+                  },
+                  {
+                    "id": 1002,
+                    "body": "@bot looks good",
+                    "user": {"login": "another"},
+                    "created_at": "2026-05-25T10:02:00Z"
+                  }
+                ]"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let comments = list_issue_comments_since(
+            &server.url(),
+            "testtoken",
+            "owner",
+            "repo",
+            42,
+            since,
+        )
+        .await
+        .expect("call should succeed");
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].id, 1001);
+        assert_eq!(comments[0].user_login(), "operator");
+        assert_eq!(comments[1].user_login(), "another");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_issue_comments_since_errors_on_404() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+        let err = list_issue_comments_since(
+            &server.url(),
+            "t",
+            "owner",
+            "repo",
+            42,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect_err("404 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("404"));
+    }
+
+    #[tokio::test]
+    async fn list_issue_comments_since_errors_on_500() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(500)
+            .with_body("upstream")
+            .create_async()
+            .await;
+        let err = list_issue_comments_since(
+            &server.url(),
+            "t",
+            "owner",
+            "repo",
+            42,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect_err("500 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("500"));
+    }
+
+    #[tokio::test]
+    async fn list_issue_comments_since_errors_on_401() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(401)
+            .with_body(r#"{"message":"Bad credentials"}"#)
+            .create_async()
+            .await;
+        let err = list_issue_comments_since(
+            &server.url(),
+            "bad",
+            "owner",
+            "repo",
+            42,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect_err("401 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("401"));
+    }
+
+    #[tokio::test]
+    async fn post_issue_comment_posts_expected_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/repos/owner/repo/issues/42/comments")
+            .match_header("authorization", "token testtoken")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"body":"hello"}"#.to_string(),
+            ))
+            .with_status(201)
+            .with_body(r#"{"id":1234}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        post_issue_comment(&server.url(), "testtoken", "owner", "repo", 42, "hello")
+            .await
+            .expect("post should succeed on 201");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn post_issue_comment_errors_on_404() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(404)
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+        let err = post_issue_comment(&server.url(), "t", "owner", "repo", 42, "x")
+            .await
+            .expect_err("404 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("404"));
+    }
+
+    #[tokio::test]
+    async fn post_issue_comment_errors_on_500() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(500)
+            .with_body("upstream")
+            .create_async()
+            .await;
+        let err = post_issue_comment(&server.url(), "t", "owner", "repo", 42, "x")
+            .await
+            .expect_err("500 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("500"));
+    }
+
+    #[tokio::test]
+    async fn post_issue_comment_errors_on_401() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(401)
+            .with_body(r#"{"message":"Bad credentials"}"#)
+            .create_async()
+            .await;
+        let err = post_issue_comment(&server.url(), "bad", "owner", "repo", 42, "x")
+            .await
+            .expect_err("401 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("401"));
     }
 }

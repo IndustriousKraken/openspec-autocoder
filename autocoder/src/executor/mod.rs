@@ -19,6 +19,22 @@ pub trait Executor: Send + Sync {
     /// flags upfront, before starting implementation.
     async fn run(&self, workspace: &Path, change: &str) -> Result<ExecutorOutcome>;
     async fn resume(&self, handle: ResumeHandle, answer: &str) -> Result<ExecutorOutcome>;
+    /// Re-invoke the agent against an already-archived `change` in
+    /// `workspace`, passing the operator's revision text and the
+    /// current PR diff as context. The default implementation calls
+    /// `run`, so backends that have not yet been taught about revision
+    /// mode degrade to a plain re-run; the production
+    /// `ClaudeCliExecutor` overrides this to build a revision-mode
+    /// prompt.
+    async fn run_revision(
+        &self,
+        workspace: &Path,
+        change: &str,
+        revision_context: &crate::revisions::RevisionContext,
+    ) -> Result<ExecutorOutcome> {
+        let _ = revision_context;
+        self.run(workspace, change).await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

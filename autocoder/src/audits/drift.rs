@@ -441,6 +441,7 @@ mod tests {
             max_changes_per_pr: None,
             startup_jitter_max_secs: None,
             inter_iteration_jitter_pct: None,
+            max_revisions_per_pr: 5,
         }
     }
 

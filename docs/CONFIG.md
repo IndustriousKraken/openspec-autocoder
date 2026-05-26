@@ -160,3 +160,27 @@ This routing affects only HTTP calls to GitHub's REST API (PR creation, optional
 
 Two repositories under the same owner cannot use different tokens. Token routing is per-owner only.
 
+## `executor.max_revisions_per_pr`
+
+Maximum number of `@<bot> revise <text>` rounds applied to a single open
+PR before further triggering comments are silently ignored. Default `5`.
+A value of `0` disables the PR-comment revision channel entirely (the
+dispatcher becomes a no-op).
+
+Values above `20` are clamped to `20` at startup with a WARN log line —
+the ceiling exists so a runaway operator config (`max_revisions_per_pr:
+1000`) cannot let one PR burn tokens forever.
+
+```yaml
+executor:
+  kind: claude_cli
+  max_revisions_per_pr: 5    # default; set to 0 to disable, max 20
+```
+
+See [OPERATIONS.md](OPERATIONS.md#revising-an-open-pr-via-comment) for the
+full revision-loop flow. The cap is per PR (not per repository); each PR
+tracks its own count under
+`<workspace>/.autocoder/revisions/<pr-number>.json`. When a PR is closed
+or merged, its state file is pruned automatically — the cap resets if the
+PR is re-opened.
+

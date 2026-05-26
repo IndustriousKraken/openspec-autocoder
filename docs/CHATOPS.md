@@ -63,6 +63,21 @@ All three keys are optional. An absent `notifications:` block parses to "all tru
 
 If `post_notification` itself fails (network blip, channel renamed, scope revoked), the failure is logged to stderr but is NEVER re-routed back through chatops — there is no recursive alert cascade.
 
+**Revision cap notifications.** The PR-comment revision channel (see
+[OPERATIONS.md](OPERATIONS.md#revising-an-open-pr-via-comment)) emits a
+one-time chatops notification when an open PR hits its revision cap:
+
+```
+🛑 <repo-url>: PR #<num> hit the revision cap of <N>. Further revision requests ignored.
+```
+
+This fires alongside the one-time `🛑 Revision cap reached` PR comment.
+Subsequent triggering comments on the same PR are silently ignored — the
+one chatops line is the operator's only out-of-band signal that the PR
+has stopped accepting revisions. The notification is not gated by the
+`failure_alerts` switch (it is a one-shot per PR, not a throttled
+infrastructure alert).
+
 ## Required Slack bot scopes
 
 A **private channel** is the recommended deployment — it keeps non-operators from prompting the agent. The Slack app's bot token must have:

@@ -34,8 +34,16 @@ const SENTINEL_EXCERPT_MAX: usize = 200;
 /// so the binary runs without requiring `prompts/` on the filesystem.
 const DEFAULT_IMPLEMENTER_TEMPLATE: &str = include_str!("../../../prompts/implementer.md");
 
+/// Built-in revision-mode prompt template, embedded at compile time.
+/// Renders the original change body, the current PR diff, and the
+/// operator's revision text into a single prompt for the wrapped CLI.
+const DEFAULT_REVISION_TEMPLATE: &str =
+    include_str!("../../../prompts/implementer-revision.md");
+
 /// Literal placeholder replaced with `openspec instructions apply` output.
 const PROMPT_BODY_PLACEHOLDER: &str = "{{change_body}}";
+const REVISION_DIFF_PLACEHOLDER: &str = "{{pr_diff}}";
+const REVISION_REQUEST_PLACEHOLDER: &str = "{{revision_request}}";
 
 pub struct ClaudeCliExecutor {
     command: String,
@@ -180,6 +188,65 @@ impl ClaudeCliExecutor {
             ));
         }
         Ok(self.template.replace(PROMPT_BODY_PLACEHOLDER, &body))
+    }
+
+    /// Build the revision-mode prompt for `change` by running `openspec
+    /// instructions apply` and substituting the result into the revision
+    /// template (along with the PR diff and the operator's revision
+    /// text). Errors propagate the same way as `build_prompt`.
+    fn build_revision_prompt(
+        &self,
+        workspace: &Path,
+        change: &str,
+        revision_context: &crate::revisions::RevisionContext,
+    ) -> Result<String> {
+        let out = std::process::Command::new("openspec")
+            .args(["instructions", "apply", "--change", change])
+            .current_dir(workspace)
+            .output()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    anyhow!(
+                        "openspec binary not found on PATH while building revision prompt for `{change}`"
+                    )
+                } else {
+                    anyhow!(
+                        "spawning `openspec instructions apply` for revision of `{change}` failed: {e}"
+                    )
+                }
+            });
+        // Revision mode is best-effort about loading the original change
+        // body: if `openspec instructions apply` cannot find the change
+        // (e.g. it was archived and the active dir is gone), we fall back
+        // to a placeholder note so the executor still gets the PR diff +
+        // revision text and can make targeted edits.
+        let change_body = match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            Ok(o) => {
+                let stderr_tail: String = String::from_utf8_lossy(&o.stderr)
+                    .chars()
+                    .take(200)
+                    .collect();
+                tracing::warn!(
+                    change,
+                    "`openspec instructions apply` for revision-mode failed; falling back to placeholder: {stderr_tail}"
+                );
+                "_(original change material unavailable — `openspec instructions apply` failed; rely on the PR diff and the revision request below.)_"
+                    .to_string()
+            }
+            Err(e) => {
+                tracing::warn!(change, "revision-mode openspec invocation errored: {e:#}");
+                format!(
+                    "_(original change material unavailable — {e}; rely on the PR diff and the revision request below.)_"
+                )
+            }
+        };
+        let template = DEFAULT_REVISION_TEMPLATE;
+        let rendered = template
+            .replace(PROMPT_BODY_PLACEHOLDER, &change_body)
+            .replace(REVISION_DIFF_PLACEHOLDER, &revision_context.pr_diff)
+            .replace(REVISION_REQUEST_PLACEHOLDER, &revision_context.revision_text);
+        Ok(rendered)
     }
 
     /// Write a `<workspace>/.mcp.json` file telling the wrapped CLI to
@@ -744,6 +811,29 @@ impl Executor for ClaudeCliExecutor {
         persist_run_log(workspace, change, &prompt, &outcome);
         self.classify_outcome(workspace, change, outcome).await
     }
+
+    async fn run_revision(
+        &self,
+        workspace: &Path,
+        change: &str,
+        revision_context: &crate::revisions::RevisionContext,
+    ) -> Result<ExecutorOutcome> {
+        let prompt = self.build_revision_prompt(workspace, change, revision_context)?;
+        // Clear any stale askuser marker so it cannot masquerade as the
+        // current invocation's question — mirrors `run`.
+        let stale_marker = workspace
+            .join("openspec/changes")
+            .join(change)
+            .join(ASKUSER_MARKER_FILENAME);
+        let _ = std::fs::remove_file(&stale_marker);
+
+        let _mcp_path = Self::write_mcp_config(workspace, change)?;
+        let outcome = self.run_subprocess(workspace, &prompt).await;
+        Self::delete_mcp_config(workspace);
+        let outcome = outcome?;
+        persist_run_log(workspace, change, &prompt, &outcome);
+        self.classify_outcome(workspace, change, outcome).await
+    }
 }
 
 /// Compute the per-change run-log path:
@@ -1202,6 +1292,7 @@ mod tests {
             max_changes_per_pr: None,
             startup_jitter_max_secs: None,
             inter_iteration_jitter_pct: None,
+            max_revisions_per_pr: 5,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
@@ -1223,6 +1314,7 @@ mod tests {
             max_changes_per_pr: None,
             startup_jitter_max_secs: None,
             inter_iteration_jitter_pct: None,
+            max_revisions_per_pr: 5,
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert!(executor.template.contains("CUSTOM_TEMPLATE_SENTINEL"));
@@ -1241,6 +1333,7 @@ mod tests {
             max_changes_per_pr: None,
             startup_jitter_max_secs: None,
             inter_iteration_jitter_pct: None,
+            max_revisions_per_pr: 5,
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("missing file must error"),
@@ -1267,6 +1360,7 @@ mod tests {
             max_changes_per_pr: None,
             startup_jitter_max_secs: None,
             inter_iteration_jitter_pct: None,
+            max_revisions_per_pr: 5,
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("empty file must error"),
@@ -1501,6 +1595,57 @@ some narrative output before the sentinel\n\
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// 5.4: a revision-mode prompt build with a sample `RevisionContext`
+    /// produces a rendered prompt containing all three substitution
+    /// sections — the original change body, the PR diff, and the
+    /// revision request — in the documented order.
+    #[test]
+    fn build_revision_prompt_substitutes_all_placeholders() {
+        let (_dir, ws) = fixture_workspace();
+        let executor = ClaudeCliExecutor::new("dummy".into(), 30);
+        let ctx = crate::revisions::RevisionContext {
+            change_name: "x".to_string(),
+            pr_diff: "DIFF_HERE".to_string(),
+            revision_text: "REVISION_HERE".to_string(),
+        };
+        // openspec may or may not be available in the test environment.
+        // The function falls back to a placeholder when it's not, so
+        // either way the prompt contains the diff + revision sections.
+        let prompt = executor.build_revision_prompt(&ws, "x", &ctx).unwrap();
+        assert!(
+            prompt.contains("DIFF_HERE"),
+            "diff section missing from rendered revision prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("REVISION_HERE"),
+            "revision request missing from rendered revision prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("BEGIN ORIGINAL CHANGE"),
+            "original-change marker missing:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("BEGIN PR DIFF"),
+            "PR-diff marker missing:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("BEGIN REVISION REQUEST"),
+            "revision-request marker missing:\n{prompt}"
+        );
+        // Ordering: original change, then diff, then revision request.
+        let pos_change = prompt
+            .find("BEGIN ORIGINAL CHANGE")
+            .expect("change marker present");
+        let pos_diff = prompt.find("BEGIN PR DIFF").expect("diff marker present");
+        let pos_req = prompt
+            .find("BEGIN REVISION REQUEST")
+            .expect("revision marker present");
+        assert!(
+            pos_change < pos_diff && pos_diff < pos_req,
+            "sections out of order: change={pos_change} diff={pos_diff} req={pos_req}"
+        );
     }
 
     /// End-to-end: after a `run`, the persisted log contains a PROMPT

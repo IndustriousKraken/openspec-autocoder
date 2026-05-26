@@ -144,6 +144,22 @@ pub struct ExecutorConfig {
     /// could otherwise exceed the interval and would saturate at zero).
     #[serde(default)]
     pub inter_iteration_jitter_pct: Option<u8>,
+    /// Maximum number of `@<bot> revise ...` rounds applied to a single
+    /// open PR before further triggering comments are silently ignored.
+    /// Default `5`. A value of `0` disables the revision channel
+    /// entirely (sites that want to opt out). Values above `20` are
+    /// clamped to `20` with a WARN log at startup so a runaway operator
+    /// config does not let one PR loop forever.
+    #[serde(default = "default_max_revisions_per_pr")]
+    pub max_revisions_per_pr: u32,
+}
+
+/// Upper bound on `executor.max_revisions_per_pr`. Anything above this is
+/// clamped down at startup with a WARN log so the operator notices.
+pub const MAX_REVISIONS_PER_PR_CEILING: u32 = 20;
+
+fn default_max_revisions_per_pr() -> u32 {
+    5
 }
 
 impl ExecutorConfig {
@@ -166,6 +182,14 @@ impl ExecutorConfig {
     /// arithmetic would otherwise saturate at zero and waste resolution).
     pub fn inter_iteration_jitter_pct(&self) -> u8 {
         self.inter_iteration_jitter_pct.unwrap_or(10).min(100)
+    }
+
+    /// Effective per-PR revision cap. Raw configured values above
+    /// `MAX_REVISIONS_PER_PR_CEILING` are clamped down to it; callers
+    /// that want to detect-and-warn about the original value read
+    /// `self.max_revisions_per_pr` directly first.
+    pub fn max_revisions_per_pr_clamped(&self) -> u32 {
+        self.max_revisions_per_pr.min(MAX_REVISIONS_PER_PR_CEILING)
     }
 }
 
@@ -850,6 +874,7 @@ github:
             "perma_stuck_after_failures",
             "startup_jitter_max_secs",
             "inter_iteration_jitter_pct",
+            "max_revisions_per_pr",
             "allowed_tools",
             "disallowed_bash_patterns",
             "disallowed_read_paths",
@@ -2264,6 +2289,81 @@ github: {}
         let cfg = Config::load_from(&path).unwrap();
         assert!(cfg.executor.inter_iteration_jitter_pct.is_none());
         assert_eq!(cfg.executor.inter_iteration_jitter_pct(), 10);
+    }
+
+    #[test]
+    fn max_revisions_per_pr_default_is_5() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.max_revisions_per_pr, 5);
+        assert_eq!(cfg.executor.max_revisions_per_pr_clamped(), 5);
+    }
+
+    #[test]
+    fn max_revisions_per_pr_explicit_zero_disables_feature() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  max_revisions_per_pr: 0
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.max_revisions_per_pr, 0);
+        assert_eq!(cfg.executor.max_revisions_per_pr_clamped(), 0);
+    }
+
+    #[test]
+    fn max_revisions_per_pr_at_ceiling_is_kept() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  max_revisions_per_pr: 20
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.max_revisions_per_pr, 20);
+        assert_eq!(cfg.executor.max_revisions_per_pr_clamped(), 20);
+    }
+
+    #[test]
+    fn max_revisions_per_pr_above_ceiling_is_clamped() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  max_revisions_per_pr: 50
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.max_revisions_per_pr, 50);
+        assert_eq!(cfg.executor.max_revisions_per_pr_clamped(), 20);
     }
 
     #[test]
