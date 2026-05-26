@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -881,6 +881,123 @@ fn format_queue_one_liner(
     )
 }
 
+/// Render the enriched wipe-workspace confirmation message. Shape:
+///
+/// ```text
+/// ⚠️ Wipe-workspace requested for <repo_url>
+/// This will delete <workspace_path> (forces a re-clone on the next iteration).
+///
+/// Currently: <busy_clause>
+/// Queue (continues after wipe): <queue_clause>
+/// [Active markers (git-tracked; preserved across the wipe):
+///   • <change> (<marker-file>)
+///   ...]
+///
+/// Reply 'confirm' within 60 seconds to proceed.
+/// ```
+///
+/// The `Currently:` clause is always present and reads either `idle` or
+/// `working on \`<change>\` (started <age> ago) — will be cancelled`. The
+/// `Queue (continues after wipe):` clause reuses the same compact form
+/// as `format_queue_one_liner` (collapses to `empty queue` when all
+/// three categories are zero). The `Active markers (...)` section is
+/// elided entirely when no marker files exist — no empty section, no
+/// `(none)` placeholder. User-controlled fields (change names, repo URL,
+/// workspace path) pass through `slack_escape` belt-and-braces so a
+/// hostile commit subject can't smuggle `<!channel>` past the parser's
+/// allowlist.
+pub fn format_wipe_confirmation(
+    workspace_path: &Path,
+    repo_url: &str,
+    status: &RepoStatusResponse,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "⚠️ Wipe-workspace requested for {}\n",
+        slack_escape(repo_url)
+    ));
+    out.push_str(&format!(
+        "This will delete {} (forces a re-clone on the next iteration).\n",
+        slack_escape(&workspace_path.display().to_string())
+    ));
+    out.push('\n');
+
+    // Currently: clause.
+    let busy_clause = match &status.currently_busy {
+        Some(b) => {
+            let age = human_age_since(b.started_at);
+            format!(
+                "working on `{}` (started {age} ago) — will be cancelled",
+                slack_escape(&b.change)
+            )
+        }
+        None => "idle".to_string(),
+    };
+    out.push_str(&format!("Currently: {busy_clause}\n"));
+
+    // Queue (continues after wipe): clause. Collapse to `empty queue`
+    // when all three categories are zero.
+    let excluded: Vec<String> = status
+        .perma_stuck_changes
+        .iter()
+        .chain(status.revision_marked_changes.iter())
+        .map(|m| m.change.clone())
+        .collect();
+    let queue_empty = status.pending_changes.is_empty()
+        && status.waiting_changes.is_empty()
+        && excluded.is_empty();
+    let queue_clause = if queue_empty {
+        "empty queue".to_string()
+    } else {
+        let pending = render_count_with_list("pending", &status.pending_changes);
+        let waiting = render_count_with_list("waiting", &status.waiting_changes);
+        // Excluded gets the count alone (no parenthetical) — operators
+        // refer to the dedicated markers section below.
+        let excluded_part = format!("{} excluded", excluded.len());
+        format!("{pending}, {waiting}, {excluded_part}")
+    };
+    out.push_str(&format!("Queue (continues after wipe): {queue_clause}\n"));
+
+    // Active markers (git-tracked; preserved across the wipe). Elided
+    // when no markers exist.
+    let total_markers =
+        status.perma_stuck_changes.len() + status.revision_marked_changes.len();
+    if total_markers > 0 {
+        out.push_str("Active markers (git-tracked; preserved across the wipe):\n");
+        for m in &status.perma_stuck_changes {
+            out.push_str(&format!(
+                "  • {} (.perma-stuck.json)\n",
+                slack_escape(&m.change)
+            ));
+        }
+        for m in &status.revision_marked_changes {
+            out.push_str(&format!(
+                "  • {} (.needs-spec-revision.json)\n",
+                slack_escape(&m.change)
+            ));
+        }
+    }
+
+    out.push('\n');
+    out.push_str(&format!(
+        "Reply 'confirm' within {WIPE_CONFIRM_TTL_SECS} seconds to proceed."
+    ));
+    out
+}
+
+/// Render `N <label> (<comma-list>)` (or just `N <label>` for an empty
+/// list). Used by the wipe confirmation's queue clause; the form mirrors
+/// the queue one-liner shape from `format_status_reply`.
+fn render_count_with_list(label: &str, list: &[String]) -> String {
+    let n = list.len();
+    if n == 0 {
+        format!("{n} {label}")
+    } else {
+        let items: Vec<String> = list.iter().map(|c| slack_escape(c)).collect();
+        format!("{n} {label} ({})", items.join(", "))
+    }
+}
+
 /// Reply when the operator-supplied substring resolves to more than one
 /// configured repository.
 pub fn format_multiple_matches(substring: &str, matches: &[&RepoIdentity]) -> String {
@@ -1385,16 +1502,35 @@ impl OperatorCommandDispatcher {
                     }
                     RepoMatch::None => return format_no_match(&repo_substring, repositories),
                 };
+                // Always record the pending entry before potentially
+                // returning early — the operator has issued the verb and
+                // we want `confirm` to work even if the status fetch
+                // glitches (the worst case is then a less-rich
+                // confirmation message, not a stuck-in-limbo state).
                 self.pending.record(
                     channel_id,
                     repo.url.clone(),
                     Duration::from_secs(WIPE_CONFIRM_TTL_SECS),
                 );
-                format!(
-                    "⚠️ This will delete {} (forces a re-clone on the next \
-                     iteration). Reply 'confirm' within {WIPE_CONFIRM_TTL_SECS} seconds.",
-                    repo.workspace_path.display()
-                )
+                // Fetch the live repo status so the confirmation message
+                // can show the operator what the wipe is acting on.
+                let status_resp = submitter
+                    .submit(serde_json::json!({
+                        "action": "repo_status",
+                        "url": repo.url,
+                    }))
+                    .await;
+                let status_obj: Option<RepoStatusResponse> =
+                    if status_resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        serde_json::from_value(status_resp["status"].clone()).ok()
+                    } else {
+                        None
+                    };
+                let status = status_obj.unwrap_or_else(|| RepoStatusResponse {
+                    url: repo.url.clone(),
+                    ..RepoStatusResponse::default()
+                });
+                format_wipe_confirmation(&repo.workspace_path, &repo.url, &status)
             }
             OperatorCommand::RebuildSpecs { repo_substring } => {
                 let repo = match match_repo(&repo_substring, repositories) {
@@ -1453,7 +1589,26 @@ impl OperatorCommandDispatcher {
                         .get("path")
                         .and_then(|v| v.as_str())
                         .unwrap_or("workspace");
-                    format!("✓ wiped {path}; next iteration will re-clone")
+                    let already_absent = resp
+                        .get("already_absent")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let drain_outcome = resp
+                        .get("drain_outcome")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("no iteration in flight");
+                    // The already-absent outcome supersedes the drain
+                    // outcome in the reply text. Operators reading the
+                    // reply want to know "directory was missing" first;
+                    // the drain outcome in that case is always "no
+                    // iteration in flight" (the daemon doesn't run an
+                    // iteration with no workspace to act on) so reporting
+                    // it would be redundant noise.
+                    if already_absent {
+                        format!("✓ Wiped {path} (already absent)")
+                    } else {
+                        format!("✓ Wiped {path} ({drain_outcome})")
+                    }
                 } else {
                     let err = resp
                         .get("error")
@@ -3499,12 +3654,30 @@ mod tests {
     async fn wipe_workspace_two_step_confirm_happy_path() {
         let dispatcher = OperatorCommandDispatcher::new();
         let submitter = FakeSubmitter::new();
+        // The first step now fetches live repo_status so the warning can
+        // show currently-busy / queue / markers context to the operator.
+        submitter.set_response(
+            "repo_status",
+            serde_json::json!({
+                "ok": true,
+                "status": {
+                    "url": "git@github.com:acme/myrepo.git",
+                    "perma_stuck_changes": [],
+                    "revision_marked_changes": [],
+                    "throttled_alerts": [],
+                    "pending_changes": [],
+                    "waiting_changes": [],
+                    "last_iteration": null,
+                },
+            }),
+        );
         submitter.set_response(
             "wipe_workspace",
             serde_json::json!({
                 "ok": true,
                 "path": "/tmp/workspaces/github_com_acme_myrepo",
                 "already_absent": false,
+                "drain_outcome": "no iteration in flight",
             }),
         );
 
@@ -3522,7 +3695,10 @@ mod tests {
         assert!(warn_text.starts_with("⚠️"), "first step is a warning: {warn_text}");
         assert!(warn_text.contains("confirm"));
         assert!(warn_text.contains("60 seconds"));
-        assert!(submitter.calls().is_empty(), "no action submitted yet");
+        // The status fetch happened, but no wipe yet.
+        let first_step_calls = submitter.calls();
+        assert_eq!(first_step_calls.len(), 1);
+        assert_eq!(first_step_calls[0]["action"], "repo_status");
         assert_eq!(dispatcher.pending_len(), 1);
 
         let success = dispatcher
@@ -3531,9 +3707,15 @@ mod tests {
             .unwrap();
         let success_text = unwrap_sync(success);
         assert!(success_text.starts_with("✓"), "confirm should succeed: {success_text}");
-        assert!(success_text.contains("wiped"));
-        assert_eq!(submitter.calls().len(), 1);
-        assert_eq!(submitter.calls()[0]["action"], "wipe_workspace");
+        assert!(success_text.contains("Wiped"));
+        assert!(
+            success_text.contains("no iteration in flight"),
+            "reply must name drain outcome: {success_text}"
+        );
+        // The total call log is now repo_status + wipe_workspace.
+        let all_calls = submitter.calls();
+        assert_eq!(all_calls.len(), 2);
+        assert_eq!(all_calls[1]["action"], "wipe_workspace");
         assert_eq!(dispatcher.pending_len(), 0);
     }
 
@@ -3576,9 +3758,26 @@ mod tests {
     async fn wipe_workspace_cross_channel_confirm_no_match() {
         let dispatcher = OperatorCommandDispatcher::new();
         let submitter = FakeSubmitter::new();
+        // The first step calls repo_status; the cross-channel confirm
+        // must NOT progress to wipe_workspace.
+        submitter.set_response(
+            "repo_status",
+            serde_json::json!({
+                "ok": true,
+                "status": {
+                    "url": "git@github.com:acme/myrepo.git",
+                    "perma_stuck_changes": [],
+                    "revision_marked_changes": [],
+                    "throttled_alerts": [],
+                    "pending_changes": [],
+                    "waiting_changes": [],
+                    "last_iteration": null,
+                },
+            }),
+        );
         submitter.set_response(
             "wipe_workspace",
-            serde_json::json!({"ok": true, "path": "/tmp/workspaces/x", "already_absent": false}),
+            serde_json::json!({"ok": true, "path": "/tmp/workspaces/x", "already_absent": false, "drain_outcome": "no iteration in flight"}),
         );
         // Wipe in channel A, confirm in channel B.
         dispatcher
@@ -3598,7 +3797,17 @@ mod tests {
         let text_b = unwrap_sync(reply_b);
         assert!(text_b.starts_with("✗"));
         assert!(text_b.contains("no pending"));
-        assert!(submitter.calls().is_empty(), "no action submitted from cross-channel confirm");
+        // The first step called repo_status; no wipe_workspace was
+        // submitted from the cross-channel confirm.
+        let wipe_calls: Vec<_> = submitter
+            .calls()
+            .into_iter()
+            .filter(|c| c["action"] == "wipe_workspace")
+            .collect();
+        assert!(
+            wipe_calls.is_empty(),
+            "no wipe action submitted from cross-channel confirm"
+        );
         // A's pending entry is still live.
         assert_eq!(dispatcher.pending_len(), 1);
     }
@@ -3626,8 +3835,23 @@ mod tests {
         let dispatcher = OperatorCommandDispatcher::new();
         let submitter = FakeSubmitter::new();
         submitter.set_response(
+            "repo_status",
+            serde_json::json!({
+                "ok": true,
+                "status": {
+                    "url": "git@github.com:acme/myrepo.git",
+                    "perma_stuck_changes": [],
+                    "revision_marked_changes": [],
+                    "throttled_alerts": [],
+                    "pending_changes": [],
+                    "waiting_changes": [],
+                    "last_iteration": null,
+                },
+            }),
+        );
+        submitter.set_response(
             "wipe_workspace",
-            serde_json::json!({"ok": true, "path": "/tmp/workspaces/sound", "already_absent": false}),
+            serde_json::json!({"ok": true, "path": "/tmp/workspaces/sound", "already_absent": false, "drain_outcome": "no iteration in flight"}),
         );
         dispatcher
             .handle_message(
@@ -3665,6 +3889,229 @@ mod tests {
         assert_eq!(
             wipe_call["url"], "git@github.com:acme/widgets.git",
             "the second wipe's URL must win"
+        );
+    }
+
+    // ---------- enriched wipe-workspace confirmation message ----------
+
+    /// Build a minimal RepoStatusResponse useful as a fixture for the
+    /// confirmation-message tests.
+    fn wipe_status_fixture() -> RepoStatusResponse {
+        RepoStatusResponse {
+            url: "git@github.com:acme/myrepo.git".into(),
+            ..RepoStatusResponse::default()
+        }
+    }
+
+    #[test]
+    fn format_wipe_confirmation_idle_empty_queue_no_markers_is_compact() {
+        let status = wipe_status_fixture();
+        let out = format_wipe_confirmation(
+            std::path::Path::new("/tmp/workspaces/myrepo"),
+            "git@github.com:acme/myrepo.git",
+            &status,
+        );
+        assert!(out.contains("⚠️ Wipe-workspace requested for git@github.com:acme/myrepo.git"));
+        assert!(out.contains("/tmp/workspaces/myrepo"));
+        assert!(out.contains("Currently: idle"), "{out}");
+        assert!(
+            out.contains("Queue (continues after wipe): empty queue"),
+            "{out}"
+        );
+        // No active-markers section when nothing is marker'd.
+        assert!(
+            !out.contains("Active markers"),
+            "no marker section when none exist: {out}"
+        );
+        // The trailing confirm line is unchanged.
+        assert!(out.contains("Reply 'confirm' within 60 seconds to proceed."));
+    }
+
+    #[test]
+    fn format_wipe_confirmation_busy_nonempty_queue_with_markers_full_form() {
+        let started_5m_ago = Utc::now() - chrono::Duration::minutes(5);
+        let status = RepoStatusResponse {
+            url: "git@github.com:acme/myrepo.git".into(),
+            currently_busy: Some(BusySummary {
+                change: "audit-proposal-self-validation".into(),
+                started_at: started_5m_ago,
+            }),
+            pending_changes: vec!["pr-body-tweak".into(), "queue-archive".into()],
+            waiting_changes: vec![],
+            perma_stuck_changes: vec![MarkerEntry {
+                change: "audit-proposal-created-notification".into(),
+                marked_at: Utc::now(),
+                detail: String::new(),
+            }],
+            revision_marked_changes: vec![],
+            ..RepoStatusResponse::default()
+        };
+        let out = format_wipe_confirmation(
+            std::path::Path::new("/tmp/workspaces/myrepo"),
+            "git@github.com:acme/myrepo.git",
+            &status,
+        );
+        assert!(
+            out.contains(
+                "Currently: working on `audit-proposal-self-validation` (started 5m ago) — will be cancelled"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("Queue (continues after wipe): 2 pending (pr-body-tweak, queue-archive)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Active markers (git-tracked; preserved across the wipe):"),
+            "{out}"
+        );
+        assert!(
+            out.contains("• audit-proposal-created-notification (.perma-stuck.json)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn format_wipe_confirmation_revision_markers_render_with_correct_suffix() {
+        let status = RepoStatusResponse {
+            url: "git@github.com:acme/myrepo.git".into(),
+            revision_marked_changes: vec![MarkerEntry {
+                change: "needs-revising-thing".into(),
+                marked_at: Utc::now(),
+                detail: String::new(),
+            }],
+            ..RepoStatusResponse::default()
+        };
+        let out = format_wipe_confirmation(
+            std::path::Path::new("/tmp/workspaces/myrepo"),
+            "git@github.com:acme/myrepo.git",
+            &status,
+        );
+        assert!(
+            out.contains("• needs-revising-thing (.needs-spec-revision.json)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn format_wipe_confirmation_slack_escapes_change_names() {
+        // The parser's allowlist makes a literal `<` in a change name
+        // unreachable in normal operation, but the formatter still applies
+        // slack_escape belt-and-braces (matching the conventions
+        // established in chatops-status-enrichment).
+        let status = RepoStatusResponse {
+            url: "git@github.com:acme/myrepo.git".into(),
+            pending_changes: vec!["bad<change".into()],
+            ..RepoStatusResponse::default()
+        };
+        let out = format_wipe_confirmation(
+            std::path::Path::new("/tmp/workspaces/myrepo"),
+            "git@github.com:acme/myrepo.git",
+            &status,
+        );
+        assert!(out.contains("bad&lt;change"), "{out}");
+        assert!(!out.contains("bad<change"), "{out}");
+    }
+
+    // ---------- wipe success-reply text variants ----------
+
+    /// Helper that walks the full two-step flow and returns the
+    /// success-reply text for a given wipe_workspace response shape.
+    async fn run_wipe_with_response(
+        wipe_response: serde_json::Value,
+    ) -> String {
+        let dispatcher = OperatorCommandDispatcher::new();
+        let submitter = FakeSubmitter::new();
+        submitter.set_response(
+            "repo_status",
+            serde_json::json!({
+                "ok": true,
+                "status": {
+                    "url": "git@github.com:acme/myrepo.git",
+                    "perma_stuck_changes": [],
+                    "revision_marked_changes": [],
+                    "throttled_alerts": [],
+                    "pending_changes": [],
+                    "waiting_changes": [],
+                    "last_iteration": null,
+                },
+            }),
+        );
+        submitter.set_response("wipe_workspace", wipe_response);
+        dispatcher
+            .handle_message(
+                &format!("{BOT} wipe-workspace myrepo"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .unwrap();
+        let reply = dispatcher
+            .handle_message("confirm", "C1", BOT, &fixture_repos(), &submitter)
+            .await
+            .unwrap();
+        unwrap_sync(reply)
+    }
+
+    #[tokio::test]
+    async fn wipe_reply_drained_cleanly_text() {
+        let text = run_wipe_with_response(serde_json::json!({
+            "ok": true,
+            "path": "/tmp/workspaces/myrepo",
+            "already_absent": false,
+            "drain_outcome": "drained cleanly in 1.2s",
+        }))
+        .await;
+        assert_eq!(
+            text,
+            "✓ Wiped /tmp/workspaces/myrepo (drained cleanly in 1.2s)"
+        );
+    }
+
+    #[tokio::test]
+    async fn wipe_reply_drain_timeout_text() {
+        let text = run_wipe_with_response(serde_json::json!({
+            "ok": true,
+            "path": "/tmp/workspaces/myrepo",
+            "already_absent": false,
+            "drain_outcome": "drain timeout — iteration may have been stuck",
+        }))
+        .await;
+        assert_eq!(
+            text,
+            "✓ Wiped /tmp/workspaces/myrepo (drain timeout — iteration may have been stuck)"
+        );
+    }
+
+    #[tokio::test]
+    async fn wipe_reply_no_iteration_in_flight_text() {
+        let text = run_wipe_with_response(serde_json::json!({
+            "ok": true,
+            "path": "/tmp/workspaces/myrepo",
+            "already_absent": false,
+            "drain_outcome": "no iteration in flight",
+        }))
+        .await;
+        assert_eq!(
+            text,
+            "✓ Wiped /tmp/workspaces/myrepo (no iteration in flight)"
+        );
+    }
+
+    #[tokio::test]
+    async fn wipe_reply_already_absent_text() {
+        let text = run_wipe_with_response(serde_json::json!({
+            "ok": true,
+            "path": "/tmp/workspaces/myrepo",
+            "already_absent": true,
+            "drain_outcome": "no iteration in flight",
+        }))
+        .await;
+        assert_eq!(
+            text,
+            "✓ Wiped /tmp/workspaces/myrepo (already absent)"
         );
     }
 

@@ -474,6 +474,11 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let pending_audit_runs: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let pending_audit_runs_for_task = pending_audit_runs.clone();
+        let iteration_cancel: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let iteration_cancel_for_task = iteration_cancel.clone();
+        let iteration_drained: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+        let iteration_drained_for_task = iteration_drained.clone();
         let join: JoinHandle<()> = tokio::spawn(async move {
             polling_loop::run(
                 config_for_task,
@@ -493,6 +498,8 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 pending_rebuild_for_task,
                 pending_triages_for_task,
                 pending_audit_runs_for_task,
+                iteration_cancel_for_task,
+                iteration_drained_for_task,
                 cancel_for_task,
             )
             .await;
@@ -519,6 +526,8 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                     pending_rebuild,
                     pending_triages,
                     pending_audit_runs,
+                    iteration_cancel,
+                    iteration_drained,
                 },
             );
             true

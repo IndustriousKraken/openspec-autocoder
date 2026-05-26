@@ -96,6 +96,15 @@ executor:
   # Values above `20` are clamped to `20` with a WARN log at startup.
   # max_revisions_per_pr: 5
 
+  # Seconds the `@<bot> wipe-workspace` flow waits for the in-flight
+  # per-repo polling iteration to drain (release its busy marker) after
+  # the operator types `confirm`. The wipe runs regardless of whether
+  # the drain completes within the window. Defaults to `30`. Values
+  # above `300` (5 minutes) are clamped to `300` with a WARN log at
+  # startup — a longer wait holds the chatops listener busy for too
+  # long and almost always indicates misconfiguration.
+  # wipe_drain_timeout_secs: 30
+
 github:
   # Name of the env var holding the GitHub PAT. The token is read once
   # per PR creation; never logged.

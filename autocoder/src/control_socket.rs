@@ -81,6 +81,20 @@ pub struct RepoTaskHandle {
     /// queue is de-duplicated on insert so multiple `audit` commands
     /// before a single iteration collapse to one run.
     pub pending_audit_runs: Arc<Mutex<Vec<String>>>,
+    /// Per-iteration cancel token. The polling loop populates this with
+    /// a child of the global cancel at iteration start and clears it
+    /// back to `None` at iteration end (via an `IterationGuard` drop).
+    /// The `wipe_workspace` control-socket handler fires it to ask the
+    /// in-flight iteration to drain cleanly before the workspace is
+    /// deleted; firing it does NOT cancel the per-repo polling task —
+    /// only the current iteration body sees the cancellation.
+    pub iteration_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    /// Per-repo `Notify` that fires every time the iteration's per-
+    /// iteration cleanup runs. The `wipe_workspace` handler awaits this
+    /// after firing `iteration_cancel` so the wipe can run on a quiet
+    /// workspace instead of yanking the directory out from under a
+    /// live executor subprocess.
+    pub iteration_drained: Arc<Notify>,
 }
 
 /// Daemon-level task registry keyed by repository URL. Mutated only by
@@ -277,7 +291,7 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "repo_status_all" => handle_repo_status_all(state).await,
         "clear_perma_stuck_marker" => handle_clear_perma_stuck(&parsed, state),
         "clear_revision_marker" => handle_clear_revision(&parsed, state),
-        "wipe_workspace" => handle_wipe_workspace(&parsed, state),
+        "wipe_workspace" => handle_wipe_workspace(&parsed, state).await,
         "rebuild_specs" => handle_rebuild_specs(&parsed, state).await,
         "trigger_audit_action" => handle_trigger_audit_action(&parsed, state).await,
         "queue_audit" => handle_queue_audit(&parsed, state),
@@ -689,7 +703,15 @@ fn handle_clear_revision(parsed: &Value, state: &ControlState) -> Value {
 /// it gone, it's gone). Returns the path that was (or would have been)
 /// removed in the success response so the chatops reply names a concrete
 /// thing.
-fn handle_wipe_workspace(parsed: &Value, state: &ControlState) -> Value {
+///
+/// Before deleting, the handler signals the per-repo polling task's
+/// per-iteration cancel token (when set) and awaits the `iteration_drained`
+/// `Notify` so the in-flight executor subprocess exits cleanly instead of
+/// losing its CWD to a `remove_dir_all`. The wait is capped by
+/// `executor.wipe_drain_timeout_secs`; the deletion runs regardless of
+/// whether the drain completed, since the directory is going to be gone
+/// either way.
+async fn handle_wipe_workspace(parsed: &Value, state: &ControlState) -> Value {
     let url = match require_str(parsed, "url") {
         Ok(u) => u,
         Err(e) => return json!({"ok": false, "error": e}),
@@ -700,11 +722,93 @@ fn handle_wipe_workspace(parsed: &Value, state: &ControlState) -> Value {
     };
     let workspace_path = workspace::resolve_path(&repo);
     let display = workspace_path.display().to_string();
+
+    // Look up the per-repo handle's iteration_cancel handle + drained
+    // Notify under the briefest possible lock so the lookup never blocks
+    // the chatops listener for longer than a hashmap probe + Arc clone.
+    let (iter_token, drained_notify): (Option<CancellationToken>, Option<Arc<Notify>>) = {
+        let guard = state.repo_tasks.lock().unwrap();
+        match guard.get(&url) {
+            Some(h) => {
+                let token = h.iteration_cancel.lock().unwrap().clone();
+                (token, Some(h.iteration_drained.clone()))
+            }
+            None => (None, None),
+        }
+    };
+
+    // Drain coordination. The four-outcome decision tree (per the
+    // wipe-workspace spec): drained-cleanly / drain-timeout / no-iteration /
+    // already-absent. The first two require an in-flight iteration; the
+    // third is the "between iterations, just delete" short-circuit; the
+    // fourth is the idempotent no-op.
+    let drain_timeout_secs = state
+        .last_config
+        .load_full()
+        .executor
+        .wipe_drain_timeout_secs_clamped();
+    let drain_outcome: String = if let (Some(token), Some(notify)) = (iter_token, drained_notify) {
+        let start = std::time::Instant::now();
+        // Register interest in the Notify BEFORE firing the cancel so we
+        // don't miss the wake. `Notify::notified()` only observes events
+        // that fire after the future is created.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        token.cancel();
+        if drain_timeout_secs == 0 {
+            // Special case: skip the await entirely. The wipe runs
+            // immediately whether the iteration responded or not. Treat
+            // as a drain-timeout outcome so the operator's chatops reply
+            // still signals "we did not wait" rather than misleadingly
+            // claiming a clean drain.
+            "drain timeout — iteration may have been stuck".to_string()
+        } else {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(drain_timeout_secs),
+                notified.as_mut(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    format!("drained cleanly in {elapsed:.1}s")
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        url = %url,
+                        timeout_secs = drain_timeout_secs,
+                        "wipe-workspace drain timeout: the in-flight iteration for `{url}` did not exit \
+                         within {drain_timeout_secs}s of the per-iteration cancel signal; \
+                         proceeding with the workspace deletion regardless"
+                    );
+                    "drain timeout — iteration may have been stuck".to_string()
+                }
+            }
+        }
+    } else {
+        "no iteration in flight".to_string()
+    };
+
     if !workspace_path.exists() {
-        return json!({"ok": true, "path": display, "url": url, "already_absent": true});
+        // Existing already-absent shape preserved (no behaviour change for
+        // operators who scripted against the prior `ok=true,
+        // already_absent=true` payload). The drain_outcome is appended.
+        return json!({
+            "ok": true,
+            "path": display,
+            "url": url,
+            "already_absent": true,
+            "drain_outcome": drain_outcome,
+        });
     }
     match std::fs::remove_dir_all(&workspace_path) {
-        Ok(()) => json!({"ok": true, "path": display, "url": url, "already_absent": false}),
+        Ok(()) => json!({
+            "ok": true,
+            "path": display,
+            "url": url,
+            "already_absent": false,
+            "drain_outcome": drain_outcome,
+        }),
         Err(e) => json!({
             "ok": false,
             "error": format!("removing {display}: {e}"),
@@ -1265,6 +1369,8 @@ mod tests {
                     pending_rebuild: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     pending_triages: Arc::new(Mutex::new(Vec::new())),
                     pending_audit_runs: Arc::new(Mutex::new(Vec::new())),
+                    iteration_cancel: Arc::new(Mutex::new(None)),
+                    iteration_drained: Arc::new(Notify::new()),
                 },
             );
             drop(guard);
@@ -2050,6 +2156,147 @@ github:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wipe_workspace_reports_no_iteration_in_flight_when_handle_unset() {
+        // The seeded fixture's per-repo handle has `iteration_cancel: None`
+        // (the fake polling task isn't running an actual iteration loop).
+        // The wipe handler must short-circuit straight to the deletion and
+        // report the "no iteration in flight" outcome.
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "wipe_workspace",
+            "url": "git@github.com:owner/myrepo.git",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(
+            resp["drain_outcome"].as_str().unwrap(),
+            "no iteration in flight",
+            "resp: {resp}"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wipe_workspace_drains_cleanly_when_iteration_responds_quickly() {
+        // Plant a per-iteration cancel handle on the fake polling task and
+        // arrange for the iteration_drained Notify to fire as soon as the
+        // cancel is observed. The wipe handler should record a
+        // "drained cleanly in <Xs>" outcome and proceed with the deletion.
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (_dir, socket, state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let url = "git@github.com:owner/myrepo.git";
+
+        // Install a per-iteration cancel + spawn a tiny task that fires
+        // the Notify when the cancel observes a cancellation.
+        let (iter_cancel, drained) = {
+            let guard = state.repo_tasks.lock().unwrap();
+            let h = guard.get(url).expect("seeded handle");
+            let token = CancellationToken::new();
+            *h.iteration_cancel.lock().unwrap() = Some(token.clone());
+            (token, h.iteration_drained.clone())
+        };
+        let watcher = tokio::spawn(async move {
+            iter_cancel.cancelled().await;
+            drained.notify_waiters();
+        });
+
+        let req = serde_json::json!({
+            "action": "wipe_workspace",
+            "url": url,
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let outcome = resp["drain_outcome"].as_str().unwrap();
+        assert!(
+            outcome.starts_with("drained cleanly in "),
+            "expected drained-cleanly outcome, got: {outcome}"
+        );
+        assert!(!workspace.exists(), "workspace must be deleted after drain");
+
+        let _ = watcher.await;
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wipe_workspace_reports_drain_timeout_when_iteration_ignores_cancel() {
+        // Plant a per-iteration cancel handle BUT do NOT fire the
+        // iteration_drained Notify. The drain must time out and the wipe
+        // must run anyway.
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        // Set wipe_drain_timeout_secs: 1 so the timeout fires fast.
+        let yaml = format!(
+            r#"
+repositories:
+  - url: "git@github.com:owner/myrepo.git"
+    local_path: "{}"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  wipe_drain_timeout_secs: 1
+github:
+  token_env: GITHUB_TOKEN
+  token:
+    value: "ghp_fixture"
+"#,
+            workspace.display()
+        );
+        let (_dir, socket, state, _cfg_path, cancel) = fixture_listener(&yaml).await;
+        let url = "git@github.com:owner/myrepo.git";
+        {
+            let guard = state.repo_tasks.lock().unwrap();
+            let h = guard.get(url).expect("seeded handle");
+            *h.iteration_cancel.lock().unwrap() = Some(CancellationToken::new());
+        }
+        let req = serde_json::json!({
+            "action": "wipe_workspace",
+            "url": url,
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(
+            resp["drain_outcome"].as_str().unwrap(),
+            "drain timeout — iteration may have been stuck",
+            "resp: {resp}"
+        );
+        assert!(!workspace.exists(), "wipe must run regardless of drain");
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wipe_workspace_already_absent_includes_drain_outcome() {
+        // Idempotent no-op case: the workspace is already gone AND no
+        // iteration is in flight. The response must still carry the
+        // (no-iteration) drain_outcome for the chatops formatter.
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("never-created");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "wipe_workspace",
+            "url": "git@github.com:owner/myrepo.git",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["already_absent"], serde_json::Value::Bool(true));
+        assert_eq!(
+            resp["drain_outcome"].as_str().unwrap(),
+            "no iteration in flight"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn repo_status_assembles_marker_alert_and_queue_snapshot() {
         let dir = TempDir::new().unwrap();
         let workspace = dir.path().join("ws");
@@ -2282,6 +2529,8 @@ github:
                     pending_rebuild: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     pending_triages: Arc::new(Mutex::new(Vec::new())),
                     pending_audit_runs: Arc::new(Mutex::new(Vec::new())),
+                    iteration_cancel: Arc::new(Mutex::new(None)),
+                    iteration_drained: Arc::new(Notify::new()),
                 },
             );
         }

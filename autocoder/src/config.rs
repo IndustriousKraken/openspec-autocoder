@@ -152,7 +152,29 @@ pub struct ExecutorConfig {
     /// config does not let one PR loop forever.
     #[serde(default = "default_max_revisions_per_pr")]
     pub max_revisions_per_pr: u32,
+    /// Seconds the `wipe_workspace` control-socket handler waits for the
+    /// in-flight per-repo iteration to drain (release its busy marker)
+    /// after firing the per-iteration cancel token. The wipe runs
+    /// regardless of whether the drain completes within the window —
+    /// the directory is going away one way or another; the drain is a
+    /// politeness, not a hard precondition. Defaults to `30`. Values
+    /// above `WIPE_DRAIN_TIMEOUT_CEILING_SECS` (300, i.e. 5 minutes) are
+    /// clamped at startup with a WARN: anything longer is almost
+    /// certainly operator misconfiguration and would hold the chatops
+    /// listener busy for too long.
+    #[serde(default = "default_wipe_drain_timeout_secs")]
+    pub wipe_drain_timeout_secs: u64,
 }
+
+/// Default seconds the wipe-workspace handler waits for the per-iteration
+/// drain after firing the cancel token.
+pub fn default_wipe_drain_timeout_secs() -> u64 {
+    30
+}
+
+/// Upper bound on `executor.wipe_drain_timeout_secs`. Anything above is
+/// clamped down at startup with a WARN log so the operator notices.
+pub const WIPE_DRAIN_TIMEOUT_CEILING_SECS: u64 = 300;
 
 /// Upper bound on `executor.max_revisions_per_pr`. Anything above this is
 /// clamped down at startup with a WARN log so the operator notices.
@@ -190,6 +212,36 @@ impl ExecutorConfig {
     /// `self.max_revisions_per_pr` directly first.
     pub fn max_revisions_per_pr_clamped(&self) -> u32 {
         self.max_revisions_per_pr.min(MAX_REVISIONS_PER_PR_CEILING)
+    }
+
+    /// Effective wipe-workspace drain timeout (seconds). Values above
+    /// `WIPE_DRAIN_TIMEOUT_CEILING_SECS` are clamped down so a runaway
+    /// config can't pin the chatops listener busy for longer than 5
+    /// minutes on a single wipe. Operators wanting to detect the clamp
+    /// at startup read `self.wipe_drain_timeout_secs` directly first.
+    pub fn wipe_drain_timeout_secs_clamped(&self) -> u64 {
+        self.wipe_drain_timeout_secs
+            .min(WIPE_DRAIN_TIMEOUT_CEILING_SECS)
+    }
+}
+
+/// Clamp the configured wipe-workspace drain timeout. Values above
+/// `WIPE_DRAIN_TIMEOUT_CEILING_SECS` are clamped down to the ceiling
+/// AND a `tracing::warn!` is emitted naming both the requested and
+/// clamped values. Returns `(clamped_value, Option<warn_message>)` so
+/// callers (in particular `Config::load_from` and the unit tests) can
+/// observe whether a WARN was issued without having to scrape the
+/// tracing log.
+pub fn clamp_wipe_drain_timeout_secs(requested: u64) -> (u64, Option<String>) {
+    if requested > WIPE_DRAIN_TIMEOUT_CEILING_SECS {
+        let msg = format!(
+            "executor.wipe_drain_timeout_secs ({requested}) is above the ceiling of \
+             {WIPE_DRAIN_TIMEOUT_CEILING_SECS}; clamping to {WIPE_DRAIN_TIMEOUT_CEILING_SECS}"
+        );
+        tracing::warn!("{msg}");
+        (WIPE_DRAIN_TIMEOUT_CEILING_SECS, Some(msg))
+    } else {
+        (requested, None)
     }
 }
 
@@ -845,6 +897,9 @@ impl Config {
             let (clamped, _) = clamp_max_validation_retries(audits.max_validation_retries);
             audits.max_validation_retries = clamped;
         }
+        let (drain_clamped, _) =
+            clamp_wipe_drain_timeout_secs(cfg.executor.wipe_drain_timeout_secs);
+        cfg.executor.wipe_drain_timeout_secs = drain_clamped;
         Ok(cfg)
     }
 }
@@ -936,6 +991,7 @@ github:
             "startup_jitter_max_secs",
             "inter_iteration_jitter_pct",
             "max_revisions_per_pr",
+            "wipe_drain_timeout_secs",
             "allowed_tools",
             "disallowed_bash_patterns",
             "disallowed_read_paths",
@@ -2474,6 +2530,100 @@ github: {}
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.executor.inter_iteration_jitter_pct, Some(250));
         assert_eq!(cfg.executor.inter_iteration_jitter_pct(), 100);
+    }
+
+    #[test]
+    fn wipe_drain_timeout_defaults_to_thirty_when_absent() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.wipe_drain_timeout_secs, 30);
+        assert_eq!(cfg.executor.wipe_drain_timeout_secs_clamped(), 30);
+    }
+
+    #[test]
+    fn wipe_drain_timeout_zero_is_permitted() {
+        // 0 skips the await; the wipe runs immediately whether the
+        // iteration responded or not. Useful for sites that always want
+        // the wipe NOW and don't care about a clean drain.
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  wipe_drain_timeout_secs: 0
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.wipe_drain_timeout_secs, 0);
+        assert_eq!(cfg.executor.wipe_drain_timeout_secs_clamped(), 0);
+        let (clamped, warn) = clamp_wipe_drain_timeout_secs(0);
+        assert_eq!(clamped, 0);
+        assert!(warn.is_none(), "no warn for 0");
+    }
+
+    #[test]
+    fn wipe_drain_timeout_three_hundred_is_permitted_no_warn() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  wipe_drain_timeout_secs: 300
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.wipe_drain_timeout_secs, 300);
+        assert_eq!(cfg.executor.wipe_drain_timeout_secs_clamped(), 300);
+        let (clamped, warn) = clamp_wipe_drain_timeout_secs(300);
+        assert_eq!(clamped, 300);
+        assert!(warn.is_none(), "no warn at ceiling");
+    }
+
+    #[test]
+    fn wipe_drain_timeout_above_ceiling_is_clamped_with_warn() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  wipe_drain_timeout_secs: 600
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        // load_from clamps the stored value in-place.
+        assert_eq!(cfg.executor.wipe_drain_timeout_secs, WIPE_DRAIN_TIMEOUT_CEILING_SECS);
+        assert_eq!(cfg.executor.wipe_drain_timeout_secs_clamped(), WIPE_DRAIN_TIMEOUT_CEILING_SECS);
+        // And the warn-message inspection.
+        let (clamped, warn) = clamp_wipe_drain_timeout_secs(600);
+        assert_eq!(clamped, WIPE_DRAIN_TIMEOUT_CEILING_SECS);
+        let msg = warn.expect("warn must be emitted when above ceiling");
+        assert!(msg.contains("600"), "warn names requested value: {msg}");
+        assert!(
+            msg.contains(&WIPE_DRAIN_TIMEOUT_CEILING_SECS.to_string()),
+            "warn names clamped value: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------

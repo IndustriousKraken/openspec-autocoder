@@ -1338,6 +1338,7 @@ mod tests {
             startup_jitter_max_secs: None,
             inter_iteration_jitter_pct: None,
             max_revisions_per_pr: 5,
+            wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert_eq!(executor.template, DEFAULT_IMPLEMENTER_TEMPLATE);
@@ -1360,6 +1361,7 @@ mod tests {
             startup_jitter_max_secs: None,
             inter_iteration_jitter_pct: None,
             max_revisions_per_pr: 5,
+            wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
         };
         let executor = ClaudeCliExecutor::from_config(&cfg).unwrap();
         assert!(executor.template.contains("CUSTOM_TEMPLATE_SENTINEL"));
@@ -1379,6 +1381,7 @@ mod tests {
             startup_jitter_max_secs: None,
             inter_iteration_jitter_pct: None,
             max_revisions_per_pr: 5,
+            wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("missing file must error"),
@@ -1406,6 +1409,7 @@ mod tests {
             startup_jitter_max_secs: None,
             inter_iteration_jitter_pct: None,
             max_revisions_per_pr: 5,
+            wipe_drain_timeout_secs: crate::config::default_wipe_drain_timeout_secs(),
         };
         let err = match ClaudeCliExecutor::from_config(&cfg) {
             Ok(_) => panic!("empty file must error"),

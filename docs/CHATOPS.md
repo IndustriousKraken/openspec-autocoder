@@ -333,13 +333,34 @@ You type the short name; the bot resolves it. The match is case-insensitive subs
 
 ### Two-step confirmation for `wipe-workspace`
 
-`wipe-workspace` is destructive, so the first reply is a warning rather than the action:
+`wipe-workspace` is destructive, so the first reply is a warning rather than the action. The warning includes a context preview drawn from the same live data the per-repo `status` command surfaces, so you can make an informed go/no-go call before committing to the wipe:
 
 ```
-⚠️ This will delete /tmp/workspaces/github_com_acme_myrepo (forces a re-clone on the next iteration). Reply 'confirm' within 60 seconds.
+⚠️ Wipe-workspace requested for git@github.com:acme/myrepo.git
+This will delete /tmp/workspaces/github_com_acme_myrepo (forces a re-clone on the next iteration).
+
+Currently: working on `audit-proposal-self-validation` (started 5m ago) — will be cancelled
+Queue (continues after wipe): 2 pending (pr-body-tweak, queue-archive), 0 waiting, 0 excluded
+Active markers (git-tracked; preserved across the wipe):
+  • audit-proposal-created-notification (.needs-spec-revision.json)
+
+Reply 'confirm' within 60 seconds to proceed.
 ```
+
+What each section means:
+
+- **`Currently:`** — `idle` when no busy marker exists; `working on <change> (started <age> ago) — will be cancelled` when the daemon is mid-iteration. Always present so you see what state the wipe is acting on.
+- **`Queue (continues after wipe):`** — one-line summary in the same compact form as `status`'s queue clause. Collapses to `Queue (continues after wipe): empty queue` when pending, waiting, and excluded categories are all zero. The queue is preserved across the wipe: only the workspace directory is deleted; the daemon's per-repo state continues.
+- **`Active markers (git-tracked; preserved across the wipe):`** — only present when at least one `.perma-stuck.json` or `.needs-spec-revision.json` marker file exists. The "git-tracked; preserved" note reassures you the wipe does not lose marker state — markers are part of the repository tree and return from origin on the next re-clone.
 
 To proceed, reply `confirm` (case-insensitive, no mention needed) within 60 seconds in the same channel. The confirmation is channel-scoped: a `confirm` in a different channel does NOT trigger a pending wipe somewhere else. If you wait longer than 60 seconds, the pending entry expires and you must re-issue the original `wipe-workspace` command.
+
+On `confirm`, the daemon signals the in-flight iteration's per-iteration cancel token, awaits a brief drain (default 30 seconds, configurable via `executor.wipe_drain_timeout_secs`), then deletes the directory. The reply names the drain outcome:
+
+- `✓ Wiped <path> (drained cleanly in <Xs>)` — the iteration exited within the timeout. The cleanest outcome.
+- `✓ Wiped <path> (drain timeout — iteration may have been stuck)` — the iteration did not exit within the timeout; the wipe ran anyway. Yellow flag: see `docs/TROUBLESHOOTING.md` for follow-up.
+- `✓ Wiped <path> (no iteration in flight)` — the daemon was between iterations at confirm time. No drain was needed.
+- `✓ Wiped <path> (already absent)` — the workspace directory was already missing. Idempotent no-op.
 
 ### Reply shape
 

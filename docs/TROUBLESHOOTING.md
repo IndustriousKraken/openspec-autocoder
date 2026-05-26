@@ -280,3 +280,35 @@ double-spending the LLM budget on the same findings.
   it's a real problem with the findings, revise the audit's source
   (e.g. tweak its config or fix what produced the noise) before
   retrying.
+
+### `✓ Wiped <path> (drain timeout — iteration may have been stuck)`
+
+The wipe-workspace flow on `confirm` signals the in-flight per-repo
+iteration's per-iteration cancel token and waits up to
+`executor.wipe_drain_timeout_secs` (default 30) for the iteration to
+release its busy marker before deleting the workspace directory.
+"Drain timeout" means the iteration did not respond within that window.
+The wipe still succeeded — the directory is gone and the next polling
+tick will re-clone — but the timeout is a yellow flag worth
+investigating.
+
+The usual cause is a blocking syscall inside the iteration: a hung
+executor subprocess (a `claude` CLI that never returned), a long `git
+fetch` against a slow remote, or an external tool the iteration is
+waiting on. The per-iteration cancel token can only fire at safety
+points; a blocking syscall holds the iteration past those points.
+
+**What to do.** After the wipe completes, open the stuck iteration's
+log at `/tmp/autocoder/logs/<workspace>/<change>.log` (the workspace
+log directory persists across a workspace wipe — only the workspace
+itself is removed). Look at the tail to see what the iteration was
+doing when the cancel signal arrived. Common findings:
+
+- A `claude` subprocess hanging mid-tool-use → the wrapped CLI may
+  have crashed without exiting. Restart the daemon (`autocoder run`) so
+  any orphan subprocesses are reaped, and re-issue the change.
+- A `git fetch` waiting on an unreachable remote → check network and
+  the upstream's reachability from this host.
+- A long executor invocation that simply needs more time → consider
+  raising `executor.wipe_drain_timeout_secs` (capped at 300) so future
+  wipes give the iteration the headroom it needed.
