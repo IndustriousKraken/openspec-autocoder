@@ -30,6 +30,13 @@ pub struct SlackBackend {
     api_base: String,
     bot_token: String,
     bot_user_id: String,
+    /// Cached `bot_id` from `auth.test`. Slack's mobile client emits
+    /// `@<bot>` mentions as `<@B...>` (bot-id form) while the desktop
+    /// client emits them as `<@U...>` (user-id form). Caching the B-id
+    /// at construction lets the inbound listener accept both. `None`
+    /// when `auth.test` did not return a `bot_id` for this token type;
+    /// in that configuration mobile-app mentions are not recognised.
+    pub(crate) bot_id: Option<String>,
     /// App-level token used by the Socket Mode listener
     /// (`apps.connections.open`). When `None`, the inbound listener is
     /// not started — outbound chatops continues to work.
@@ -75,11 +82,20 @@ impl SlackBackend {
         let bot_user_id = parsed
             .user_id
             .ok_or_else(|| anyhow!("slack auth.test response missing user_id"))?;
+        let bot_id = parsed.bot_id;
+        if bot_id.is_none() {
+            tracing::warn!(
+                "slack: auth.test response missing bot_id field; \
+                 mobile-app mentions (B-prefix) will not be recognized. \
+                 Desktop mentions (U-prefix) continue to work."
+            );
+        }
         Ok(Self {
             client,
             api_base,
             bot_token,
             bot_user_id,
+            bot_id,
             app_token: None,
         })
     }
@@ -450,6 +466,7 @@ impl ChatOpsBackend for SlackBackend {
             api_base: self.api_base.clone(),
             bot_token: self.bot_token.clone(),
             bot_user_id: self.bot_user_id.clone(),
+            bot_id: self.bot_id.clone(),
             app_token,
             dispatcher,
             repos,
@@ -465,6 +482,8 @@ struct AuthTestResponse {
     ok: bool,
     #[serde(default)]
     user_id: Option<String>,
+    #[serde(default)]
+    bot_id: Option<String>,
     #[serde(default)]
     error: Option<String>,
 }
@@ -608,14 +627,52 @@ pub fn parse_socket_envelope(raw: &str) -> Result<SocketMessage> {
     }
 }
 
+/// Which form of bot mention the inbound message used. Slack's desktop
+/// client emits `<@U...>` (user-id form); the mobile client emits
+/// `<@B...>` (bot-id form). Both refer to the same bot. The listener
+/// accepts either and normalises the message text to the user-id form
+/// before passing it to the dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MentionForm {
+    /// Mention used `<@{user_id}>` (the U-prefix, desktop default).
+    UserId,
+    /// Mention used `<@{bot_id}>` (the B-prefix, mobile default).
+    BotId,
+}
+
+/// Check whether `text`'s leading non-whitespace token is a mention of
+/// the bot. Accepts either `<@{user_id}>` or (when `bot_id` is cached)
+/// `<@{bot_id}>`. Returns `None` if neither form matches the leading
+/// token. Pure function — no IO, fully unit-testable.
+pub fn leading_mention_matches_self(
+    text: &str,
+    user_id: &str,
+    bot_id: Option<&str>,
+) -> Option<MentionForm> {
+    let trimmed = text.trim_start();
+    let user_form = format!("<@{user_id}>");
+    if trimmed.starts_with(&user_form) {
+        return Some(MentionForm::UserId);
+    }
+    if let Some(bid) = bot_id {
+        let bot_form = format!("<@{bid}>");
+        if trimmed.starts_with(&bot_form) {
+            return Some(MentionForm::BotId);
+        }
+    }
+    None
+}
+
 /// Filter outcome for a single `app_mention` event. The first
 /// (DropChannelAllowlist, DropSelfAuthor, DropBotAuthor,
 /// DropLeadingMention) layer that rejects determines the result; the
 /// listener never re-evaluates later layers after a drop.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FilterDecision {
-    /// Dispatch into the operator-commands codepath.
-    Dispatch,
+    /// Dispatch into the operator-commands codepath. Carries which
+    /// mention form the inbound text used so the caller can normalise
+    /// the message body before invoking the dispatcher.
+    Dispatch(MentionForm),
     /// Channel not in the operator-configured allowlist. Routine drop;
     /// DEBUG log only.
     DropChannelAllowlist,
@@ -639,6 +696,7 @@ pub enum FilterDecision {
 pub fn classify_app_mention(
     event: &AppMentionEvent,
     bot_user_id: &str,
+    bot_id: Option<&str>,
     allowed_channels: &HashSet<String>,
 ) -> FilterDecision {
     // 1. Channel allowlist (cheapest check first — routine drop).
@@ -656,11 +714,12 @@ pub fn classify_app_mention(
     // 4. Leading-mention check — the operator must @-mention the bot
     //    as the first token. Quoted README lines and re-shared
     //    messages that merely *contain* the mention are dropped.
-    let expected = format!("<@{bot_user_id}>");
-    if !event.text.trim_start().starts_with(&expected) {
-        return FilterDecision::DropLeadingMention;
+    //    Mobile clients emit `<@B...>`; desktop emits `<@U...>`. Both
+    //    are accepted when both ids are cached.
+    match leading_mention_matches_self(&event.text, bot_user_id, bot_id) {
+        Some(form) => FilterDecision::Dispatch(form),
+        None => FilterDecision::DropLeadingMention,
     }
-    FilterDecision::Dispatch
 }
 
 // ============================================================================
@@ -723,6 +782,9 @@ struct InboundListenerContext {
     api_base: String,
     bot_token: String,
     bot_user_id: String,
+    /// Cached `bot_id` (B-prefix) for accepting mobile-client mentions.
+    /// See [`leading_mention_matches_self`] and `SlackBackend::bot_id`.
+    bot_id: Option<String>,
     app_token: String,
     dispatcher: Arc<OperatorCommandDispatcher>,
     repos: Arc<dyn RepoIdentityProvider>,
@@ -947,7 +1009,12 @@ where
 /// (used by the outer loop to decide whether the backoff should
 /// reset).
 async fn process_app_mention(ctx: &InboundListenerContext, event: &AppMentionEvent) -> bool {
-    match classify_app_mention(event, &ctx.bot_user_id, &ctx.allowed_channels) {
+    let form = match classify_app_mention(
+        event,
+        &ctx.bot_user_id,
+        ctx.bot_id.as_deref(),
+        &ctx.allowed_channels,
+    ) {
         FilterDecision::DropChannelAllowlist => {
             tracing::debug!(
                 channel = event.channel.as_str(),
@@ -980,10 +1047,36 @@ async fn process_app_mention(ctx: &InboundListenerContext, event: &AppMentionEve
             );
             return false;
         }
-        FilterDecision::Dispatch => {}
-    }
+        FilterDecision::Dispatch(f) => f,
+    };
 
     let bot_mention = format!("<@{}>", ctx.bot_user_id);
+    // Normalise mobile-client mentions (`<@B...>`) to the canonical
+    // user-id form (`<@U...>`) before the dispatcher sees the text.
+    // Downstream parsing keys off `<@{user_id}>`, so the normalisation
+    // keeps that one parser the single source of truth.
+    let normalized_text = match form {
+        MentionForm::UserId => std::borrow::Cow::Borrowed(event.text.as_str()),
+        MentionForm::BotId => {
+            let bid = ctx.bot_id.as_deref().expect(
+                "MentionForm::BotId implies ctx.bot_id is Some \
+                 (set by leading_mention_matches_self)",
+            );
+            let bot_form = format!("<@{bid}>");
+            let trimmed = event.text.trim_start();
+            // Pre-trim prefix (whitespace) preserved verbatim so the
+            // dispatcher sees the same body shape it would on desktop
+            // — just with the mention rewritten.
+            let lead_len = event.text.len() - trimmed.len();
+            let mut rewritten = String::with_capacity(
+                event.text.len() + bot_mention.len() - bot_form.len(),
+            );
+            rewritten.push_str(&event.text[..lead_len]);
+            rewritten.push_str(&bot_mention);
+            rewritten.push_str(&trimmed[bot_form.len()..]);
+            std::borrow::Cow::Owned(rewritten)
+        }
+    };
     let repos = ctx.repos.snapshot();
     let submitter = crate::chatops::operator_commands::ControlSocketSubmitter::new(
         crate::control_socket::socket_path(),
@@ -991,7 +1084,7 @@ async fn process_app_mention(ctx: &InboundListenerContext, event: &AppMentionEve
     let reply = ctx
         .dispatcher
         .handle_message(
-            &event.text,
+            &normalized_text,
             &event.channel,
             &bot_mention,
             &repos,
@@ -1145,6 +1238,66 @@ mod tests {
         assert_eq!(backend.provider_name(), "slack");
         assert!(!backend.is_experimental());
         assert!(!backend.has_app_token());
+        // Response carried no bot_id field → cached as None and a WARN
+        // log fires (covered by `new_warns_when_bot_id_missing` below).
+        assert!(backend.bot_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn new_caches_both_user_id_and_bot_id_when_present() {
+        // Both fields present → both populated on the backend; no WARN.
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/auth.test")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"user_id":"U_BOT","bot_id":"B_BOT"}"#)
+            .create_async()
+            .await;
+        let backend = SlackBackend::new_at(server.url(), "xoxb-x".into())
+            .await
+            .expect("auth ok");
+        assert_eq!(backend.bot_user_id(), "U_BOT");
+        assert_eq!(backend.bot_id.as_deref(), Some("B_BOT"));
+    }
+
+    #[tokio::test]
+    async fn new_warns_when_bot_id_missing() {
+        // auth.test returns only user_id. The backend constructs
+        // successfully but `bot_id` is None — desktop-only matching.
+        // The WARN log itself is logged via tracing; we don't trap the
+        // subscriber in this test (the WARN-emission path is also
+        // exercised by the existing `new_caches_bot_user_id_on_success`).
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/auth.test")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"user_id":"U_BOT"}"#)
+            .create_async()
+            .await;
+        let backend = SlackBackend::new_at(server.url(), "xoxb-x".into())
+            .await
+            .expect("auth ok");
+        assert_eq!(backend.bot_user_id(), "U_BOT");
+        assert!(backend.bot_id.is_none(), "bot_id must be None when absent");
+    }
+
+    #[tokio::test]
+    async fn new_returns_err_when_user_id_missing_even_if_bot_id_present() {
+        // Defensive: a token that returns only bot_id (no user_id) is
+        // unusable — the bot's own message filter keys off user_id. The
+        // user_id-required error path wins regardless of bot_id state.
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/auth.test")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"bot_id":"B_BOT"}"#)
+            .create_async()
+            .await;
+        let err = must_err(
+            SlackBackend::new_at(server.url(), "x".into()).await,
+            "missing user_id must error",
+        );
+        assert!(format!("{err:#}").contains("user_id"));
     }
 
     #[tokio::test]
@@ -1617,14 +1770,14 @@ mod tests {
     #[test]
     fn filter_drops_channel_not_in_allowlist() {
         let e = evt("<@UBOT> status myrepo", "C_OUTSIDE", Some("U_HUMAN"));
-        let d = classify_app_mention(&e, "UBOT", &allow(&["C_OPS"]));
+        let d = classify_app_mention(&e, "UBOT", None, &allow(&["C_OPS"]));
         assert_eq!(d, FilterDecision::DropChannelAllowlist);
     }
 
     #[test]
     fn filter_drops_self_authored() {
         let e = evt("<@UBOT> status myrepo", "C_OPS", Some("UBOT"));
-        let d = classify_app_mention(&e, "UBOT", &allow(&["C_OPS"]));
+        let d = classify_app_mention(&e, "UBOT", None, &allow(&["C_OPS"]));
         assert_eq!(d, FilterDecision::DropSelfAuthor);
     }
 
@@ -1632,7 +1785,7 @@ mod tests {
     fn filter_drops_bot_id_set() {
         let mut e = evt("<@UBOT> status myrepo", "C_OPS", Some("U_HUMAN"));
         e.bot_id = Some("B999".into());
-        let d = classify_app_mention(&e, "UBOT", &allow(&["C_OPS"]));
+        let d = classify_app_mention(&e, "UBOT", None, &allow(&["C_OPS"]));
         assert_eq!(d, FilterDecision::DropBotAuthor);
     }
 
@@ -1640,7 +1793,7 @@ mod tests {
     fn filter_drops_subtype_bot_message() {
         let mut e = evt("<@UBOT> status myrepo", "C_OPS", Some("U_HUMAN"));
         e.subtype = Some("bot_message".into());
-        let d = classify_app_mention(&e, "UBOT", &allow(&["C_OPS"]));
+        let d = classify_app_mention(&e, "UBOT", None, &allow(&["C_OPS"]));
         assert_eq!(d, FilterDecision::DropBotAuthor);
     }
 
@@ -1654,7 +1807,7 @@ mod tests {
             "C_OPS",
             Some("U_HUMAN"),
         );
-        let d = classify_app_mention(&e, "UBOT", &allow(&["C_OPS"]));
+        let d = classify_app_mention(&e, "UBOT", None, &allow(&["C_OPS"]));
         assert_eq!(d, FilterDecision::DropLeadingMention);
     }
 
@@ -1662,8 +1815,8 @@ mod tests {
     fn filter_passes_with_leading_whitespace() {
         // Leading whitespace is trimmed before the mention check.
         let e = evt("   <@UBOT> help", "C_OPS", Some("U_HUMAN"));
-        let d = classify_app_mention(&e, "UBOT", &allow(&["C_OPS"]));
-        assert_eq!(d, FilterDecision::Dispatch);
+        let d = classify_app_mention(&e, "UBOT", None, &allow(&["C_OPS"]));
+        assert_eq!(d, FilterDecision::Dispatch(MentionForm::UserId));
     }
 
     #[test]
@@ -1672,15 +1825,94 @@ mod tests {
         // authored by a bot. The bot-author filter must win.
         let mut e = evt("<@UBOT> wipe-workspace evil", "C_OPS", Some("U_BOT2"));
         e.bot_id = Some("B999".into());
-        let d = classify_app_mention(&e, "UBOT", &allow(&["C_OPS"]));
+        let d = classify_app_mention(&e, "UBOT", None, &allow(&["C_OPS"]));
         assert_eq!(d, FilterDecision::DropBotAuthor);
     }
 
     #[test]
     fn filter_passes_happy_path() {
         let e = evt("<@UBOT> status myrepo", "C_OPS", Some("U_HUMAN"));
-        let d = classify_app_mention(&e, "UBOT", &allow(&["C_OPS"]));
-        assert_eq!(d, FilterDecision::Dispatch);
+        let d = classify_app_mention(&e, "UBOT", None, &allow(&["C_OPS"]));
+        assert_eq!(d, FilterDecision::Dispatch(MentionForm::UserId));
+    }
+
+    #[test]
+    fn filter_passes_with_bot_id_mention_when_cached() {
+        // Mobile-client form: `<@B...>`. When `bot_id` is cached the
+        // filter accepts the mention and reports MentionForm::BotId
+        // so the caller can normalise the message text.
+        let e = evt("<@B_BOT_ID> status myrepo", "C_OPS", Some("U_HUMAN"));
+        let d = classify_app_mention(&e, "U_BOT_USER", Some("B_BOT_ID"), &allow(&["C_OPS"]));
+        assert_eq!(d, FilterDecision::Dispatch(MentionForm::BotId));
+    }
+
+    #[test]
+    fn filter_drops_bot_id_mention_when_bot_id_not_cached() {
+        // Mobile-client form arrives but `auth.test` didn't return a
+        // bot_id (some token types lack one). Without a cached bot_id
+        // the listener cannot match the mobile form — the leading
+        // mention check rejects it.
+        let e = evt("<@B_BOT_ID> status myrepo", "C_OPS", Some("U_HUMAN"));
+        let d = classify_app_mention(&e, "U_BOT_USER", None, &allow(&["C_OPS"]));
+        assert_eq!(d, FilterDecision::DropLeadingMention);
+    }
+
+    // ---------- leading_mention_matches_self ----------
+
+    #[test]
+    fn leading_mention_user_form_matches() {
+        assert_eq!(
+            leading_mention_matches_self("<@U_BOT_USER> status", "U_BOT_USER", None),
+            Some(MentionForm::UserId),
+        );
+    }
+
+    #[test]
+    fn leading_mention_bot_form_matches_when_bot_id_cached() {
+        assert_eq!(
+            leading_mention_matches_self(
+                "<@B_BOT_ID> status",
+                "U_BOT_USER",
+                Some("B_BOT_ID"),
+            ),
+            Some(MentionForm::BotId),
+        );
+    }
+
+    #[test]
+    fn leading_mention_bot_form_rejected_when_bot_id_is_none() {
+        assert_eq!(
+            leading_mention_matches_self("<@B_BOT_ID> status", "U_BOT_USER", None),
+            None,
+        );
+    }
+
+    #[test]
+    fn leading_mention_other_user_rejected() {
+        assert_eq!(
+            leading_mention_matches_self(
+                "<@U_OTHER_USER> status",
+                "U_BOT_USER",
+                Some("B_BOT_ID"),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn leading_mention_accepts_leading_whitespace_for_both_forms() {
+        assert_eq!(
+            leading_mention_matches_self("   <@U_BOT_USER> help", "U_BOT_USER", None),
+            Some(MentionForm::UserId),
+        );
+        assert_eq!(
+            leading_mention_matches_self(
+                "\t  <@B_BOT_ID> help",
+                "U_BOT_USER",
+                Some("B_BOT_ID"),
+            ),
+            Some(MentionForm::BotId),
+        );
     }
 
     #[test]
@@ -1848,11 +2080,22 @@ mod tests {
         bot_user_id: &str,
         channels: &[&str],
     ) -> InboundListenerContext {
+        test_ctx_for_event_loop_with_bot_id(api_base, bot_token, bot_user_id, None, channels)
+    }
+
+    fn test_ctx_for_event_loop_with_bot_id(
+        api_base: String,
+        bot_token: String,
+        bot_user_id: &str,
+        bot_id: Option<&str>,
+        channels: &[&str],
+    ) -> InboundListenerContext {
         InboundListenerContext {
             client: reqwest::Client::new(),
             api_base,
             bot_token,
             bot_user_id: bot_user_id.to_string(),
+            bot_id: bot_id.map(str::to_string),
             app_token: "xapp-1-test".into(),
             dispatcher: Arc::new(OperatorCommandDispatcher::new()),
             repos: Arc::new(crate::chatops::TaskMapRepoIdentities::new(Vec::new)),
@@ -2094,6 +2337,121 @@ mod tests {
             .unwrap();
         let _exit = run_event_loop(&ctx, stream, &cancel).await;
         // Mockito will fail the test if expectations are violated.
+    }
+
+    #[tokio::test]
+    async fn event_loop_mobile_mention_form_normalized_and_dispatched() {
+        // Inbound message uses the mobile-client `<@B_BOT_ID>` form. The
+        // listener must normalise to the desktop `<@U_BOT_USER>` form
+        // BEFORE handing it to the dispatcher, otherwise the dispatcher's
+        // mention-prefix check rejects the message and no threaded reply
+        // is posted. A successful threaded reply proves both:
+        //   (a) the leading-mention check accepted the bot-id form, and
+        //   (b) the dispatcher saw the rewritten user-id form text.
+        let mut server = mockito::Server::new_async().await;
+        let _post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"channel":"C_OPS","thread_ts":"1.0"}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.1"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // If normalisation failed, the dispatcher returns None and the
+        // listener instead posts a `?` reaction — that path must NOT
+        // fire.
+        let _react_mock = server
+            .mock("POST", "/reactions.add")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (stream, in_tx, _out_rx) = make_fake_stream();
+        let cancel = CancellationToken::new();
+        let ctx = test_ctx_for_event_loop_with_bot_id(
+            server.url(),
+            "xoxb-x".to_string(),
+            "U_BOT_USER",
+            Some("B_BOT_ID"),
+            &["C_OPS"],
+        );
+        let env = serde_json::json!({
+            "type": "events_api",
+            "envelope_id": "env-1",
+            "payload": {
+                "event": {
+                    "type": "app_mention",
+                    "text": "<@B_BOT_ID> help",
+                    "user": "U_HUMAN",
+                    "channel": "C_OPS",
+                    "ts": "1.0"
+                }
+            }
+        });
+        in_tx
+            .send(Ok(WsMessage::Text(env.to_string().into())))
+            .unwrap();
+        in_tx
+            .send(Ok(WsMessage::Text(
+                r#"{"type":"disconnect","reason":"done"}"#.to_string().into(),
+            )))
+            .unwrap();
+        let _exit = run_event_loop(&ctx, stream, &cancel).await;
+        // Mockito will fail the test if expectations are violated.
+    }
+
+    #[tokio::test]
+    async fn event_loop_mobile_mention_form_rejected_without_cached_bot_id() {
+        // Same inbound text as the previous test, but `bot_id` is None
+        // (e.g. auth.test didn't return one). The leading-mention check
+        // must reject the message — no threaded reply, no reaction
+        // either (DropLeadingMention path returns false without posting
+        // anything).
+        let mut server = mockito::Server::new_async().await;
+        let _post_mock = server
+            .mock("POST", "/chat.postMessage")
+            .expect(0)
+            .create_async()
+            .await;
+        let _react_mock = server
+            .mock("POST", "/reactions.add")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (stream, in_tx, _out_rx) = make_fake_stream();
+        let cancel = CancellationToken::new();
+        let ctx = test_ctx_for_event_loop_with_bot_id(
+            server.url(),
+            "xoxb-x".to_string(),
+            "U_BOT_USER",
+            None,
+            &["C_OPS"],
+        );
+        let env = serde_json::json!({
+            "type": "events_api",
+            "envelope_id": "env-1",
+            "payload": {
+                "event": {
+                    "type": "app_mention",
+                    "text": "<@B_BOT_ID> help",
+                    "user": "U_HUMAN",
+                    "channel": "C_OPS",
+                    "ts": "1.0"
+                }
+            }
+        });
+        in_tx
+            .send(Ok(WsMessage::Text(env.to_string().into())))
+            .unwrap();
+        in_tx
+            .send(Ok(WsMessage::Text(
+                r#"{"type":"disconnect","reason":"done"}"#.to_string().into(),
+            )))
+            .unwrap();
+        let _exit = run_event_loop(&ctx, stream, &cancel).await;
     }
 
     #[tokio::test]

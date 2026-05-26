@@ -234,6 +234,12 @@ If a Slack reply never arrives, autocoder does not time out — it waits indefin
 2. **Manually delete `.question.json`** — reverts the change to pending state. The next iteration re-runs it from scratch (without the answer). Useful when the question was a false positive or the change should restart.
 3. **`autocoder rewind <change>`** — full reset: deletes the agent branch, unarchives if needed, clears all `.question.json` / `.answer.json` markers via the rewind path.
 
+### Mobile vs desktop mention forms
+
+Slack's mobile client and desktop client render `@<bot-name>` identically on screen but emit two different mention strings in the underlying message text. Desktop emits the bot's **user id** (`<@U...>`); mobile emits the bot's **bot/app id** (`<@B...>`). Both refer to the same bot. autocoder caches both ids at startup (via `auth.test`) and the inbound chatops listener accepts either form as the leading bot mention — operators don't need to do anything specific.
+
+If mobile mentions stop working after a token rotation, check the daemon log for the `auth.test response missing bot_id` WARN. Some Slack token types don't return a `bot_id` field; when that field is missing, the daemon falls back to user-id-only matching and mobile-app mentions stop being recognised while desktop continues to work. The WARN line names the gap explicitly so operators know where to look.
+
 ## `.question.json`, `.answer.json`, and `.alert-state.json` as workspace artifacts
 
 These files are written by autocoder into the workspace as bookkeeping. `.question.json` and `.answer.json` live alongside the change's `proposal.md`; `.alert-state.json` lives at the workspace root and tracks the per-(repo, category) 24h-alert throttle for [progress notifications](CHATOPS.md#progress-notifications).
