@@ -102,6 +102,26 @@ The code-reviewer SHALL ship a default prompt template that explicitly limits th
   `{{change_summary}}` placeholder are left with the literal text
   unsubstituted — the operator is responsible for migrating
 
+### Requirement: LLM client surfaces an actionable error when a 2xx response is unusable
+The code-reviewer's LLM-client layer (`AnthropicClient`, `OpenAiCompatibleClient`) SHALL distinguish "transport failed / HTTP error" (already covered by the non-2xx scenarios) from "transport succeeded but the response body cannot be turned into review text". For the latter case, the client SHALL return `Err(_)` whose message names the specific shape problem so the operator can tell from logs whether to retry, switch model, or escalate.
+
+#### Scenario: Anthropic returns 2xx with no text content block
+- **WHEN** an `AnthropicClient::complete` call gets a `200` response whose `content` array contains only non-text blocks (e.g. only `image` or `tool_use` entries)
+- **THEN** the call returns `Err(_)` whose `format!("{err:#}")` contains a substring naming the missing-text-block condition (e.g. `no text block`)
+- **AND** the error message does NOT claim the HTTP call failed (preserving the operator's ability to tell shape errors from transport errors in logs)
+
+#### Scenario: Anthropic returns 2xx with unparseable JSON body
+- **WHEN** an `AnthropicClient::complete` call gets a `200` whose body is not valid JSON of shape `AnthropicResponse`
+- **THEN** the call returns `Err(_)` whose message contains a substring naming the decode failure (e.g. `decode failed`)
+
+#### Scenario: OpenAI-compatible returns 2xx with empty choices array
+- **WHEN** an `OpenAiCompatibleClient::complete` call gets a `200` with body `{"choices":[]}`
+- **THEN** the call returns `Err(_)` whose message contains a substring naming the empty-choices condition (e.g. `no choices`)
+
+#### Scenario: OpenAI-compatible returns 2xx with unparseable JSON body
+- **WHEN** an `OpenAiCompatibleClient::complete` call gets a `200` whose body is not valid JSON of shape `OpenAiResponse`
+- **THEN** the call returns `Err(_)` whose message contains a substring naming the decode failure (e.g. `decode failed`)
+
 ### Requirement: Reviewer-initiated revision comments on Block verdicts
 When `reviewer.auto_revise_on_block` is `true` AND the reviewer returns a `Block` verdict, the daemon SHALL post one PR issue comment per concern where the reviewer marked `should_request_revision: true`, subject to the per-PR revision-cap budget. Each comment's body SHALL begin with the marker line `<!-- reviewer-revision -->` followed by a newline, then the trigger pattern `@<bot-username> revise <actionable_request>`. The marker enables the revision dispatcher's self-author-filter bypass; without it the dispatcher would (correctly) filter the comment as bot-authored noise. The feature is off by default; the config flag must be explicitly enabled.
 

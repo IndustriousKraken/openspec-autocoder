@@ -25,16 +25,14 @@ The queue engine SHALL list pending OpenSpec changes in the workspace, excluding
 - **THEN** `list_pending` returns the same order as before the
   operation (entry names are stable across git operations)
 - **AND** operators who require explicit sequencing prepend a
-  letter+number prefix to change names (e.g.
-  `a01-rename-foo`, `a02-extract-bar`) to control order.
-  OpenSpec rejects names that start with a digit, so the
-  leading letter is required.
+  numeric or alphabetical prefix to change names (e.g.
+  `01-rename-foo`, `02-extract-bar`) to control order
 
 ### Requirement: Lock state management
 The queue engine SHALL atomically lock and unlock changes via filesystem markers to prevent duplicate execution and to signal in-progress state to humans inspecting the workspace.
 
 #### Scenario: Locking a change
-- **WHEN** autocoder selects a change for execution
+- **WHEN** the orchestrator selects a change for execution
 - **THEN** the queue engine creates an empty file at `<workspace>/openspec/changes/<change>/.in-progress` BEFORE invoking the executor
 - **AND** the file is verifiable on disk via standard filesystem inspection (e.g. `ls -a`)
 
@@ -44,7 +42,7 @@ The queue engine SHALL atomically lock and unlock changes via filesystem markers
 - **AND** the deletion is idempotent (no error if the file is already absent)
 
 #### Scenario: Stale lock cleanup on startup
-- **WHEN** autocoder initializes a workspace at process startup
+- **WHEN** the orchestrator initializes a workspace at process startup
 - **THEN** any pre-existing `.in-progress` files inside `<workspace>/openspec/changes/<change>/` are deleted before the polling loop for that repository begins
 - **AND** a log line is emitted for each lock cleared, naming the change
 
@@ -74,4 +72,12 @@ The queue engine SHALL provide a separate enumeration of changes currently waiti
 - **AND** the returned list is sorted ascending by entry name
 - **AND** archived directories are excluded
 - **AND** entries beginning with `.` are excluded
+
+### Requirement: Perma-stuck marker write guards against missing change directory
+The `perma_stuck::write_marker` helper SHALL refuse to write the marker file when the change's directory under `<workspace>/openspec/changes/` does not exist. The error SHALL name the missing directory so a caller looking at logs can tell the change was deleted out-of-band rather than blaming the marker-write step itself. The guard SHALL fire BEFORE any filesystem write so a failed call leaves no partial state behind.
+
+#### Scenario: write_marker is called for a change directory that does not exist
+- **WHEN** `perma_stuck::write_marker(workspace, "foo", &entry)` is called AND `<workspace>/openspec/changes/foo/` does not exist
+- **THEN** the call returns `Err(_)` whose message contains the substring `change directory does not exist` AND the change name `foo`
+- **AND** `<workspace>/openspec/changes/foo/.perma-stuck.json` does NOT exist on the filesystem after the failed call (the guard runs before any tempfile is created)
 

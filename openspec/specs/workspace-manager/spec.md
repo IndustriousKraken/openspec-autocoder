@@ -17,16 +17,16 @@ The workspace manager SHALL derive a per-repository workspace path deterministic
 - **AND** repeated derivations preserve the inequality
 
 ### Requirement: Cross-repository path collision detection at startup
-autocoder SHALL detect any two configured repositories that resolve to the same workspace path and refuse to start, naming both URLs and the shared path in the error message.
+The orchestrator SHALL detect any two configured repositories that resolve to the same workspace path and refuse to start, naming both URLs and the shared path in the error message.
 
 #### Scenario: Two repos derive to the same path
-- **WHEN** autocoder loads a config containing two repositories whose URLs sanitize to the same workspace path (or whose explicit `local_path` overrides collide)
-- **THEN** autocoder emits a startup error whose text contains BOTH conflicting URLs verbatim AND the shared path
+- **WHEN** the orchestrator loads a config containing two repositories whose URLs sanitize to the same workspace path (or whose explicit `local_path` overrides collide)
+- **THEN** the orchestrator emits a startup error whose text contains BOTH conflicting URLs verbatim AND the shared path
 - **AND** no polling tasks are spawned for either repository
 - **AND** the process exits non-zero within 5 seconds of config load
 
 ### Requirement: Idempotent workspace initialization
-The workspace manager SHALL ensure a repository is locally cloned before each polling iteration begins, performing a clone if absent and a fetch if present, without losing existing local state. When fork-PR mode is active (`github.fork_owner` is configured), the manager SHALL ALSO ensure a second remote named `fork` is registered, pointing at the fork URL derived from the upstream URL and `fork_owner`. When the manager performs a clone (the workspace path was absent) AND fork-PR mode is active, the manager SHALL ALSO fetch ONLY the configured agent branch from the `fork` remote — using an explicit refspec `+refs/heads/<agent_branch>:refs/remotes/fork/<agent_branch>` — so the local tracking ref reflects the fork's actual state for that single branch. The fetch SHALL NOT populate any other `refs/remotes/fork/<other-branch>` refs, because a fork branch whose name shadows an upstream branch (e.g. both `origin/dev` and `fork/dev` present) would otherwise cause `git checkout <base_branch>` DWIM to fail with "matched multiple remote tracking branches."
+The workspace manager SHALL ensure a repository is locally cloned before each polling iteration begins, performing a clone if absent and a fetch if present, without losing existing local state. When fork-PR mode is active (`github.fork_owner` is configured), the manager SHALL ALSO ensure a second remote named `fork` is registered, pointing at the fork URL derived from the upstream URL and `fork_owner`. When the manager performs a clone (the workspace path was absent) AND fork-PR mode is active, the manager SHALL ALSO fetch from the `fork` remote so the local tracking ref `refs/remotes/fork/<branch>` reflects the fork's actual state — necessary so subsequent `git push --force-with-lease` operations compare against accurate data and do not falsely report "stale info."
 
 #### Scenario: First-time clone (direct-push mode)
 - **WHEN** the polling task begins an iteration AND the workspace path
@@ -43,39 +43,18 @@ The workspace manager SHALL ensure a repository is locally cloned before each po
 - **AND** the manager then runs `git remote add fork <fork-url>` inside
   the workspace, where `<fork-url>` is derived from `<upstream-url>` by
   substituting `fork_owner` for the upstream owner segment
-- **AND** the manager then runs
-  `git fetch fork +refs/heads/<agent_branch>:refs/remotes/fork/<agent_branch>`
-  inside the workspace, populating ONLY `refs/remotes/fork/<agent_branch>`
-- **AND** no other `refs/remotes/fork/<branch>` refs are populated by
-  this fetch (any pre-existing remote-tracking refs from prior
-  iterations are preserved, but new ones for non-agent branches are
-  NOT created)
+- **AND** the manager then runs `git fetch fork` inside the workspace,
+  populating `refs/remotes/fork/*` so that local tracking reflects the
+  fork's actual state
 - **AND** the resulting workspace has exactly two remotes: `origin`
   pointing at the upstream URL AND `fork` pointing at the fork URL
 
-#### Scenario: Fork has a branch that shadows an upstream branch name
-- **WHEN** the upstream repository has branches `main` and `dev`
-- **AND** the fork has its own `dev` branch (a leftover from previous
-  work, possibly with a different SHA than `origin/dev`)
-- **AND** the polling task begins an iteration AND the workspace path
-  does not exist on disk AND `github.fork_owner` is set
-- **AND** the configured agent branch is `agent-q`
-- **THEN** after `ensure_initialized` completes, the local tracking
-  ref `refs/remotes/fork/agent-q` resolves (if it exists on the fork)
-- **AND** `refs/remotes/fork/dev` does NOT resolve (the fetch refspec
-  did not match it)
-- **AND** a subsequent `git checkout dev` succeeds without the
-  "matched multiple remote tracking branches" error, because
-  `refs/remotes/origin/dev` is the only `dev` remote-tracking ref
-
 #### Scenario: Fork fetch failure on first-time clone is non-fatal
-- **WHEN** the post-clone
-  `git fetch fork +refs/heads/<agent_branch>:refs/remotes/fork/<agent_branch>`
-  step fails (network error, fork is empty, fork doesn't yet exist,
-  authentication failure for the fork remote, the agent branch does
-  not yet exist on the fork, etc.)
-- **THEN** the manager logs the failure at WARN naming the fork URL,
-  the agent branch, and the error
+- **WHEN** the post-clone `git fetch fork` step fails (network error,
+  fork is empty, fork doesn't yet exist, authentication failure for
+  the fork remote, etc.)
+- **THEN** the manager logs the failure at WARN naming the fork URL
+  and the error
 - **AND** `ensure_initialized` still returns Ok — the clone +
   remote-registration succeeded, and the empty local tracking ref
   is no worse than the pre-fix behavior
