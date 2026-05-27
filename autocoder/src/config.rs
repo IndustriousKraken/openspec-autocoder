@@ -509,6 +509,24 @@ pub struct ReviewerConfig {
     /// polling iteration. Default `false` (no behavioural change).
     #[serde(default)]
     pub auto_revise_on_block: bool,
+    /// Maximum size (in chars) of the rendered reviewer prompt body —
+    /// change context + changed files + diff combined. Default
+    /// `2_000_000` preserves the historical hard-coded value. No clamping:
+    /// the operator is responsible for matching this to their LLM
+    /// provider's actual context window. Hot-applicable via
+    /// `autocoder reload`.
+    #[serde(default = "default_prompt_budget_chars")]
+    pub prompt_budget_chars: usize,
+    /// Reviewer dispatch mode. `bundled` (default) keeps the existing
+    /// one-reviewer-call-per-PR behavior. `per_change` dispatches one
+    /// reviewer call per change in the pass and emits one
+    /// `## Code Review: <slug>` section per change in the PR body.
+    #[serde(default)]
+    pub mode: ReviewerMode,
+}
+
+fn default_prompt_budget_chars() -> usize {
+    2_000_000
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,6 +535,14 @@ pub enum ReviewerProvider {
     Anthropic,
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
+}
+
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerMode {
+    #[default]
+    Bundled,
+    PerChange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1754,6 +1780,8 @@ github:
             "api_key",
             "api_base_url",
             "auto_revise_on_block",
+            "prompt_budget_chars",
+            "mode",
             // `ChatOpsConfig` + provider sub-blocks + `NotificationsConfig`.
             "bot_token_env",
             "bot_token",
@@ -1946,6 +1974,89 @@ reviewer:
         let cfg = Config::load_from(&path).expect("config with auto_revise_on_block should parse");
         let rv = cfg.reviewer.expect("reviewer block should be present");
         assert!(rv.auto_revise_on_block);
+    }
+
+    #[test]
+    fn reviewer_default_prompt_budget_and_mode() {
+        // Omitting `prompt_budget_chars` and `mode` resolves to
+        // 2_000_000 chars and `ReviewerMode::Bundled` respectively —
+        // the documented "no behavior change vs. before this change"
+        // defaults.
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("default reviewer parses");
+        let rv = cfg.reviewer.expect("reviewer block should be present");
+        assert_eq!(rv.prompt_budget_chars, 2_000_000);
+        assert_eq!(rv.mode, ReviewerMode::Bundled);
+    }
+
+    #[test]
+    fn reviewer_explicit_prompt_budget_and_mode() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  prompt_budget_chars: 4000000
+  mode: per_change
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("explicit reviewer fields parse");
+        let rv = cfg.reviewer.unwrap();
+        assert_eq!(rv.prompt_budget_chars, 4_000_000);
+        assert_eq!(rv.mode, ReviewerMode::PerChange);
+    }
+
+    #[test]
+    fn reviewer_unknown_mode_value_errors() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  mode: chaotic
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path).expect_err("invalid mode must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("mode")
+                || msg.to_lowercase().contains("chaotic")
+                || msg.to_lowercase().contains("variant"),
+            "error must mention the invalid mode; got: {msg}"
+        );
     }
 
     #[test]

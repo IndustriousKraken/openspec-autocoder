@@ -201,6 +201,24 @@ github:
 #   # customized reviewer templates must be updated to emit the new
 #   # per-concern fields. See README's "Reviewer-initiated revisions" section.
 #   # auto_revise_on_block: false
+#   #
+#   # Maximum size (in chars) of the rendered reviewer prompt body —
+#   # change context + changed files + diff combined. Default 2_000_000
+#   # preserves historical behavior. No hard ceiling; the operator is
+#   # responsible for matching this to their LLM provider's context
+#   # window (Grok-4 / Claude Sonnet 4.6 fit 4_000_000+; tighter caps
+#   # suit smaller-window providers like older Ollama deployments).
+#   # See `docs/CODE-REVIEW.md` § "Prompt budget".
+#   # prompt_budget_chars: 2_000_000
+#   #
+#   # Reviewer dispatch mode. `bundled` (default) keeps today's single
+#   # reviewer call per PR. `per_change` dispatches one reviewer call
+#   # per change in a multi-change PR and emits one
+#   # `## Code Review: <slug>` section per change in the PR body. The
+#   # LLM cost scales linearly with the number of changes; use only if
+#   # you specifically want per-change attention.
+#   # See `docs/CODE-REVIEW.md` § "Per-change reviewer mode".
+#   # mode: bundled
 
 # ChatOps escalation — when the agent can't proceed without human
 # input, post the question to a chat provider and resume on reply.

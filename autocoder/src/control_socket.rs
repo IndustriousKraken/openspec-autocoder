@@ -1743,6 +1743,65 @@ github:
         cancel.cancel();
     }
 
+    /// Mode-toggle reload: writing a config that flips
+    /// `reviewer.mode` from bundled to per_change rebuilds the live
+    /// reviewer slot. The seeded test fixture starts with an empty
+    /// reviewer slot (the daemon initializes it at startup outside
+    /// `handle_reload`), so the assertion is that the reload-driven
+    /// hot-swap populates the slot with the new mode + budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reload_applies_reviewer_mode_change() {
+        let base_with_reviewer = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+  token:
+    value: "ghp_fixture"
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key:
+    value: "sk-fixture"
+"#;
+        let (_dir, socket, state, cfg_path, cancel) = fixture_listener(base_with_reviewer).await;
+        // Operator edits the config to flip mode + raise budget.
+        let new_yaml = base_with_reviewer.replace(
+            "  api_key:\n    value: \"sk-fixture\"\n",
+            "  api_key:\n    value: \"sk-fixture\"\n  mode: per_change\n  prompt_budget_chars: 4000000\n",
+        );
+        std::fs::write(&cfg_path, new_yaml).unwrap();
+        let resp = send_request(&socket, r#"{"action":"reload"}"#).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        let applied: Vec<String> = resp["applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            applied.contains(&"reviewer".to_string()),
+            "reviewer must be in applied: {applied:?}"
+        );
+        // The hot-swapped reviewer slot sees the new mode + budget.
+        {
+            let r = state.reviewer.load_full();
+            let inner = r
+                .as_ref()
+                .as_ref()
+                .expect("reviewer slot populated by reload");
+            assert_eq!(inner.mode(), crate::config::ReviewerMode::PerChange);
+            assert_eq!(inner.prompt_budget(), 4_000_000);
+        }
+        cancel.cancel();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reload_reports_requires_restart_for_executor_change() {
         let (_dir, socket, state, cfg_path, cancel) = fixture_listener(BASE_YAML).await;

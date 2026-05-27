@@ -14,12 +14,11 @@ use std::sync::OnceLock;
 /// runs without requiring `prompts/` on the filesystem.
 const DEFAULT_TEMPLATE: &str = include_str!("../../prompts/code-review-default.md");
 
-/// Total cap (in chars) on the rendered prompt body — change context +
-/// changed files + diff combined. Sized for modern 1M-token-class models
-/// (Opus, Grok-4) at ~4 chars/token, conservatively halved. Individual
-/// files are NEVER truncated; if a file's contents would push the total
-/// over budget, the file is skipped in full and named in a footer.
-const PROMPT_BUDGET: usize = 2_000_000;
+/// Backwards-compatible default for the reviewer's prompt-body cap. The
+/// real cap is read from `ReviewerConfig::prompt_budget_chars`; this
+/// constant exists as the resolution target for `serde(default = ...)`
+/// and the documented baseline. Operators override via `config.yaml`.
+const DEFAULT_PROMPT_BUDGET: usize = 2_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewVerdict {
@@ -38,6 +37,22 @@ pub struct ReviewReport {
     /// don't emit the block produce an empty vec, which keeps the
     /// reviewer-initiated revision flow off for that operator's setup.
     pub concerns: Vec<ReviewConcern>,
+    /// When populated, the report represents a per-change reviewer pass:
+    /// each element is one `(change-slug, per-change markdown)` pair and
+    /// the PR-body composer emits one `## Code Review: <slug>` section
+    /// per element INSTEAD OF a single combined `## Code Review` block.
+    /// Empty for bundled-mode reports.
+    pub per_change_sections: Vec<PerChangeSection>,
+}
+
+/// One per-change reviewer section, surfaced into the PR body under a
+/// `## Code Review: <change_slug>` heading. The `markdown` body includes
+/// the per-change verdict + concerns + revision-requests in the same
+/// format the bundled-mode `## Code Review` block uses.
+#[derive(Debug, Clone)]
+pub struct PerChangeSection {
+    pub change_slug: String,
+    pub markdown: String,
 }
 
 /// One concern parsed from the reviewer's structured `revision-requests`
@@ -51,6 +66,14 @@ pub struct ReviewConcern {
     pub actionable_request: Option<String>,
     #[serde(default)]
     pub should_request_revision: bool,
+    /// Per-change attribution: in per_change reviewer mode, set to the
+    /// change slug whose review surfaced this concern. Used by the
+    /// dropped-cap annotator to write the "(not auto-revised; cap
+    /// budget exhausted)" footer into the correct
+    /// `## Code Review: <slug>` PR-body section. `None` in bundled
+    /// mode (annotations land in the single `## Code Review` block).
+    #[serde(default)]
+    pub change_slug: Option<String>,
 }
 
 /// One archived OpenSpec change's source material. Used to give the
@@ -72,7 +95,8 @@ pub struct ChangedFile {
 
 /// All the material the reviewer sees: the change(s) that shipped, the
 /// resulting file state, and the unified diff. Rendering into a prompt
-/// honors `PROMPT_BUDGET` in priority order (context > files > diff).
+/// honors `ReviewerConfig::prompt_budget_chars` in priority order
+/// (context > files > diff).
 #[derive(Debug, Clone, Default)]
 pub struct ReviewContext {
     pub archived_changes: Vec<ChangeBrief>,
@@ -80,10 +104,40 @@ pub struct ReviewContext {
     pub diff: String,
 }
 
+/// Per-change reviewer call: the change being reviewed (own brief, own
+/// diff, own touched files) plus the cross-change preamble naming the
+/// other changes in the same pass. Used only when
+/// `ReviewerConfig::mode == PerChange`.
+#[derive(Debug, Clone)]
+pub struct PerChangeContext {
+    /// The change being reviewed in this call.
+    pub change_slug: String,
+    /// The single-change review context (briefs/files/diff scoped to
+    /// this change alone).
+    pub context: ReviewContext,
+    /// Fixed-size cross-change preamble inserted at the top of the
+    /// rendered prompt. Format: human-readable lines describing the
+    /// OTHER changes in the same PR (slug + first-paragraph-of-Why),
+    /// each truncated to 200 chars. Empty when the pass is single-
+    /// change (no other changes to reference).
+    pub cross_change_preamble: String,
+}
+
+/// One per-change reviewer result. Returned by `run_per_change_review`
+/// for each change in the pass; the PR-body composer turns each one
+/// into a `## Code Review: <change-slug>` section.
+#[derive(Debug, Clone)]
+pub struct PerChangeReview {
+    pub change_slug: String,
+    pub report: ReviewReport,
+}
+
 pub struct CodeReviewer {
     client: Box<dyn LlmClient>,
     template: String,
     auto_revise_on_block: bool,
+    prompt_budget: usize,
+    mode: crate::config::ReviewerMode,
 }
 
 impl CodeReviewer {
@@ -92,7 +146,36 @@ impl CodeReviewer {
             client,
             template,
             auto_revise_on_block: false,
+            prompt_budget: DEFAULT_PROMPT_BUDGET,
+            mode: crate::config::ReviewerMode::Bundled,
         }
+    }
+
+    /// Builder-style setter for the prompt-budget cap. Default is
+    /// `DEFAULT_PROMPT_BUDGET` (2,000,000 chars); production callers
+    /// always thread the value from `ReviewerConfig::prompt_budget_chars`.
+    pub fn with_prompt_budget(mut self, budget: usize) -> Self {
+        self.prompt_budget = budget;
+        self
+    }
+
+    /// Read the resolved prompt-budget cap (in chars). Used by the
+    /// hot-reload tests to verify a config-driven update reached the
+    /// live reviewer slot.
+    #[allow(dead_code)]
+    pub fn prompt_budget(&self) -> usize {
+        self.prompt_budget
+    }
+
+    /// Builder-style setter for the reviewer dispatch mode.
+    pub fn with_mode(mut self, mode: crate::config::ReviewerMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Read the configured dispatch mode (`Bundled` vs `PerChange`).
+    pub fn mode(&self) -> crate::config::ReviewerMode {
+        self.mode
     }
 
     /// Builder-style setter mirroring the config flag of the same name.
@@ -128,18 +211,59 @@ impl CodeReviewer {
             })?,
             None => DEFAULT_TEMPLATE.to_string(),
         };
-        Ok(Self::new(client, template).with_auto_revise_on_block(cfg.auto_revise_on_block))
+        Ok(Self::new(client, template)
+            .with_auto_revise_on_block(cfg.auto_revise_on_block)
+            .with_prompt_budget(cfg.prompt_budget_chars)
+            .with_mode(cfg.mode))
     }
 
     pub async fn review(&self, context: &ReviewContext) -> Result<ReviewReport> {
-        let rendered = render_sections(context);
-        let prompt = self
+        self.review_with_preamble(context, "").await
+    }
+
+    /// Per-change dispatch: invokes the LLM once per `PerChangeContext`,
+    /// each with that change's diff + touched files + the cross-change
+    /// preamble. Each call respects `prompt_budget_chars` independently,
+    /// so one change's huge file does NOT affect the other changes'
+    /// reviews. Returns one `PerChangeReview` per input context, in
+    /// input order; transient failures surface as `Err` for the whole
+    /// pass (the polling-loop synthesizes a Concerns-verdict report).
+    pub async fn review_per_change(
+        &self,
+        contexts: &[PerChangeContext],
+    ) -> Result<Vec<PerChangeReview>> {
+        let mut out = Vec::with_capacity(contexts.len());
+        for pcc in contexts {
+            let report = self
+                .review_with_preamble(&pcc.context, &pcc.cross_change_preamble)
+                .await
+                .with_context(|| format!("per-change review for `{}`", pcc.change_slug))?;
+            out.push(PerChangeReview {
+                change_slug: pcc.change_slug.clone(),
+                report,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Run the reviewer against `context`, optionally prepending
+    /// `preamble` to the rendered prompt (used by per-change mode to
+    /// carry the cross-change context block). An empty preamble is the
+    /// bundled-mode behavior.
+    pub async fn review_with_preamble(
+        &self,
+        context: &ReviewContext,
+        preamble: &str,
+    ) -> Result<ReviewReport> {
+        let rendered = render_sections(context, self.prompt_budget);
+        let body = self
             .template
+            .replace("{{cross_change_preamble}}", preamble)
             .replace("{{change_context}}", &rendered.change_context)
             .replace("{{changed_files}}", &rendered.changed_files)
             .replace("{{diff}}", &rendered.diff_or_explanation);
-        log_prompt_stats(context, &rendered, prompt.len());
-        let raw = self.client.complete(&prompt).await?;
+        log_prompt_stats(context, &rendered, body.len(), self.prompt_budget);
+        let raw = self.client.complete(&body).await?;
         Ok(parse_response(&raw))
     }
 }
@@ -148,7 +272,12 @@ impl CodeReviewer {
 /// per-section bytes, per-file bytes, total vs. budget, and any files
 /// dropped due to budget exhaustion. Operators rely on this to tell at a
 /// glance whether a review approached the prompt-budget cap.
-fn log_prompt_stats(ctx: &ReviewContext, rendered: &RenderedSections, prompt_bytes: usize) {
+fn log_prompt_stats(
+    ctx: &ReviewContext,
+    rendered: &RenderedSections,
+    prompt_bytes: usize,
+    budget: usize,
+) {
     let file_sizes: String = ctx
         .changed_files
         .iter()
@@ -156,14 +285,14 @@ fn log_prompt_stats(ctx: &ReviewContext, rendered: &RenderedSections, prompt_byt
         .collect::<Vec<_>>()
         .join(",");
     let file_bytes_total: usize = ctx.changed_files.iter().map(|f| f.contents.len()).sum();
-    let pct = if PROMPT_BUDGET == 0 {
-        0
-    } else {
-        (prompt_bytes.saturating_mul(100) / PROMPT_BUDGET).min(999)
-    };
+    let pct = prompt_bytes
+        .saturating_mul(100)
+        .checked_div(budget)
+        .map(|p| p.min(999))
+        .unwrap_or(0);
     tracing::info!(
         prompt_bytes = prompt_bytes,
-        budget = PROMPT_BUDGET,
+        budget = budget,
         pct_of_budget = pct,
         change_context_bytes = rendered.change_context.len(),
         changed_files_bytes = rendered.changed_files.len(),
@@ -179,8 +308,84 @@ fn log_prompt_stats(ctx: &ReviewContext, rendered: &RenderedSections, prompt_byt
     );
 }
 
+/// Build the cross-change preamble for a per-change reviewer call:
+/// names the OTHER changes in the same pass so the reviewer has cross-
+/// reference context, while making clear the verdict applies only to
+/// `this_change`.
+///
+/// Format (matches the spec's task 3.3 template):
+/// ```text
+/// This PR contains <N> changes. You are reviewing only `<slug>`.
+/// Other changes in the same PR (for cross-reference context only — do not review them):
+/// - <other-slug-1>: <other-1-summary>
+/// - <other-slug-2>: <other-2-summary>
+/// Your verdict applies ONLY to `<slug>`. The reviewer for each other change runs independently.
+/// ```
+///
+/// Each `<other-summary>` is the first paragraph of the other change's
+/// proposal `## Why` section, truncated to 200 chars. When the pass
+/// contains a single change, the preamble is an empty string (no other
+/// changes to reference).
+pub fn build_cross_change_preamble(
+    this_change: &str,
+    all_changes: &[ChangeBrief],
+) -> String {
+    if all_changes.len() <= 1 {
+        return String::new();
+    }
+    let n = all_changes.len();
+    let mut out = format!(
+        "This PR contains {n} changes. You are reviewing only `{this_change}`.\n\
+         Other changes in the same PR (for cross-reference context only — do not review them):\n"
+    );
+    for brief in all_changes {
+        if brief.name == this_change {
+            continue;
+        }
+        let summary = first_paragraph_of_why(&brief.proposal);
+        let truncated: String = summary.chars().take(200).collect();
+        out.push_str(&format!("- {}: {}\n", brief.name, truncated));
+    }
+    out.push_str(&format!(
+        "Your verdict applies ONLY to `{this_change}`. The reviewer for each other change runs independently.\n"
+    ));
+    out
+}
+
+/// Extract the first non-empty paragraph from a proposal's `## Why`
+/// section. Returns an empty string when the section is absent or empty.
+/// "Paragraph" = consecutive non-empty lines (joined with single spaces),
+/// stopping at the first blank line or the next `## ` header.
+fn first_paragraph_of_why(proposal: &str) -> String {
+    let mut in_why = false;
+    let mut paragraph_lines: Vec<&str> = Vec::new();
+    for raw_line in proposal.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("## ") {
+            if in_why {
+                break;
+            }
+            in_why = trimmed == "## Why";
+            continue;
+        }
+        if !in_why {
+            continue;
+        }
+        if line.trim().is_empty() {
+            if !paragraph_lines.is_empty() {
+                break;
+            }
+            continue;
+        }
+        paragraph_lines.push(line.trim());
+    }
+    paragraph_lines.join(" ")
+}
+
 /// Rendered substitution values for the three template placeholders, sized
-/// against `PROMPT_BUDGET` in priority order. Pure function for testability.
+/// against the configured `budget` in priority order. Pure function for
+/// testability.
 struct RenderedSections {
     change_context: String,
     changed_files: String,
@@ -190,7 +395,7 @@ struct RenderedSections {
     skipped_files: Vec<String>,
 }
 
-fn render_sections(ctx: &ReviewContext) -> RenderedSections {
+fn render_sections(ctx: &ReviewContext, budget: usize) -> RenderedSections {
     // 1. Change context — always included in full. Change briefs are
     //    small (proposal/design/tasks of OpenSpec changes), so the
     //    worst-case overflow here would be a misuse anyway.
@@ -219,7 +424,7 @@ fn render_sections(ctx: &ReviewContext) -> RenderedSections {
         // would have fit. Use a conservative additive estimate.
         let segment_len = file.path.len() + file.contents.len() + 64;
         let projected = change_context.len() + changed_files.len() + segment_len;
-        if projected > PROMPT_BUDGET {
+        if projected > budget {
             skipped.push(file.path.clone());
             continue;
         }
@@ -242,11 +447,11 @@ fn render_sections(ctx: &ReviewContext) -> RenderedSections {
     // 3. Diff — all-or-explanation. The diff is dropped if any files
     //    were skipped (the spec treats skipped files as the budget-
     //    exhaustion signal), OR if including the diff would push the
-    //    rendered prompt past `PROMPT_BUDGET`.
+    //    rendered prompt past the configured budget.
     let used = change_context.len() + changed_files.len();
     let diff_or_explanation = if ctx.diff.is_empty() {
         String::from("(no diff produced this pass)")
-    } else if !skipped.is_empty() || used + ctx.diff.len() > PROMPT_BUDGET {
+    } else if !skipped.is_empty() || used + ctx.diff.len() > budget {
         String::from("(diff omitted: budget exhausted by change context and changed files)")
     } else {
         ctx.diff.clone()
@@ -306,6 +511,7 @@ fn parse_response(raw: &str) -> ReviewReport {
                 verdict,
                 markdown,
                 concerns,
+                per_change_sections: Vec::new(),
             }
         }
         _ => ReviewReport {
@@ -314,6 +520,7 @@ fn parse_response(raw: &str) -> ReviewReport {
                 "[reviewer response did not include a valid verdict line]\n\n{raw}"
             ),
             concerns,
+            per_change_sections: Vec::new(),
         },
     }
 }
@@ -651,7 +858,7 @@ this is not yaml: at all: ::: {{{ broken
     async fn never_truncates_individual_file() {
         let (client, captured) = stub_with_capture("VERDICT: Pass\n");
         let reviewer = CodeReviewer::new(client, "{{changed_files}}".to_string());
-        let huge = "z".repeat(PROMPT_BUDGET + 100_000);
+        let huge = "z".repeat(DEFAULT_PROMPT_BUDGET + 100_000);
         let ctx = ReviewContext {
             archived_changes: Vec::new(),
             changed_files: vec![ChangedFile {
@@ -691,7 +898,7 @@ this is not yaml: at all: ::: {{{ broken
             }],
             diff: "DELTA".into(),
         };
-        let r = render_sections(&ctx);
+        let r = render_sections(&ctx, DEFAULT_PROMPT_BUDGET);
         assert!(r.change_context.contains("## Change: x"));
         assert!(r.change_context.contains("P\n\nD\n\nT"));
         assert!(r.changed_files.contains("## File: a.rs"));
@@ -717,6 +924,8 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: Some(template_path),
             auto_revise_on_block: false,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("should load custom template");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_OVERRIDE") };
@@ -746,6 +955,8 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: Some(bogus.clone()),
             auto_revise_on_block: false,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
         };
         let result = CodeReviewer::from_config(&cfg);
         let err = match result {
@@ -773,6 +984,8 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             auto_revise_on_block: false,
+            prompt_budget_chars: 2_000_000,
+            mode: crate::config::ReviewerMode::Bundled,
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("default template loads");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_DEFAULT") };
@@ -805,6 +1018,271 @@ this is not yaml: at all: ::: {{{ broken
             DEFAULT_TEMPLATE.to_lowercase().contains("most-critical-first")
                 || DEFAULT_TEMPLATE.to_lowercase().contains("most critical first"),
             "default template must instruct on ordering for cap-budget truncation"
+        );
+    }
+
+    /// A higher prompt-budget cap lets a file through that the default
+    /// cap would have skipped. Demonstrates the field is data-driven.
+    #[tokio::test]
+    async fn higher_prompt_budget_admits_files_default_would_skip() {
+        let (client, captured) = stub_with_capture("VERDICT: Pass\n");
+        let reviewer = CodeReviewer::new(client, "{{changed_files}}".to_string())
+            .with_prompt_budget(4_000_000);
+        // 3MB file: the default 2MB cap would skip it; the 4MB cap admits it.
+        let three_mb = "y".repeat(3_000_000);
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "big.rs".into(),
+                contents: three_mb,
+            }],
+            diff: String::new(),
+        };
+        reviewer.review(&ctx).await.unwrap();
+        let prompt = captured.lock().unwrap().clone().unwrap();
+        assert!(prompt.contains("## File: big.rs"));
+        assert!(
+            !prompt.contains("## Skipped (budget exhausted)"),
+            "no skip footer expected when cap fits the content"
+        );
+    }
+
+    /// Default `prompt_budget` from `CodeReviewer::new` matches
+    /// `DEFAULT_PROMPT_BUDGET` (the historical hard-coded value).
+    #[test]
+    fn default_prompt_budget_matches_historical_constant() {
+        let (client, _) = stub_with_capture("VERDICT: Pass\n");
+        let reviewer = CodeReviewer::new(client, "irrelevant".into());
+        assert_eq!(reviewer.prompt_budget(), DEFAULT_PROMPT_BUDGET);
+        assert_eq!(reviewer.prompt_budget(), 2_000_000);
+    }
+
+    #[test]
+    fn build_cross_change_preamble_single_change_is_empty() {
+        let briefs = vec![ChangeBrief {
+            name: "only-one".into(),
+            proposal: "## Why\nfor reasons\n".into(),
+            design: None,
+            tasks: String::new(),
+        }];
+        assert_eq!(
+            build_cross_change_preamble("only-one", &briefs),
+            "",
+            "single-change pass produces empty preamble"
+        );
+    }
+
+    #[test]
+    fn build_cross_change_preamble_lists_other_changes() {
+        let briefs = vec![
+            ChangeBrief {
+                name: "a".into(),
+                proposal: "## Why\nfix the auth bug\n".into(),
+                design: None,
+                tasks: String::new(),
+            },
+            ChangeBrief {
+                name: "b".into(),
+                proposal: "## Why\nadd metrics emission\n".into(),
+                design: None,
+                tasks: String::new(),
+            },
+            ChangeBrief {
+                name: "c".into(),
+                proposal: "## Why\nrefactor dispatcher\n".into(),
+                design: None,
+                tasks: String::new(),
+            },
+        ];
+        let p = build_cross_change_preamble("b", &briefs);
+        // Must reference the change being reviewed, mention the count,
+        // and name the OTHER changes — never itself.
+        assert!(p.contains("This PR contains 3 changes"));
+        assert!(p.contains("`b`"));
+        assert!(p.contains("- a: fix the auth bug"));
+        assert!(p.contains("- c: refactor dispatcher"));
+        // Must NOT include the reviewed change in the "others" list.
+        assert!(!p.contains("- b: add metrics emission"));
+        // Must end with the verdict-scope reminder.
+        assert!(p.contains("Your verdict applies ONLY to `b`"));
+    }
+
+    #[test]
+    fn build_cross_change_preamble_truncates_long_why_to_200_chars() {
+        // Use a sentinel char that does NOT appear anywhere in the
+        // surrounding preamble template, so we can count its occurrences
+        // and isolate the truncation behavior.
+        let long_why = "Z".repeat(500);
+        let briefs = vec![
+            ChangeBrief {
+                name: "self".into(),
+                proposal: "## Why\nshort\n".into(),
+                design: None,
+                tasks: String::new(),
+            },
+            ChangeBrief {
+                name: "other".into(),
+                proposal: format!("## Why\n{long_why}\n"),
+                design: None,
+                tasks: String::new(),
+            },
+        ];
+        let p = build_cross_change_preamble("self", &briefs);
+        // The line is `- other: <truncated to 200 chars>\n`; we expect
+        // exactly 200 Z's, not 500.
+        let z_count = p.matches('Z').count();
+        assert_eq!(z_count, 200);
+    }
+
+    #[tokio::test]
+    async fn review_per_change_invokes_llm_once_per_change() {
+        // We need to track each call. Use the StubClient pattern but
+        // record every prompt observed (not just the last).
+        use std::sync::Mutex;
+        struct CountingClient {
+            prompts: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl LlmClient for CountingClient {
+            async fn complete(&self, prompt: &str) -> anyhow::Result<String> {
+                self.prompts.lock().unwrap().push(prompt.to_string());
+                Ok("VERDICT: Pass\n".to_string())
+            }
+        }
+        let prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let client = Box::new(CountingClient { prompts: prompts.clone() });
+        let template = "PREAMBLE<<{{cross_change_preamble}}>>FILES<<{{changed_files}}>>".to_string();
+        let reviewer = CodeReviewer::new(client, template)
+            .with_mode(crate::config::ReviewerMode::PerChange);
+
+        let briefs = vec![
+            ChangeBrief {
+                name: "a".into(),
+                proposal: "## Why\nfor a reasons\n".into(),
+                design: None,
+                tasks: String::new(),
+            },
+            ChangeBrief {
+                name: "b".into(),
+                proposal: "## Why\nfor b reasons\n".into(),
+                design: None,
+                tasks: String::new(),
+            },
+            ChangeBrief {
+                name: "c".into(),
+                proposal: "## Why\nfor c reasons\n".into(),
+                design: None,
+                tasks: String::new(),
+            },
+        ];
+        let contexts: Vec<PerChangeContext> = briefs
+            .iter()
+            .map(|b| PerChangeContext {
+                change_slug: b.name.clone(),
+                context: ReviewContext {
+                    archived_changes: vec![b.clone()],
+                    changed_files: vec![ChangedFile {
+                        path: format!("{}.rs", b.name),
+                        contents: format!("body of {}", b.name),
+                    }],
+                    diff: format!("diff of {}", b.name),
+                },
+                cross_change_preamble: build_cross_change_preamble(&b.name, &briefs),
+            })
+            .collect();
+
+        let results = reviewer.review_per_change(&contexts).await.unwrap();
+        assert_eq!(results.len(), 3);
+        let captured = prompts.lock().unwrap();
+        assert_eq!(captured.len(), 3, "one LLM call per change");
+        // Each prompt must contain ONLY its own file's body and a
+        // preamble naming the OTHER two changes.
+        for (i, slug) in ["a", "b", "c"].iter().enumerate() {
+            let p = &captured[i];
+            assert!(p.contains(&format!("body of {slug}")), "prompt {i}: own body");
+            for other in ["a", "b", "c"].iter() {
+                if other != slug {
+                    assert!(
+                        p.contains(&format!("- {other}: for {other} reasons")),
+                        "prompt {i}: preamble must name other slug {other}"
+                    );
+                }
+            }
+            // Must NOT contain the verdict-scope line for any OTHER change.
+            assert!(
+                p.contains(&format!("`{slug}`")),
+                "prompt {i}: self-reference in preamble"
+            );
+        }
+        for r in &results {
+            assert_eq!(r.report.verdict, ReviewVerdict::Pass);
+        }
+    }
+
+    /// Per-change budget enforcement is per-call: a huge file in change
+    /// A produces a skip footer in A's section but does NOT affect B's
+    /// or C's reviews.
+    #[tokio::test]
+    async fn review_per_change_budgets_are_independent() {
+        use std::sync::Mutex;
+        struct EchoClient {
+            prompts: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl LlmClient for EchoClient {
+            async fn complete(&self, prompt: &str) -> anyhow::Result<String> {
+                self.prompts.lock().unwrap().push(prompt.to_string());
+                Ok("VERDICT: Pass\n".to_string())
+            }
+        }
+        let prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let client = Box::new(EchoClient { prompts: prompts.clone() });
+        let reviewer = CodeReviewer::new(client, "{{changed_files}}".to_string())
+            .with_prompt_budget(1_000_000)
+            .with_mode(crate::config::ReviewerMode::PerChange);
+        // Change A: a huge file (way over the 1MB cap).
+        let huge = "z".repeat(2_000_000);
+        let a_ctx = PerChangeContext {
+            change_slug: "a".into(),
+            context: ReviewContext {
+                archived_changes: Vec::new(),
+                changed_files: vec![ChangedFile {
+                    path: "huge.rs".into(),
+                    contents: huge,
+                }],
+                diff: String::new(),
+            },
+            cross_change_preamble: String::new(),
+        };
+        // Change B: a tiny file (well under cap).
+        let b_ctx = PerChangeContext {
+            change_slug: "b".into(),
+            context: ReviewContext {
+                archived_changes: Vec::new(),
+                changed_files: vec![ChangedFile {
+                    path: "tiny.rs".into(),
+                    contents: "fn ok() {}".into(),
+                }],
+                diff: String::new(),
+            },
+            cross_change_preamble: String::new(),
+        };
+        let _ = reviewer
+            .review_per_change(&[a_ctx, b_ctx])
+            .await
+            .unwrap();
+        let captured = prompts.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        // A's prompt: skipped footer must fire.
+        assert!(
+            captured[0].contains("## Skipped (budget exhausted): huge.rs"),
+            "change A's huge file must trigger its own skip footer"
+        );
+        // B's prompt: must contain the tiny file in full, and NO skip footer.
+        assert!(captured[1].contains("fn ok() {}"));
+        assert!(
+            !captured[1].contains("## Skipped (budget exhausted)"),
+            "change B's review must NOT be affected by change A's truncation"
         );
     }
 

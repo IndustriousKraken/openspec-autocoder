@@ -350,6 +350,100 @@ pub fn last_commit_summary(
     }))
 }
 
+/// Find commits on `head` (since divergence from `base`) whose commit
+/// subject matches `<change>:` — the convention used by the orchestrator
+/// when shipping a change. Returns SHAs in chronological order
+/// (`--reverse`). Empty when no matching commit exists (e.g. the change
+/// was archived with no committed work, or the commit message format
+/// differs).
+pub fn commits_for_change(
+    workspace: &Path,
+    base: &str,
+    head: &str,
+    change: &str,
+) -> Result<Vec<String>> {
+    let range = format!("{base}..{head}");
+    let pattern = format!("^{}:", regex_escape(change));
+    let output = run_git(
+        workspace,
+        "log --grep",
+        &[
+            "log",
+            "--reverse",
+            "--pretty=format:%H",
+            "-E",
+            "--grep",
+            &pattern,
+            &range,
+        ],
+    )?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// Escape regex metacharacters in a literal so that `git log -E --grep`
+/// treats them as literal text. Hand-rolled to avoid adding the `regex`
+/// crate to this module just for one helper.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        if matches!(
+            c,
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '['
+                | ']' | '{' | '}' | '|' | '\\' | '/'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Return the unified diff produced by the given commit SHAs, concatenated
+/// in the order provided. Each `git show -p <sha>` call emits the
+/// commit's metadata header followed by the diff body. Used by the
+/// per-change reviewer mode to scope each per-change prompt to that
+/// change's commits alone.
+pub fn diff_for_commits(workspace: &Path, shas: &[String]) -> Result<String> {
+    let mut out = String::new();
+    for sha in shas {
+        let output = run_git(workspace, "show", &["show", "-p", "--no-color", sha])?;
+        out.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    Ok(out)
+}
+
+/// Return the deduplicated workspace-relative paths touched by the given
+/// commit SHAs (union, preserving first-seen order). Used to scope the
+/// per-change reviewer prompt to the files that specific commit touched.
+pub fn files_for_commits(workspace: &Path, shas: &[String]) -> Result<Vec<String>> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for sha in shas {
+        let output = run_git(
+            workspace,
+            "show --name-only",
+            &["show", "--name-only", "--pretty=format:", sha],
+        )?;
+        let raw = String::from_utf8_lossy(&output.stdout);
+        for line in raw.lines() {
+            let l = line.trim();
+            if l.is_empty() {
+                continue;
+            }
+            if seen.insert(l.to_string()) {
+                out.push(l.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Return the name-only file list for the three-dot diff between `base`
 /// and `head`. Equivalent to `git diff --name-only <base>...<head>`.
 /// Empty lines are filtered. Each entry is a workspace-relative path.

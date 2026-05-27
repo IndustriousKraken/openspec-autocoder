@@ -1265,6 +1265,8 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
                 api_base_url: None,
                 prompt_template_path: None,
                 auto_revise_on_block: false,
+                prompt_budget_chars: 2_000_000,
+                mode: crate::config::ReviewerMode::Bundled,
             })
         }
     };
@@ -1920,6 +1922,8 @@ pub(crate) async fn reconfigure_reviewer(
                 api_base_url: None,
                 prompt_template_path: None,
                 auto_revise_on_block: false,
+                prompt_budget_chars: 2_000_000,
+                mode: crate::config::ReviewerMode::Bundled,
             });
             reviewer.provider = provider;
             reviewer.model = model;

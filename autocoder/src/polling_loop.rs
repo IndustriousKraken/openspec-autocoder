@@ -8,7 +8,10 @@ use crate::audits::AuditRegistry;
 use crate::audits::scheduler::run_due_audits;
 use crate::busy_marker;
 use crate::chatops::{self, AnswerPayload, ChatOpsBackend, QuestionPayload};
-use crate::code_reviewer::{CodeReviewer, ReviewConcern, ReviewReport, ReviewVerdict};
+use crate::code_reviewer::{
+    CodeReviewer, PerChangeContext, PerChangeReview, PerChangeSection, ReviewConcern,
+    ReviewReport, ReviewVerdict, build_cross_change_preamble,
+};
 use crate::config::{AuditSettings, AuditsConfig, GithubConfig, RepositoryConfig};
 use crate::control_socket::{ChatOpsHolder, ChatOpsSlot, GithubHolder, ReviewerHolder};
 use crate::executor::{Executor, ExecutorOutcome, ResumeHandle, UnimplementableTask};
@@ -686,8 +689,20 @@ pub async fn execute_one_pass(
         None => (None, false, Vec::new()),
         Some(r) => {
             let _ = guard.set_stage(busy_marker::Stage::Review);
-            let ctx = build_review_context(workspace, repo, &processed)?;
-            match r.review(&ctx).await {
+            let outcome = match r.mode() {
+                crate::config::ReviewerMode::Bundled => {
+                    let ctx = build_review_context(workspace, repo, &processed)?;
+                    r.review(&ctx).await
+                }
+                crate::config::ReviewerMode::PerChange => {
+                    let contexts =
+                        build_per_change_contexts(workspace, repo, &processed)?;
+                    r.review_per_change(&contexts).await.map(|per_change| {
+                        synthesize_per_change_report(per_change)
+                    })
+                }
+            };
+            match outcome {
                 Ok(mut report) => {
                     let draft = matches!(report.verdict, ReviewVerdict::Block);
                     let taken = if r.auto_revise_on_block() {
@@ -703,6 +718,7 @@ pub async fn execute_one_pass(
                         verdict: ReviewVerdict::Concerns,
                         markdown: format!("(reviewer failed: {e})"),
                         concerns: Vec::new(),
+                        per_change_sections: Vec::new(),
                     };
                     (Some(synthetic), false, Vec::new())
                 }
@@ -855,6 +871,169 @@ fn build_review_context(
         changed_files,
         diff,
     })
+}
+
+/// Assemble one `PerChangeContext` per change in `processed`, used by
+/// the reviewer's `per_change` mode dispatch. Each per-change context is
+/// scoped to:
+/// - the change's own brief (proposal/design/tasks),
+/// - the diff of the commit(s) for that change (NOT the union diff),
+/// - the workspace-state contents of the files touched by those commits,
+/// - a cross-change preamble naming the OTHER changes in the same pass.
+///
+/// Commits are located by subject-prefix (`<change>:`) using
+/// `git::commits_for_change`. A change with no matching commit (or whose
+/// touched-file list is empty) still produces a context, but with an
+/// empty diff/files set — the reviewer's prompt for that change still
+/// includes the brief + preamble, so the operator sees a deliberate
+/// `## Code Review: <slug>` section instead of a silent skip.
+fn build_per_change_contexts(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    processed: &[String],
+) -> Result<Vec<PerChangeContext>> {
+    // First pass: gather briefs for all changes. The cross-change
+    // preamble for change `i` needs the OTHER changes' briefs in full,
+    // so we collect them all first.
+    let archive_root = workspace.join("openspec/changes/archive");
+    let mut briefs: Vec<crate::code_reviewer::ChangeBrief> =
+        Vec::with_capacity(processed.len());
+    for name in processed {
+        let dir = match locate_archive_dir(&archive_root, name)? {
+            Some(d) => d,
+            None => {
+                tracing::warn!(
+                    change = %name,
+                    "archive directory not found while building per-change review context"
+                );
+                continue;
+            }
+        };
+        let proposal = std::fs::read_to_string(dir.join("proposal.md")).unwrap_or_default();
+        let design = std::fs::read_to_string(dir.join("design.md")).ok();
+        let tasks = std::fs::read_to_string(dir.join("tasks.md")).unwrap_or_default();
+        briefs.push(crate::code_reviewer::ChangeBrief {
+            name: name.clone(),
+            proposal,
+            design,
+            tasks,
+        });
+    }
+
+    let mut contexts: Vec<PerChangeContext> = Vec::with_capacity(briefs.len());
+    for brief in &briefs {
+        let shas = git::commits_for_change(
+            workspace,
+            &repo.base_branch,
+            &repo.agent_branch,
+            &brief.name,
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                change = %brief.name,
+                "git log --grep failed locating per-change commits; falling back to empty list: {e:#}"
+            );
+            Vec::new()
+        });
+        let diff = if shas.is_empty() {
+            String::new()
+        } else {
+            git::diff_for_commits(workspace, &shas).unwrap_or_default()
+        };
+        let file_paths = if shas.is_empty() {
+            Vec::new()
+        } else {
+            git::files_for_commits(workspace, &shas).unwrap_or_default()
+        };
+        let mut changed_files = Vec::with_capacity(file_paths.len());
+        for path in &file_paths {
+            let abs = workspace.join(path);
+            match std::fs::read_to_string(&abs) {
+                Ok(contents) => {
+                    changed_files.push(crate::code_reviewer::ChangedFile {
+                        path: path.clone(),
+                        contents,
+                    });
+                }
+                // Deleted files have no current content but still appear
+                // in the per-change diff — that's fine, the diff body
+                // captures the deletion.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path,
+                        change = %brief.name,
+                        "skipping per-change file read for reviewer: {e}"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let context = crate::code_reviewer::ReviewContext {
+            archived_changes: vec![brief.clone()],
+            changed_files,
+            diff,
+        };
+        let preamble = build_cross_change_preamble(&brief.name, &briefs);
+        contexts.push(PerChangeContext {
+            change_slug: brief.name.clone(),
+            context,
+            cross_change_preamble: preamble,
+        });
+    }
+    Ok(contexts)
+}
+
+/// Aggregate a `Vec<PerChangeReview>` into one `ReviewReport` whose
+/// `per_change_sections` drives the PR-body composer to emit one
+/// `## Code Review: <slug>` section per element. The aggregate
+/// `verdict` is the worst across sections (`Block` > `Concerns` >
+/// `Pass`). The flat `concerns` vec is the union of each per-change
+/// report's concerns, used by the auto-revise pipeline.
+fn synthesize_per_change_report(per_change: Vec<PerChangeReview>) -> ReviewReport {
+    let mut verdict = ReviewVerdict::Pass;
+    let mut concerns: Vec<ReviewConcern> = Vec::new();
+    let mut sections: Vec<PerChangeSection> = Vec::with_capacity(per_change.len());
+    for pcr in per_change {
+        verdict = worst_verdict(verdict, pcr.report.verdict);
+        for concern in &pcr.report.concerns {
+            let mut tagged = concern.clone();
+            tagged.change_slug = Some(pcr.change_slug.clone());
+            concerns.push(tagged);
+        }
+        let section_body =
+            format!("VERDICT: {}\n\n{}", verdict_label(pcr.report.verdict), pcr.report.markdown);
+        sections.push(PerChangeSection {
+            change_slug: pcr.change_slug,
+            markdown: section_body,
+        });
+    }
+    ReviewReport {
+        verdict,
+        markdown: String::new(),
+        concerns,
+        per_change_sections: sections,
+    }
+}
+
+fn verdict_label(v: ReviewVerdict) -> &'static str {
+    match v {
+        ReviewVerdict::Pass => "Pass",
+        ReviewVerdict::Concerns => "Concerns",
+        ReviewVerdict::Block => "Block",
+    }
+}
+
+fn worst_verdict(a: ReviewVerdict, b: ReviewVerdict) -> ReviewVerdict {
+    fn rank(v: ReviewVerdict) -> u8 {
+        match v {
+            ReviewVerdict::Pass => 0,
+            ReviewVerdict::Concerns => 1,
+            ReviewVerdict::Block => 2,
+        }
+    }
+    if rank(a) >= rank(b) { a } else { b }
 }
 
 /// Find the date-prefixed archive directory matching the given change name
@@ -2984,25 +3163,68 @@ fn partition_and_annotate_reviewer_revisions(
         (revisable, Vec::new())
     };
     if !dropped.is_empty() {
-        // Ensure separation from any prior content the LLM produced.
-        if !report.markdown.ends_with("\n\n") {
-            if report.markdown.ends_with('\n') {
-                report.markdown.push('\n');
-            } else {
-                report.markdown.push_str("\n\n");
-            }
-        }
-        report
-            .markdown
-            .push_str("### Reviewer-initiated revisions: dropped (cap budget exhausted)\n");
-        for c in &dropped {
-            report.markdown.push_str(&format!(
-                "- (not auto-revised; cap budget exhausted) {}\n",
-                c.summary
-            ));
+        if report.per_change_sections.is_empty() {
+            annotate_dropped_in_markdown(&mut report.markdown, &dropped);
+        } else {
+            annotate_dropped_in_per_change_sections(report, &dropped);
         }
     }
     taken
+}
+
+/// Append the "dropped (cap budget exhausted)" footer to a bundled-mode
+/// report's single `## Code Review` markdown.
+fn annotate_dropped_in_markdown(markdown: &mut String, dropped: &[ReviewConcern]) {
+    if !markdown.ends_with("\n\n") {
+        if markdown.ends_with('\n') {
+            markdown.push('\n');
+        } else {
+            markdown.push_str("\n\n");
+        }
+    }
+    markdown
+        .push_str("### Reviewer-initiated revisions: dropped (cap budget exhausted)\n");
+    for c in dropped {
+        markdown.push_str(&format!(
+            "- (not auto-revised; cap budget exhausted) {}\n",
+            c.summary
+        ));
+    }
+}
+
+/// In per-change mode, group dropped concerns by their originating
+/// change slug and append the footer to each matching `PerChangeSection`'s
+/// markdown so the annotation lands in the correct `## Code Review:
+/// <slug>` PR-body section. Dropped concerns lacking a slug attribution
+/// (shouldn't happen — `synthesize_per_change_report` always stamps it)
+/// are appended to the LAST section as a safety net.
+fn annotate_dropped_in_per_change_sections(
+    report: &mut ReviewReport,
+    dropped: &[ReviewConcern],
+) {
+    use std::collections::HashMap;
+    let mut by_slug: HashMap<String, Vec<&ReviewConcern>> = HashMap::new();
+    let mut unattributed: Vec<&ReviewConcern> = Vec::new();
+    for c in dropped {
+        match c.change_slug.as_deref() {
+            Some(slug) => by_slug.entry(slug.to_string()).or_default().push(c),
+            None => unattributed.push(c),
+        }
+    }
+    for section in report.per_change_sections.iter_mut() {
+        if let Some(concerns) = by_slug.get(&section.change_slug) {
+            annotate_dropped_in_markdown(&mut section.markdown, &concerns_to_owned(concerns));
+        }
+    }
+    if !unattributed.is_empty() {
+        if let Some(last) = report.per_change_sections.last_mut() {
+            annotate_dropped_in_markdown(&mut last.markdown, &concerns_to_owned(&unattributed));
+        }
+    }
+}
+
+fn concerns_to_owned(refs: &[&ReviewConcern]) -> Vec<ReviewConcern> {
+    refs.iter().map(|c| (*c).clone()).collect()
 }
 
 /// Build the implementer-summary markdown for `processed`, truncate it to
@@ -5869,6 +6091,7 @@ mod tests {
                         verdict: ReviewVerdict::Concerns,
                         markdown: format!("(reviewer failed: {e})"),
                         concerns: Vec::new(),
+                        per_change_sections: Vec::new(),
                     }),
                     false,
                 ),
@@ -10818,6 +11041,7 @@ mod tests {
             verdict,
             markdown: "## Summary\nbase markdown.\n".to_string(),
             concerns,
+            per_change_sections: Vec::new(),
         }
     }
 
@@ -10826,6 +11050,7 @@ mod tests {
             summary: summary.to_string(),
             actionable_request: Some(request.to_string()),
             should_request_revision: true,
+            change_slug: None,
         }
     }
 
@@ -10834,7 +11059,83 @@ mod tests {
             summary: summary.to_string(),
             actionable_request: None,
             should_request_revision: false,
+            change_slug: None,
         }
+    }
+
+    #[test]
+    fn synthesize_per_change_aggregates_verdict_worst() {
+        use crate::code_reviewer::PerChangeReview;
+        let per_change = vec![
+            PerChangeReview {
+                change_slug: "a".into(),
+                report: ReviewReport {
+                    verdict: ReviewVerdict::Pass,
+                    markdown: "ok".into(),
+                    concerns: Vec::new(),
+                    per_change_sections: Vec::new(),
+                },
+            },
+            PerChangeReview {
+                change_slug: "b".into(),
+                report: ReviewReport {
+                    verdict: ReviewVerdict::Concerns,
+                    markdown: "minor".into(),
+                    concerns: Vec::new(),
+                    per_change_sections: Vec::new(),
+                },
+            },
+            PerChangeReview {
+                change_slug: "c".into(),
+                report: ReviewReport {
+                    verdict: ReviewVerdict::Block,
+                    markdown: "bad".into(),
+                    concerns: Vec::new(),
+                    per_change_sections: Vec::new(),
+                },
+            },
+        ];
+        let synth = synthesize_per_change_report(per_change);
+        // Worst verdict wins (Block > Concerns > Pass).
+        assert_eq!(synth.verdict, ReviewVerdict::Block);
+        // Each section preserves the per-change verdict in its body.
+        assert_eq!(synth.per_change_sections.len(), 3);
+        assert!(synth.per_change_sections[0].markdown.starts_with("VERDICT: Pass"));
+        assert!(synth.per_change_sections[1].markdown.starts_with("VERDICT: Concerns"));
+        assert!(synth.per_change_sections[2].markdown.starts_with("VERDICT: Block"));
+    }
+
+    #[test]
+    fn synthesize_per_change_stamps_change_slug_on_concerns() {
+        use crate::code_reviewer::PerChangeReview;
+        let mut c1 = revisable_concern("c1", "fix");
+        c1.change_slug = None; // simulate freshly-parsed (untagged)
+        let mut c2 = revisable_concern("c2", "fix");
+        c2.change_slug = None;
+        let per_change = vec![
+            PerChangeReview {
+                change_slug: "alpha".into(),
+                report: ReviewReport {
+                    verdict: ReviewVerdict::Block,
+                    markdown: String::new(),
+                    concerns: vec![c1.clone()],
+                    per_change_sections: Vec::new(),
+                },
+            },
+            PerChangeReview {
+                change_slug: "beta".into(),
+                report: ReviewReport {
+                    verdict: ReviewVerdict::Block,
+                    markdown: String::new(),
+                    concerns: vec![c2.clone()],
+                    per_change_sections: Vec::new(),
+                },
+            },
+        ];
+        let synth = synthesize_per_change_report(per_change);
+        assert_eq!(synth.concerns.len(), 2);
+        assert_eq!(synth.concerns[0].change_slug.as_deref(), Some("alpha"));
+        assert_eq!(synth.concerns[1].change_slug.as_deref(), Some("beta"));
     }
 
     #[test]
@@ -10921,6 +11222,84 @@ mod tests {
         assert!(r.markdown.contains("(not auto-revised; cap budget exhausted) b"));
     }
 
+    /// 3-change per-change pass with 2 revision requests per change AND
+    /// `max_revisions_per_pr: 5` → 5 comments posted, 1 annotated as
+    /// "(not auto-revised; cap budget exhausted)" inside its OWN per-
+    /// change section (not the bundled markdown).
+    #[test]
+    fn partition_per_change_drops_extra_into_change_section() {
+        use crate::code_reviewer::PerChangeSection;
+        let mut concern_a1 = revisable_concern("a-c1", "fix a-c1");
+        concern_a1.change_slug = Some("change-a".into());
+        let mut concern_a2 = revisable_concern("a-c2", "fix a-c2");
+        concern_a2.change_slug = Some("change-a".into());
+        let mut concern_b1 = revisable_concern("b-c1", "fix b-c1");
+        concern_b1.change_slug = Some("change-b".into());
+        let mut concern_b2 = revisable_concern("b-c2", "fix b-c2");
+        concern_b2.change_slug = Some("change-b".into());
+        let mut concern_c1 = revisable_concern("c-c1", "fix c-c1");
+        concern_c1.change_slug = Some("change-c".into());
+        let mut concern_c2 = revisable_concern("c-c2", "fix c-c2");
+        concern_c2.change_slug = Some("change-c".into());
+
+        let mut report = ReviewReport {
+            verdict: ReviewVerdict::Block,
+            markdown: String::new(),
+            concerns: vec![
+                concern_a1, concern_a2, concern_b1, concern_b2, concern_c1, concern_c2,
+            ],
+            per_change_sections: vec![
+                PerChangeSection {
+                    change_slug: "change-a".into(),
+                    markdown: "VERDICT: Block\n\n## Summary\nchange a notes.\n".into(),
+                },
+                PerChangeSection {
+                    change_slug: "change-b".into(),
+                    markdown: "VERDICT: Block\n\n## Summary\nchange b notes.\n".into(),
+                },
+                PerChangeSection {
+                    change_slug: "change-c".into(),
+                    markdown: "VERDICT: Block\n\n## Summary\nchange c notes.\n".into(),
+                },
+            ],
+        };
+        let taken = partition_and_annotate_reviewer_revisions(&mut report, 5);
+        // 5 of 6 revisable concerns posted.
+        assert_eq!(taken.len(), 5);
+        let taken_summaries: Vec<String> = taken.iter().map(|c| c.summary.clone()).collect();
+        assert_eq!(
+            taken_summaries,
+            vec!["a-c1", "a-c2", "b-c1", "b-c2", "c-c1"]
+        );
+        // The 6th concern (c-c2) is annotated inside change-c's section,
+        // NOT in the bundled markdown field.
+        let change_c_section = report
+            .per_change_sections
+            .iter()
+            .find(|s| s.change_slug == "change-c")
+            .expect("change-c section retained");
+        assert!(
+            change_c_section.markdown.contains("(not auto-revised; cap budget exhausted) c-c2"),
+            "dropped concern must be annotated in its own section; got:\n{}",
+            change_c_section.markdown
+        );
+        // Other sections must NOT carry the dropped annotation.
+        for slug in ["change-a", "change-b"] {
+            let s = report
+                .per_change_sections
+                .iter()
+                .find(|s| s.change_slug == slug)
+                .unwrap();
+            assert!(
+                !s.markdown.contains("cap budget exhausted"),
+                "section {slug} should not be annotated; got:\n{}",
+                s.markdown
+            );
+        }
+        // The bundled `markdown` field stays empty in per-change mode.
+        assert!(!report.markdown.contains("cap budget exhausted"));
+    }
+
     #[test]
     fn partition_block_with_no_revisable_concerns_returns_empty() {
         let mut r = make_report(
@@ -10946,6 +11325,7 @@ mod tests {
                     summary: "missing-body".into(),
                     actionable_request: Some("   ".into()),
                     should_request_revision: true,
+                    change_slug: None,
                 },
                 revisable_concern("ok", "fix this"),
             ],

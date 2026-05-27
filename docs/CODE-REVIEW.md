@@ -47,9 +47,47 @@ The reviewer receives a structured bundle, not just a diff. In priority order:
 2. **Changed files (full contents)** — every file touched by the pass, read at the agent-branch state. Whole-file context lets the reviewer evaluate trust boundaries, call sites, and helper definitions — work that a unified diff alone cannot support.
 3. **Unified diff** — included last, if the prompt budget allows.
 
-The combined prompt is capped at **2,000,000 characters** (sized for current 1M-token-class models). Files are never partially truncated: if the next file would push the running total over budget, it is skipped in full and named in a `## Skipped (budget exhausted): ...` footer. When files are skipped, the diff is also dropped and replaced by an explanatory message. The default template instructs the model to acknowledge missing context in its first bullet under "Possible bugs" and bias toward `Concerns` over `Pass`.
+The combined prompt is capped by the configured `reviewer.prompt_budget_chars` (see [Prompt budget](#prompt-budget) below). Files are never partially truncated: if the next file would push the running total over budget, it is skipped in full and named in a `## Skipped (budget exhausted): ...` footer. When files are skipped, the diff is also dropped and replaced by an explanatory message. The default template instructs the model to acknowledge missing context in its first bullet under "Possible bugs" and bias toward `Concerns` over `Pass`.
 
 This is a stopgap until the reviewer is upgraded to an MCP-tool-using model that can `Read`/`Grep` the codebase directly — for now, "send the whole touched surface" gives the reviewer enough information to do a real security review.
+
+## Prompt budget
+
+The reviewer's prompt-body cap is controlled by `reviewer.prompt_budget_chars` (default `2_000_000`). When the rendered prompt — change context + changed files + diff — would exceed this number of characters, files are skipped whole (in priority order) and the `## Skipped (budget exhausted): ...` footer is emitted.
+
+There is **no hard upper bound** enforced by the daemon. Operators are responsible for matching this value to their LLM provider's actual context window:
+
+- High-context providers (Grok-4, Claude Sonnet 4.6, etc., with 1M+ token windows) tolerate `4_000_000` chars or more — stop hitting truncation on bundled multi-change PRs touching large files.
+- Smaller-window providers (some self-hosted Ollama deployments, older Claude models) need a tighter cap to fit the provider's real limit. Setting `1_000_000` (or whatever maps to your provider's actual window at the model's chars-per-token rate) avoids API-side rejects.
+- Setting too high a value relative to the model's window will cause the LLM to return an error at request time; autocoder does not pre-validate this. Match it to your provider.
+
+The field is hot-applicable via `autocoder reload` (it lives in the `reviewer:` block, which the existing reload path picks up). Restart-free.
+
+```yaml
+reviewer:
+  prompt_budget_chars: 4_000_000   # default 2_000_000
+```
+
+## Per-change reviewer mode
+
+`reviewer.mode` controls how the reviewer dispatches against multi-change PRs:
+
+- **`bundled`** (default) — one reviewer call per PR, with the prompt scoped to the union of every touched file from every change in the PR. This is today's behavior; the reviewer sees the whole pass at once.
+- **`per_change`** — one reviewer call per change in the pass. Each call's prompt is scoped to that change's own diff plus the files that specific change touched. The PR body contains one `## Code Review: <change-slug>` section per change instead of a single combined `## Code Review` block.
+
+Trade-offs:
+
+- **LLM cost** scales linearly under `per_change`: an N-change PR costs N× the bundled-mode price. Pick `per_change` only if you specifically want per-change attention and are willing to pay for it.
+- **Per-change budget** — each per-change call independently respects `prompt_budget_chars`. One change touching a huge file gets its own truncation footer without affecting the other changes' reviews.
+- **Cross-change context preserved** — each per-change prompt includes a short preamble naming the OTHER changes in the same PR (slug + first paragraph of `## Why`, truncated to 200 chars each), so the reviewer sees that change A introduced a symbol change B consumes.
+- **Reviewer-initiated revisions still aggregate** — the union of revision requests across all per-change reviews shares the same `executor.max_revisions_per_pr` cap. Dropped requests are annotated inside their own `## Code Review: <change-slug>` section.
+
+```yaml
+reviewer:
+  mode: per_change                  # default `bundled`
+```
+
+The mode is hot-applicable via `autocoder reload`; flipping it between iterations causes the next PR to use the new mode.
 
 ## Reviewer-initiated revisions on `Block` verdicts
 

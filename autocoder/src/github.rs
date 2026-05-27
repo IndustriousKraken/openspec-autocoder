@@ -542,13 +542,54 @@ async fn create_issue_comment_at(
     Ok(())
 }
 
-/// Compose the PR body: the existing body, optionally followed by a
-/// `## Code Review` section containing the reviewer report's markdown.
+/// GitHub's hard cap on PR-body length. Bodies submitted above this size
+/// are rejected by the REST API. Used by `compose_body` to truncate the
+/// LAST per-change reviewer section under per-change mode (matching the
+/// shape of the existing `## Agent implementation notes` truncation).
+const GITHUB_PR_BODY_MAX_CHARS: usize = 65_535;
+
+/// Compose the PR body. In bundled mode (`per_change_sections` empty),
+/// the existing body gains a single `## Code Review` section. In per-
+/// change mode (`per_change_sections` non-empty), the body gains one
+/// `## Code Review: <slug>` section per element instead. If the
+/// combined per-change body exceeds GitHub's 65,535-char PR-body cap,
+/// the LAST section is truncated with a "see daemon log" pointer.
 fn compose_body(body: &str, review_report: Option<&ReviewReport>) -> String {
-    match review_report {
-        Some(r) => format!("{body}\n\n## Code Review\n\n{}", r.markdown),
-        None => body.to_string(),
+    let report = match review_report {
+        Some(r) => r,
+        None => return body.to_string(),
+    };
+    if report.per_change_sections.is_empty() {
+        return format!("{body}\n\n## Code Review\n\n{}", report.markdown);
     }
+    let sections = &report.per_change_sections;
+    let mut out = body.to_string();
+    for section in sections.iter() {
+        let candidate = format!(
+            "\n\n## Code Review: {}\n\n{}",
+            section.change_slug, section.markdown
+        );
+        if out.len() + candidate.len() > GITHUB_PR_BODY_MAX_CHARS {
+            // The combined body would overflow. Truncate the current
+            // section with the pointer footer and stop appending
+            // further sections — matches the shape of the existing
+            // `## Agent implementation notes` truncation.
+            let pointer =
+                "\n\n(truncated to fit GitHub's PR-body cap; see daemon log for full review)\n";
+            let header = format!("\n\n## Code Review: {}\n\n", section.change_slug);
+            let available = GITHUB_PR_BODY_MAX_CHARS
+                .saturating_sub(out.len())
+                .saturating_sub(header.len())
+                .saturating_sub(pointer.len());
+            let body_slice: String = section.markdown.chars().take(available).collect();
+            out.push_str(&header);
+            out.push_str(&body_slice);
+            out.push_str(pointer);
+            break;
+        }
+        out.push_str(&candidate);
+    }
+    out
 }
 
 async fn apply_label(
@@ -1206,6 +1247,7 @@ mod tests {
             verdict: ReviewVerdict::Pass,
             markdown: "VERDICT details".to_string(),
             concerns: Vec::new(),
+            per_change_sections: Vec::new(),
         };
         create_pull_request_at(
             &server.url(),
@@ -1993,5 +2035,104 @@ mod tests {
             .expect_err("401 must surface as Err");
         let msg = format!("{err:#}");
         assert!(msg.contains("401"));
+    }
+
+    use crate::code_reviewer::PerChangeSection;
+
+    /// Per-change mode renders multiple `## Code Review: <slug>`
+    /// sections in order, instead of one combined block.
+    #[test]
+    fn compose_body_per_change_emits_section_per_slug() {
+        let report = ReviewReport {
+            verdict: ReviewVerdict::Concerns,
+            markdown: String::new(),
+            concerns: Vec::new(),
+            per_change_sections: vec![
+                PerChangeSection {
+                    change_slug: "a07-foo".into(),
+                    markdown: "VERDICT: Pass\n\nlooks good".into(),
+                },
+                PerChangeSection {
+                    change_slug: "a08-bar".into(),
+                    markdown: "VERDICT: Concerns\n\nsome nit".into(),
+                },
+                PerChangeSection {
+                    change_slug: "a09-baz".into(),
+                    markdown: "VERDICT: Block\n\nbug here".into(),
+                },
+            ],
+        };
+        let composed = compose_body("base body", Some(&report));
+        // Sections appear in change order, all three present.
+        let foo_idx = composed.find("## Code Review: a07-foo").expect("foo header present");
+        let bar_idx = composed.find("## Code Review: a08-bar").expect("bar header present");
+        let baz_idx = composed.find("## Code Review: a09-baz").expect("baz header present");
+        assert!(foo_idx < bar_idx);
+        assert!(bar_idx < baz_idx);
+        // Section bodies inlined.
+        assert!(composed.contains("looks good"));
+        assert!(composed.contains("some nit"));
+        assert!(composed.contains("bug here"));
+        // The bundled-mode single header must NOT appear when sections are present.
+        let bundled_header = "\n\n## Code Review\n\n";
+        assert!(
+            !composed.contains(bundled_header),
+            "bundled-mode parent header must NOT appear in per-change body; got: {composed:?}"
+        );
+    }
+
+    /// Truncation safety: a 3-change pass whose combined body would
+    /// overflow GitHub's 65,535-char PR-body cap is truncated; the LAST
+    /// section is shortened with the "see daemon log" pointer footer.
+    #[test]
+    fn compose_body_per_change_truncates_at_github_cap() {
+        let big = "x".repeat(40_000);
+        let report = ReviewReport {
+            verdict: ReviewVerdict::Block,
+            markdown: String::new(),
+            concerns: Vec::new(),
+            per_change_sections: vec![
+                PerChangeSection {
+                    change_slug: "a".into(),
+                    markdown: big.clone(),
+                },
+                PerChangeSection {
+                    change_slug: "b".into(),
+                    markdown: big.clone(),
+                },
+                PerChangeSection {
+                    change_slug: "c".into(),
+                    markdown: big.clone(),
+                },
+            ],
+        };
+        let composed = compose_body("base", Some(&report));
+        // Body stays under GitHub's cap.
+        assert!(
+            composed.len() <= GITHUB_PR_BODY_MAX_CHARS,
+            "composed body must fit GitHub's cap; got {} chars",
+            composed.len()
+        );
+        // First two sections present; last section pointer-truncated.
+        assert!(composed.contains("## Code Review: a"));
+        assert!(composed.contains("## Code Review: b"));
+        assert!(composed.contains(
+            "truncated to fit GitHub's PR-body cap; see daemon log for full review"
+        ));
+    }
+
+    /// Bundled mode (empty `per_change_sections`) still emits the
+    /// single `## Code Review` block (no regression).
+    #[test]
+    fn compose_body_bundled_still_uses_single_section() {
+        let report = ReviewReport {
+            verdict: ReviewVerdict::Pass,
+            markdown: "VERDICT details".into(),
+            concerns: Vec::new(),
+            per_change_sections: Vec::new(),
+        };
+        let composed = compose_body("base body", Some(&report));
+        assert!(composed.contains("\n\n## Code Review\n\nVERDICT details"));
+        assert!(!composed.contains("## Code Review: "));
     }
 }
