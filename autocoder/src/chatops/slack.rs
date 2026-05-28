@@ -641,6 +641,12 @@ pub struct AppMentionEvent {
     pub channel: String,
     #[serde(default)]
     pub ts: String,
+    /// Slack populates this on reply events (messages posted inside an
+    /// existing thread). Absent on top-level mentions. Required by
+    /// thread-aware verbs (`send it`) to identify which thread the
+    /// operator is replying inside.
+    #[serde(default)]
+    pub thread_ts: Option<String>,
     /// Field name from Slack's event-type field on the nested event,
     /// not the top-level envelope. Populated by the deserializer.
     #[serde(default)]
@@ -1183,9 +1189,11 @@ async fn process_app_mention(ctx: &InboundListenerContext, event: &AppMentionEve
     );
     let reply = ctx
         .dispatcher
-        .handle_message(
+        .handle_message_with_context(
             &normalized_text,
             &event.channel,
+            event.thread_ts.as_deref(),
+            event.user.as_deref(),
             &bot_mention,
             &repos,
             &submitter,
@@ -1822,6 +1830,38 @@ mod tests {
                 assert_eq!(event.text, "<@UBOT> status myrepo");
                 assert_eq!(event.user.as_deref(), Some("U_HUMAN"));
                 assert_eq!(event.channel, "C_OPS");
+                // Top-level mention: no `thread_ts` field in Slack's
+                // payload, deserializes to `None`. Required for thread-aware
+                // verbs like `send it` to refuse correctly outside threads.
+                assert!(event.thread_ts.is_none());
+            }
+            other => panic!("expected EventsApi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_app_mention_envelope_captures_thread_ts() {
+        // Reply-in-thread case: Slack includes `thread_ts` in the event
+        // payload pointing at the parent message's `ts`. The listener
+        // must capture this so thread-aware verbs (`send it`) can
+        // resolve which thread the operator replied inside.
+        let raw = r#"{
+            "type": "events_api",
+            "envelope_id": "env-thread",
+            "payload": {
+                "event": {
+                    "type": "app_mention",
+                    "text": "<@UBOT> send it",
+                    "user": "U_RAB",
+                    "channel": "C_OPS",
+                    "ts": "1700000050.000200",
+                    "thread_ts": "9999.1234"
+                }
+            }
+        }"#;
+        match parse_socket_envelope(raw).unwrap() {
+            SocketMessage::EventsApi { event, .. } => {
+                assert_eq!(event.thread_ts.as_deref(), Some("9999.1234"));
             }
             other => panic!("expected EventsApi, got {other:?}"),
         }
@@ -1854,6 +1894,172 @@ mod tests {
         assert!(format!("{err:#}").contains("envelope_id"));
     }
 
+    // ---------- send-it thread-context propagation (a20a0) ----------
+
+    // Records every action submitted, lets us assert the dispatcher
+    // received the thread context the slack inbound listener wired in.
+    struct RecordingSubmitter {
+        log: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl RecordingSubmitter {
+        fn new() -> Self {
+            Self {
+                log: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> Vec<serde_json::Value> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::chatops::operator_commands::ActionSubmitter for RecordingSubmitter {
+        async fn submit(&self, action: serde_json::Value) -> serde_json::Value {
+            self.log.lock().unwrap().push(action.clone());
+            // Pretend the daemon accepts every action so the dispatcher's
+            // happy path runs to completion.
+            serde_json::json!({"ok": true, "poll_interval_sec": 60})
+        }
+    }
+
+    fn stamp_audit_thread_state(
+        state_root: &std::path::Path,
+        thread_ts: &str,
+    ) {
+        let state = crate::audits::threads::AuditThreadState {
+            thread_ts: thread_ts.to_string(),
+            channel: "C_OPS".to_string(),
+            repo_url: "git@github.com:acme/myrepo.git".to_string(),
+            audit_type: "architecture_brightline".to_string(),
+            findings_excerpt: "  • file foo.rs is 1234 lines".to_string(),
+            posted_at: chrono::Utc::now() - chrono::Duration::minutes(30),
+            status: crate::audits::threads::AuditThreadStatus::Open,
+            reason: None,
+        };
+        crate::audits::threads::write_state(state_root, &state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn slack_inbound_propagates_thread_ts_to_dispatcher_for_send_it() {
+        // The contract this test guards (a20a0):
+        // when Slack delivers an app_mention reply with `thread_ts` set,
+        // the inbound listener captures the field on AppMentionEvent and
+        // forwards it via handle_message_with_context. The dispatcher's
+        // send-it handler then resolves the audit thread and submits a
+        // trigger_audit_action with that thread_ts.
+        //
+        // Pre-fix code called handle_message(...) which dropped
+        // thread_ts → ParseOutcome::None → no trigger submitted → ? reaction.
+        // This test would have failed against the pre-fix listener.
+        let tmp = tempfile::TempDir::new().unwrap();
+        stamp_audit_thread_state(tmp.path(), "9999.1234");
+
+        let dispatcher = crate::chatops::operator_commands::OperatorCommandDispatcher::new()
+            .with_audit_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = RecordingSubmitter::new();
+        let bot_mention = "<@UBOT>";
+
+        // Construct the event exactly as the deserializer would for a
+        // threaded reply (parse_app_mention_envelope_captures_thread_ts
+        // covers the JSON → struct half).
+        let event = AppMentionEvent {
+            text: format!("{bot_mention} send it"),
+            user: Some("U_RAB".into()),
+            bot_id: None,
+            subtype: None,
+            channel: "C_OPS".into(),
+            ts: "1700000050.000200".into(),
+            thread_ts: Some("9999.1234".into()),
+            event_type: "app_mention".into(),
+        };
+
+        // Replicate the production dispatch call shape from
+        // process_app_mention (slack.rs ~line 1190). If that call site
+        // ever regresses back to the no-context entry point,
+        // handle_message itself is #[cfg(test)] so the regression
+        // surfaces at compile time, not here.
+        let reply = dispatcher
+            .handle_message_with_context(
+                &event.text,
+                &event.channel,
+                event.thread_ts.as_deref(),
+                event.user.as_deref(),
+                bot_mention,
+                &[],
+                &submitter,
+            )
+            .await
+            .expect("send-it inside a tracked thread must produce a reply");
+
+        let text = match reply {
+            crate::chatops::operator_commands::Reply::Sync(s) => s,
+            other => panic!("expected Sync reply, got {other:?}"),
+        };
+        assert!(text.starts_with("✓"), "expected accept reply, got: {text}");
+
+        let calls = submitter.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one action expected (trigger_audit_action)"
+        );
+        assert_eq!(calls[0]["action"], "trigger_audit_action");
+        assert_eq!(
+            calls[0]["thread_ts"], "9999.1234",
+            "thread_ts must flow from the AppMentionEvent into the control-socket submission"
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_inbound_send_it_outside_thread_still_refused() {
+        // The negative-side regression: when thread_ts is None
+        // (top-level mention), send it correctly returns ParseOutcome::None
+        // → the dispatcher returns None → the listener applies the
+        // `?` reaction. This preserves the canonical "send it outside
+        // an audit thread is refused" behaviour.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = crate::chatops::operator_commands::OperatorCommandDispatcher::new()
+            .with_audit_thread_state_dir(tmp.path().to_path_buf());
+        let submitter = RecordingSubmitter::new();
+        let bot_mention = "<@UBOT>";
+
+        let event = AppMentionEvent {
+            text: format!("{bot_mention} send it"),
+            user: Some("U_RAB".into()),
+            bot_id: None,
+            subtype: None,
+            channel: "C_OPS".into(),
+            ts: "1700000050.000200".into(),
+            thread_ts: None, // top-level mention; no thread context
+            event_type: "app_mention".into(),
+        };
+
+        let reply = dispatcher
+            .handle_message_with_context(
+                &event.text,
+                &event.channel,
+                event.thread_ts.as_deref(),
+                event.user.as_deref(),
+                bot_mention,
+                &[],
+                &submitter,
+            )
+            .await;
+
+        // Parser returns ParseOutcome::None for send it without thread_ts.
+        // Dispatcher returns None; production listener turns that into
+        // a `?` reaction (covered by the existing slack-listener tests).
+        assert!(
+            reply.is_none(),
+            "top-level `send it` must produce no dispatcher reply"
+        );
+        assert!(
+            submitter.calls().is_empty(),
+            "no action should be submitted when send it is refused"
+        );
+    }
+
     // ---------- filter logic ----------
 
     fn evt(text: &str, channel: &str, user: Option<&str>) -> AppMentionEvent {
@@ -1864,6 +2070,7 @@ mod tests {
             subtype: None,
             channel: channel.to_string(),
             ts: "1.0".into(),
+            thread_ts: None,
             event_type: "app_mention".into(),
         }
     }

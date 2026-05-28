@@ -1842,6 +1842,14 @@ impl OperatorCommandDispatcher {
     ///   - `None` — the message did not address the bot OR used an
     ///     unknown verb. The Slack inbound listener turns this into a
     ///     `?` reaction on the operator's original message.
+    ///
+    /// `#[cfg(test)]`-only since `a20a0`: the production path SHALL call
+    /// `handle_message_with_context` directly with the inbound envelope's
+    /// `thread_ts` AND `user`. Allowing production code to bypass thread
+    /// context regressed `send it` (and silently dropped operator-user
+    /// attribution from state files) for months; the compile-time gate
+    /// prevents that class of bug.
+    #[cfg(test)]
     pub async fn handle_message(
         &self,
         text: &str,
@@ -1862,11 +1870,12 @@ impl OperatorCommandDispatcher {
         .await
     }
 
-    /// Thread-aware entry point. The Slack inbound listener uses this
-    /// so the `send it` verb (which only parses inside a thread) sees
-    /// the inbound envelope's `thread_ts`. Pass `None` for channel-level
-    /// mentions; pass `Some(&str)` (non-empty) for replies in a thread.
-    #[allow(dead_code)] // used by tests; production path goes via handle_message_with_context
+    /// Thread-aware test convenience wrapper. The production Slack
+    /// inbound listener calls `handle_message_with_context` directly so
+    /// it can also propagate `operator_user`. This wrapper is
+    /// `#[cfg(test)]`-only since `a20a0` — tests that don't need the
+    /// `operator_user` field use this for brevity.
+    #[cfg(test)]
     pub async fn handle_message_in_thread(
         &self,
         text: &str,
