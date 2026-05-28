@@ -3,7 +3,7 @@
 //! one iteration are logged and the loop continues to the next sleep.
 
 use crate::alert_state::{AlertCategory, AlertEntry, AlertState};
-use crate::alerts::handle_predictable_failure;
+use crate::alerts::{handle_classified_recovery_failure, handle_predictable_failure};
 use crate::audits::AuditRegistry;
 use crate::audits::scheduler::run_due_audits;
 use crate::busy_marker;
@@ -15,6 +15,7 @@ use crate::code_reviewer::{
 use crate::config::{AuditSettings, AuditsConfig, GithubConfig, RepositoryConfig};
 use crate::control_socket::{ChatOpsHolder, ChatOpsSlot, GithubHolder, ReviewerHolder};
 use crate::executor::{Executor, ExecutorOutcome, ResumeHandle, UnimplementableTask};
+use crate::recovery_classification::{RecoveryFailureClass, classify_recovery_failure};
 use crate::spec_revision::{self, SpecNeedsRevisionDetail};
 use crate::{failure_state, git, github, perma_stuck, queue, workspace};
 use std::collections::HashMap;
@@ -1111,7 +1112,9 @@ pub async fn run_pass_through_commits(
         .as_deref()
         .map(|u| (u, repo.agent_branch.as_str()));
     if let Err(e) = workspace::ensure_initialized(workspace, &repo.url, fork_arg) {
-        handle_predictable_failure(
+        let class = classify_recovery_failure(&e);
+        log_classified_recovery_failure(&repo.url, "workspace_init", class, &e);
+        handle_classified_recovery_failure(
             workspace,
             &repo.url,
             chatops_ctx,
@@ -1120,6 +1123,7 @@ pub async fn run_pass_through_commits(
                 .unwrap_or(false),
             AlertCategory::WorkspaceInitFailure,
             &e,
+            class,
         )
         .await;
         return Err(e);
@@ -1155,7 +1159,9 @@ pub async fn run_pass_through_commits(
                         "workspace {} still dirty after recovery; refusing to proceed:\n{recheck_filtered}",
                         workspace.display()
                     );
-                    handle_predictable_failure(
+                    let class = classify_recovery_failure(&e);
+                    log_classified_recovery_failure(&repo.url, "dirty_recheck", class, &e);
+                    handle_classified_recovery_failure(
                         workspace,
                         &repo.url,
                         chatops_ctx,
@@ -1164,6 +1170,7 @@ pub async fn run_pass_through_commits(
                             .unwrap_or(false),
                         AlertCategory::WorkspaceDirtyMidIteration,
                         &e,
+                        class,
                     )
                     .await;
                     return Err(e);
@@ -1173,7 +1180,9 @@ pub async fn run_pass_through_commits(
                 let e = anyhow!(
                     "dirty-workspace recovery failed: {recovery_err:#}; original dirty state:\n{dirty_filtered}"
                 );
-                handle_predictable_failure(
+                let class = classify_recovery_failure(&e);
+                log_classified_recovery_failure(&repo.url, "dirty_cleanup", class, &e);
+                handle_classified_recovery_failure(
                     workspace,
                     &repo.url,
                     chatops_ctx,
@@ -1182,6 +1191,7 @@ pub async fn run_pass_through_commits(
                         .unwrap_or(false),
                     AlertCategory::WorkspaceDirtyMidIteration,
                     &e,
+                    class,
                 )
                 .await;
                 return Err(e);
@@ -1189,7 +1199,23 @@ pub async fn run_pass_through_commits(
         }
     }
 
-    git::fetch(workspace)?;
+    if let Err(e) = git::fetch(workspace) {
+        let class = classify_recovery_failure(&e);
+        log_classified_recovery_failure(&repo.url, "git_fetch", class, &e);
+        handle_classified_recovery_failure(
+            workspace,
+            &repo.url,
+            chatops_ctx,
+            chatops_ctx
+                .map(|c| c.failure_alerts_enabled)
+                .unwrap_or(false),
+            AlertCategory::WorkspaceInitFailure,
+            &e,
+            class,
+        )
+        .await;
+        return Err(e);
+    }
     git::checkout(workspace, &repo.base_branch)?;
     git::pull_ff_only(workspace, &repo.base_branch)?;
     git::recreate_branch(workspace, &repo.agent_branch)?;
@@ -2141,6 +2167,34 @@ fn truncate_reason(reason: &str) -> String {
         let mut out: String = reason.chars().take(PERMA_STUCK_REASON_EXCERPT_MAX).collect();
         out.push('…');
         out
+    }
+}
+
+/// Log a mid-iteration recovery failure with its classification (transient
+/// vs. permanent). Transient → WARN (network blips are noisy but
+/// self-recovering); Permanent → ERROR (operator must inspect). The
+/// `site` field names the call site (`workspace_init`, `git_fetch`,
+/// `dirty_cleanup`, `dirty_recheck`) so journalctl filters can scope to
+/// a specific stage.
+fn log_classified_recovery_failure(
+    repo_url: &str,
+    site: &'static str,
+    class: RecoveryFailureClass,
+    err: &anyhow::Error,
+) {
+    match class {
+        RecoveryFailureClass::Transient => tracing::warn!(
+            url = repo_url,
+            site,
+            class = class.log_tag(),
+            "mid-iteration recovery failed (will retry next iteration): {err:#}"
+        ),
+        RecoveryFailureClass::Permanent => tracing::error!(
+            url = repo_url,
+            site,
+            class = class.log_tag(),
+            "mid-iteration recovery failed (operator inspection required): {err:#}"
+        ),
     }
 }
 
@@ -8985,6 +9039,102 @@ mod tests {
                 .contains_key(&crate::alert_state::AlertCategory::WorkspaceDirtyMidIteration),
             "alert state must record the WorkspaceDirtyMidIteration timestamp"
         );
+    }
+
+    /// classify-recovery-failure-mid-iteration: when a recovery failure
+    /// classifies as `Permanent` (e.g. "remains dirty after recovery"),
+    /// the chatops alert text carries the operator-inspection suffix.
+    /// The 24h throttle is unchanged; only the message body differs from
+    /// the legacy (no-class) form. Exercises the composition path
+    /// directly so the test does not depend on reproducing the rarer
+    /// `recheck_filtered` non-empty branch of `run_pass_through_commits`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dirty_workspace_remains_dirty_after_recovery_alerts_with_permanent_suffix() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(
+                    "workspace dirty mid-iteration \\(permanent; skipped until daemon restart\\) \
+                     — operator inspection required\\. Latest:"
+                        .to_string(),
+                ),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let chatops_ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        };
+        let err = anyhow!(
+            "workspace {} still dirty after recovery; refusing to proceed:\n D foo.rs",
+            ws.display()
+        );
+        crate::alerts::handle_classified_recovery_failure(
+            &ws,
+            "git@github.com:owner/repo.git",
+            Some(&chatops_ctx),
+            true,
+            crate::alert_state::AlertCategory::WorkspaceDirtyMidIteration,
+            &err,
+            crate::recovery_classification::RecoveryFailureClass::Permanent,
+        )
+        .await;
+        mock.assert_async().await;
+    }
+
+    /// classify-recovery-failure-mid-iteration: a transient classification
+    /// (network blip, e.g. "Could not resolve host") produces an alert
+    /// with the `(transient; retrying)` suffix and otherwise behaves
+    /// identically to the pre-classification path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_init_transient_alert_carries_retrying_suffix() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::Regex(
+                "workspace init keeps failing \\(transient; retrying\\)\\. Latest:".to_string(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let chatops_ctx = ChatOpsContext {
+            chatops,
+            channel: "C_TEST".to_string(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        };
+        let err = anyhow!("clone failed: fatal: Could not resolve host: github.com");
+        let class = crate::recovery_classification::classify_recovery_failure(&err);
+        assert_eq!(
+            class,
+            crate::recovery_classification::RecoveryFailureClass::Transient,
+            "fixture should classify as transient"
+        );
+        crate::alerts::handle_classified_recovery_failure(
+            &ws,
+            "git@github.com:owner/repo.git",
+            Some(&chatops_ctx),
+            true,
+            crate::alert_state::AlertCategory::WorkspaceInitFailure,
+            &err,
+            class,
+        )
+        .await;
+        mock.assert_async().await;
     }
 
     /// recover-dirty-workspace-mid-iteration: without chatops the

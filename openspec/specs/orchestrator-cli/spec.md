@@ -4299,3 +4299,96 @@ This rule eliminates a defect class where readers and writers drift to different
 - **THEN** the path-literals CI test treats that file as part of the allowlist
 - **AND** the migration code can continue to reference the legacy path without triggering a CI failure
 
+### Requirement: Audit framework bounds audits per iteration to prevent storm patterns
+The audit framework's per-iteration scheduler SHALL run at most `audits.max_audits_per_iteration` eligible audits before returning control to the iteration loop. Subsequent eligible audits SHALL defer to the next iteration. The bound applies to BOTH cadence-driven AND on-demand queued runs — every run increments the counter regardless of trigger source. The default value is `1`, intentionally low to ensure pending changes (per `a12`) AND audit work share each iteration's wall-clock fairly. Operators wanting faster audit drainage during onboarding or after major refactors can raise the bound; values above the number of registered audits clamp at the registry count with a WARN.
+
+Audits are tried in the registry's declaration order. On-demand queued audits drain FIRST within the loop (preserving the existing "queued bypasses cadence" semantics), then cadence-driven audits in order. Either source contributes to the per-iteration count.
+
+#### Scenario: Default bound runs one audit per iteration
+- **WHEN** `audits.max_audits_per_iteration` is unset (default `1`) AND 3 audits are eligible at the start of an iteration
+- **THEN** the scheduler runs the first eligible audit in declaration order
+- **AND** the scheduler returns control to the iteration loop after that audit completes
+- **AND** the other 2 eligible audits do NOT run this iteration
+- **AND** the unrun audits' `.audit-state.json` entries are unchanged — they remain eligible for the next iteration
+
+#### Scenario: Raised bound runs multiple audits per iteration
+- **WHEN** `audits.max_audits_per_iteration: 3` AND 5 audits are eligible
+- **THEN** the scheduler runs the first 3 eligible audits in declaration order
+- **AND** the other 2 defer to the next iteration
+
+#### Scenario: Bound 0 skips all audits
+- **WHEN** `audits.max_audits_per_iteration: 0`
+- **THEN** the scheduler runs zero audits regardless of how many are eligible
+- **AND** the iteration proceeds to push+PR (or no-op if no other commits exist)
+- **AND** this behavior is useful for diagnostics OR for temporarily silencing the audit framework
+
+#### Scenario: On-demand queued audits count against the bound
+- **WHEN** `audits.max_audits_per_iteration: 1` AND the on-demand queue contains 2 audits AND 1 cadence-driven audit is eligible
+- **THEN** the scheduler runs the FIRST queued audit (queued drain has priority)
+- **AND** the counter increments to 1, hitting the bound
+- **AND** the second queued audit AND the cadence-eligible audit do NOT run this iteration
+- **AND** both unrun audits' state is preserved (queue retains the deferred entry; cadence audit's `.audit-state.json` is unchanged)
+
+#### Scenario: Out-of-bounds bound is clamped at the registry count
+- **WHEN** `audits.max_audits_per_iteration: 50` AND the registry contains 5 audits
+- **THEN** the resolved value is 5
+- **AND** a WARN log at startup names both the requested AND clamped values
+
+#### Scenario: Bound interacts cleanly with change-precedence ordering
+- **WHEN** an iteration begins AND 2 pending changes are in the queue AND 5 audits are eligible AND bound is default `1`
+- **THEN** per `a12`'s change-precedence rule, the 2 pending changes process first
+- **AND** the audit phase runs at most 1 audit
+- **AND** the iteration's push+PR step ships commits from both phases
+- **AND** the next iteration processes any remaining pending changes (likely none, but if any) AND runs 1 more audit, and so on
+
+### Requirement: Mid-iteration recovery failures classify transient vs. permanent; transient retries on next iteration
+When a mid-iteration recovery operation (workspace re-clone, dirty cleanup, git fetch retry) returns `Err`, the daemon SHALL classify the failure into one of two categories via a `classify_recovery_failure(err) -> RecoveryFailureClass` helper:
+
+- **Transient**: network errors (DNS resolution failures, connection refused / reset / timed out, TLS handshake failures), GitHub HTTP 5xx (502, 503, 504, 522, 524), HTTP 401 / 403 (auth blip — recoverable on token rotation without daemon restart), HTTP 429 (rate limit), git exit code 128 with stderr matching common network strings ("Could not resolve host", "Connection timed out", "the remote end hung up"), I/O error kinds (`WouldBlock`, `TimedOut`, `ConnectionReset`, `ConnectionAborted`, `BrokenPipe`).
+- **Permanent**: configuration errors (missing required field, malformed YAML, no matching token route), missing prerequisites (binaries not on PATH: `openspec`, `git`, `claude`), "remains dirty after recovery" (the existing scenario from `Dirty workspace auto-recovers at startup`).
+
+The default classification for an unrecognized error SHALL be `Transient` — the conservative choice is to retry, since operators have `clear-perma-stuck` AND manual-skip escape hatches for genuinely-permanent failures that mis-classify.
+
+**Transient** failures: log WARN with `class=transient`, fire the existing 24h-throttled `WorkspaceInitFailure` chatops alert with a ` (transient; retrying)` suffix, return from the iteration. The NEXT polling iteration retries automatically — no special backoff state is needed.
+
+**Permanent** failures: log ERROR with `class=permanent`, mark the repo as skipped-for-lifetime (existing helper), fire the alert with a ` (permanent; skipped until daemon restart) — operator inspection required` suffix.
+
+This requirement applies to MID-ITERATION recovery only. Startup-time recovery (the existing `Dirty workspace auto-recovers at startup` requirement) continues its conservative skip-for-lifetime behavior. A future spec MAY extend classification to startup; not in scope here.
+
+#### Scenario: Transient network failure retries automatically
+- **WHEN** a mid-iteration recovery operation returns an error whose source chain contains "Could not resolve host github.com"
+- **THEN** `classify_recovery_failure` returns `Transient`
+- **AND** the iteration logs WARN with `class=transient`
+- **AND** a chatops alert (subject to the 24h throttle) fires with the ` (transient; retrying)` suffix
+- **AND** the repo is NOT marked skipped-for-lifetime
+- **AND** the next polling iteration attempts the recovery again
+- **AND** if that iteration succeeds, the repo proceeds normally
+
+#### Scenario: HTTP 503 from GitHub is transient
+- **WHEN** a mid-iteration `POST /repos/.../pulls` call returns HTTP 503
+- **THEN** the classification is `Transient` (per the 5xx pattern match)
+- **AND** the iteration retries on the next polling tick
+
+#### Scenario: 401 auth blip retries (operator may rotate token without restart)
+- **WHEN** a GitHub API call returns HTTP 401
+- **THEN** the classification is `Transient`
+- **AND** the operator can rotate the env-var-backed token (and the daemon's hot-reload picks it up via `autocoder reload`) without restarting
+
+#### Scenario: Permanent failure skips-for-lifetime as before
+- **WHEN** the dirty-workspace recovery commands all complete BUT `git status --porcelain` is still non-empty
+- **THEN** `classify_recovery_failure` returns `Permanent`
+- **AND** the iteration logs ERROR with `class=permanent`
+- **AND** a chatops alert fires with the ` (permanent; skipped until daemon restart) — operator inspection required` suffix
+- **AND** the repo is skipped for the daemon's process lifetime (existing behavior preserved)
+
+#### Scenario: Default-to-transient handles unknown errors conservatively
+- **WHEN** a recovery operation returns an error whose source chain matches none of the documented transient OR permanent patterns
+- **THEN** `classify_recovery_failure` returns `Transient`
+- **AND** the iteration logs WARN with `class=transient (unclassified)` so the unfamiliar pattern is visible in journalctl
+- **AND** the next iteration retries — the choice to retry on unknown failures favors operator-friendly resilience over fast-fail-on-uncertainty
+
+#### Scenario: Startup recovery is unchanged
+- **WHEN** a workspace is dirty at daemon startup AND recovery fails
+- **THEN** the existing `Dirty workspace auto-recovers at startup` requirement's behavior applies (skip-for-lifetime regardless of classification)
+- **AND** this requirement applies only to mid-iteration recovery
+

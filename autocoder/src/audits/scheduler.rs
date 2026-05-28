@@ -33,8 +33,8 @@ use super::{
 use crate::alert_state::AlertCategory;
 use crate::alerts::handle_predictable_failure;
 use crate::config::{
-    AuditSettings, AuditsConfig, RepositoryConfig, default_max_validation_retries,
-    resolved_cadence,
+    AuditSettings, AuditsConfig, RepositoryConfig, default_max_audits_per_iteration,
+    default_max_validation_retries, resolved_cadence,
 };
 use crate::polling_loop::ChatOpsContext;
 use crate::{git, workspace};
@@ -68,15 +68,39 @@ pub async fn run_due_audits(
     }
     let mut state = AuditState::load_or_default(workspace);
 
-    // 1. Run queued audits first (unconditional — bypass cadence).
+    // Per-iteration bound. Both queued AND cadence-driven runs count
+    // against the same counter so a flood of on-demand audits doesn't
+    // bypass the storm-prevention guard. `0` disables audits behaviourally
+    // (every iteration skips the audit phase). When the operator did
+    // not configure the field (or did not configure an `audits:` block at
+    // all), the default lives in `default_max_audits_per_iteration()`.
+    let bound = audits_cfg
+        .map(|c| c.max_audits_per_iteration)
+        .unwrap_or_else(default_max_audits_per_iteration);
+    let mut audits_run_this_iteration: usize = 0;
+
+    if bound == 0 {
+        // Operator explicitly disabled all audit runs this iteration —
+        // skip both the queued drain AND the cadence sweep. Queued
+        // entries remain in the queue for a later iteration (drained
+        // is owned by the caller).
+        return Ok(());
+    }
+
+    // 1. Run queued audits first (unconditional — bypass cadence). Each
+    //    run increments the counter; once the bound is reached the
+    //    remaining queued entries defer to the next iteration.
     let mut ran_via_queue: HashSet<String> = HashSet::new();
     if !queued_audit_types.is_empty() {
         for audit in registry.iter() {
+            if audits_run_this_iteration >= bound {
+                break;
+            }
             let name = audit.audit_type();
             if !queued_audit_types.contains(name) {
                 continue;
             }
-            if let Err(e) = run_one_audit_unconditional(
+            match run_one_audit_unconditional(
                 audit.as_ref(),
                 workspace,
                 repo,
@@ -87,18 +111,33 @@ pub async fn run_due_audits(
             )
             .await
             {
-                tracing::error!(
-                    url = %repo.url,
-                    audit_type = name,
-                    "queued audit `{name}` failed (iteration continues): {e:#}"
-                );
+                Ok(ran) => {
+                    if ran {
+                        audits_run_this_iteration += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        url = %repo.url,
+                        audit_type = name,
+                        "queued audit `{name}` failed (iteration continues): {e:#}"
+                    );
+                    // A failure inside `run()` still consumed an
+                    // attempt; count it against the bound so a flaky
+                    // audit can't monopolise the iteration.
+                    audits_run_this_iteration += 1;
+                }
             }
             ran_via_queue.insert(name.to_string());
         }
         // Log any queued names that didn't match a registered audit so
-        // an operator typo doesn't disappear silently.
+        // an operator typo doesn't disappear silently. Names that DID
+        // match but were deferred because the bound was reached are NOT
+        // logged here — they remain in the queue for next iteration.
         for q in queued_audit_types {
-            if !ran_via_queue.contains(q) {
+            if !ran_via_queue.contains(q)
+                && !registry.iter().any(|a| a.audit_type() == q)
+            {
                 tracing::warn!(
                     url = %repo.url,
                     "queued audit `{q}` is not a registered audit type; skipping"
@@ -107,12 +146,16 @@ pub async fn run_due_audits(
         }
     }
 
-    // 2. Cadence-driven sweep. Skip anything already run via the queue.
+    // 2. Cadence-driven sweep. Skip anything already run via the queue
+    //    AND stop once the bound is reached.
     for audit in registry.iter() {
+        if audits_run_this_iteration >= bound {
+            break;
+        }
         if ran_via_queue.contains(audit.audit_type()) {
             continue;
         }
-        if let Err(e) = run_one_audit(
+        match run_one_audit(
             audit.as_ref(),
             workspace,
             repo,
@@ -123,22 +166,34 @@ pub async fn run_due_audits(
         )
         .await
         {
-            // Per spec: log and continue. State is not updated for this
-            // audit (the inner helper only writes state on success).
-            tracing::error!(
-                url = %repo.url,
-                audit_type = audit.audit_type(),
-                "audit `{}` failed (this iteration's other audits continue): {e:#}",
-                audit.audit_type()
-            );
+            Ok(ran) => {
+                if ran {
+                    audits_run_this_iteration += 1;
+                }
+            }
+            Err(e) => {
+                // Per spec: log and continue. State is not updated for
+                // this audit (the inner helper only writes state on
+                // success). The audit DID consume an attempt though,
+                // so it counts against the bound.
+                tracing::error!(
+                    url = %repo.url,
+                    audit_type = audit.audit_type(),
+                    "audit `{}` failed (this iteration's other audits continue): {e:#}",
+                    audit.audit_type()
+                );
+                audits_run_this_iteration += 1;
+            }
         }
     }
     Ok(())
 }
 
-/// Wrapper for the cadence-driven path: returns `Ok(())` for both
-/// skipped audits AND completed-successfully audits, propagates errors
-/// from the audit's `run()` for the caller to log-and-continue.
+/// Wrapper for the cadence-driven path: returns `Ok(true)` if the audit
+/// consumed a per-iteration slot (i.e. its `run()` was invoked), `Ok(false)`
+/// if it was skipped before invocation (cadence not elapsed, HEAD
+/// unchanged, etc.), and propagates errors from the audit's `run()` for
+/// the caller to log-and-continue.
 async fn run_one_audit(
     audit: &dyn Audit,
     workspace: &Path,
@@ -147,7 +202,7 @@ async fn run_one_audit(
     audit_settings: &HashMap<String, AuditSettings>,
     chatops_ctx: Option<&ChatOpsContext>,
     state: &mut AuditState,
-) -> Result<()> {
+) -> Result<bool> {
     drive_one_audit(
         audit,
         workspace,
@@ -166,7 +221,9 @@ async fn run_one_audit(
 /// audit unconditionally. State is still updated on success so the
 /// audit's cadence clock moves forward as if it were a cadence-driven
 /// run (per the proposal's cadence-interaction rule: an on-demand run
-/// shifts the next scheduled fire forward).
+/// shifts the next scheduled fire forward). Returns `Ok(true)` on
+/// successful invocation; `Ok(false)` is unreachable on this path
+/// because the cadence/HEAD gates are bypassed.
 async fn run_one_audit_unconditional(
     audit: &dyn Audit,
     workspace: &Path,
@@ -175,7 +232,7 @@ async fn run_one_audit_unconditional(
     audit_settings: &HashMap<String, AuditSettings>,
     chatops_ctx: Option<&ChatOpsContext>,
     state: &mut AuditState,
-) -> Result<()> {
+) -> Result<bool> {
     drive_one_audit(
         audit,
         workspace,
@@ -189,10 +246,13 @@ async fn run_one_audit_unconditional(
     .await
 }
 
-/// Inner per-audit driver. Returns `Ok(())` for skipped audits and
-/// completed-successfully-or-violation-handled audits; returns `Err`
+/// Inner per-audit driver. Returns `Ok(true)` once the audit's `run()`
+/// has been invoked (regardless of outcome — completed-successfully,
+/// violation-handled, validation-exhausted, etc.); returns `Ok(false)`
+/// when the audit was skipped before invocation (cadence not elapsed,
+/// HEAD unchanged when `requires_head_change` is set). Returns `Err`
 /// only when the audit's `run()` itself errored (the caller logs and
-/// moves on).
+/// moves on); the call still consumed an attempt.
 ///
 /// `bypass_cadence` skips the cadence + `requires_head_change` gate at
 /// the top of the function (used by the on-demand audit-trigger path).
@@ -206,7 +266,7 @@ async fn drive_one_audit(
     chatops_ctx: Option<&ChatOpsContext>,
     state: &mut AuditState,
     bypass_cadence: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let audit_type = audit.audit_type();
     let cadence = resolved_cadence(repo, audits_cfg, audit_type);
     // When bypassing cadence, accept a Disabled config (queued runs are
@@ -215,7 +275,7 @@ async fn drive_one_audit(
     // on-demand" note). When NOT bypassing, Disabled → skip.
     if !bypass_cadence && cadence.interval().is_none() {
         tracing::debug!(audit_type, "audit cadence is Disabled; skipping");
-        return Ok(());
+        return Ok(false);
     }
 
     let now = Utc::now();
@@ -233,7 +293,7 @@ async fn drive_one_audit(
                 prior.last_run_at,
                 next_due
             );
-            return Ok(());
+            return Ok(false);
         }
         if audit.requires_head_change()
             && let (Some(prior_sha), Some(current_sha)) =
@@ -245,7 +305,7 @@ async fn drive_one_audit(
                 sha = %current_sha,
                 "audit requires HEAD change but HEAD unchanged since last run; skipping"
             );
-            return Ok(());
+            return Ok(false);
         }
     }
 
@@ -324,7 +384,12 @@ async fn drive_one_audit(
                 wp = workspace_path.display(),
             ),
         )?;
-        return Ok(());
+        // `WorkspaceUnavailable` is an "audit declined to run" skip — the
+        // audit did NO file IO, NO LLM call, and NO state mutation. Treat
+        // it like a cadence skip for accounting purposes so a fleet-wide
+        // workspace problem doesn't burn the per-iteration bound on every
+        // registered audit returning the same skip.
+        return Ok(false);
     }
 
     // Post-hoc write-policy enforcement. Use `-uall` so untracked
@@ -413,8 +478,10 @@ async fn drive_one_audit(
             &alert_err,
         )
         .await;
-        // State NOT updated → cadence re-triggers next iteration.
-        return Ok(());
+        // State NOT updated → cadence re-triggers next iteration. The
+        // audit DID consume an attempt though (it ran far enough to
+        // violate the write policy), so it counts toward the bound.
+        return Ok(true);
     }
 
     // Outcome dispatch.
@@ -577,7 +644,7 @@ async fn drive_one_audit(
             );
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 struct PolicyViolation {
@@ -1145,9 +1212,14 @@ mod tests {
         let mut defaults = HashMap::new();
         defaults.insert("af1".to_string(), Cadence::Daily);
         defaults.insert("af2".to_string(), Cadence::Daily);
+        // Raise the per-iteration bound above the test's audit count so
+        // this test isolates the "failure doesn't abort the loop" property
+        // from the storm-prevention bound (see `bound_default_one_*`
+        // tests for the default-bound behaviour).
         let cfg = AuditsConfig {
             defaults,
             settings: HashMap::new(),
+            max_audits_per_iteration: 5,
             ..AuditsConfig::default()
         };
         let repo = fixture_repo();
@@ -2091,13 +2163,16 @@ mod tests {
         let cadence_counter = cadence_audit.invocations.clone();
         let registry =
             AuditRegistry::with_audits(vec![queued_audit.clone(), cadence_audit.clone()]);
-        // Both have daily cadence.
+        // Both have daily cadence. Raise the per-iteration bound above
+        // the test's audit count so this test isolates the queue+cadence
+        // coexistence property from the storm-prevention bound.
         let mut defaults = HashMap::new();
         defaults.insert("q6-queued".to_string(), Cadence::Daily);
         defaults.insert("q6-cadence".to_string(), Cadence::Daily);
         let cfg = AuditsConfig {
             defaults,
             settings: HashMap::new(),
+            max_audits_per_iteration: 5,
             ..AuditsConfig::default()
         };
         // q6-queued has a recent last_run (not due via cadence), but the
@@ -2179,4 +2254,291 @@ mod tests {
         );
     }
 
+    // ---------------- max_audits_per_iteration bound ----------------
+
+    /// Build an `AuditsConfig` that sets every audit in `slugs` to daily
+    /// cadence AND sets `max_audits_per_iteration` to `bound`.
+    fn audits_cfg_bounded(slugs: &[&str], bound: usize) -> AuditsConfig {
+        let mut defaults = HashMap::new();
+        for s in slugs {
+            defaults.insert((*s).to_string(), Cadence::Daily);
+        }
+        AuditsConfig {
+            defaults,
+            settings: HashMap::new(),
+            max_audits_per_iteration: bound,
+            ..AuditsConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_default_one_runs_first_eligible_and_defers_rest() {
+        let (_t, ws) = init_workspace();
+        let a = Arc::new(CountingAudit::new("b1-a").with_rhc(false));
+        let b = Arc::new(CountingAudit::new("b1-b").with_rhc(false));
+        let c = Arc::new(CountingAudit::new("b1-c").with_rhc(false));
+        let ca = a.invocations.clone();
+        let cb = b.invocations.clone();
+        let cc = c.invocations.clone();
+        let registry =
+            AuditRegistry::with_audits(vec![a.clone(), b.clone(), c.clone()]);
+        // Default bound = 1.
+        let cfg = audits_cfg_bounded(&["b1-a", "b1-b", "b1-c"], 1);
+        let repo = fixture_repo();
+        run_due_audits(
+            &registry,
+            &ws,
+            &repo,
+            Some(&cfg),
+            &HashMap::new(),
+            None,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        // First in declaration order runs; the other two defer.
+        assert_eq!(*ca.lock().unwrap(), 1, "first audit must run");
+        assert_eq!(*cb.lock().unwrap(), 0, "second audit must defer");
+        assert_eq!(*cc.lock().unwrap(), 0, "third audit must defer");
+        // State for the unrun audits is untouched, so the next iteration
+        // can re-evaluate them.
+        let state = AuditState::load_or_default(&ws);
+        assert!(state.runs.contains_key("b1-a"));
+        assert!(!state.runs.contains_key("b1-b"));
+        assert!(!state.runs.contains_key("b1-c"));
+    }
+
+    #[tokio::test]
+    async fn bound_two_runs_first_two_and_defers_third() {
+        let (_t, ws) = init_workspace();
+        let a = Arc::new(CountingAudit::new("b2-a").with_rhc(false));
+        let b = Arc::new(CountingAudit::new("b2-b").with_rhc(false));
+        let c = Arc::new(CountingAudit::new("b2-c").with_rhc(false));
+        let ca = a.invocations.clone();
+        let cb = b.invocations.clone();
+        let cc = c.invocations.clone();
+        let registry =
+            AuditRegistry::with_audits(vec![a.clone(), b.clone(), c.clone()]);
+        let cfg = audits_cfg_bounded(&["b2-a", "b2-b", "b2-c"], 2);
+        let repo = fixture_repo();
+        run_due_audits(
+            &registry,
+            &ws,
+            &repo,
+            Some(&cfg),
+            &HashMap::new(),
+            None,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*ca.lock().unwrap(), 1);
+        assert_eq!(*cb.lock().unwrap(), 1);
+        assert_eq!(*cc.lock().unwrap(), 0, "third audit must defer");
+    }
+
+    #[tokio::test]
+    async fn bound_above_eligibles_runs_them_all() {
+        let (_t, ws) = init_workspace();
+        let a = Arc::new(CountingAudit::new("b5-a").with_rhc(false));
+        let b = Arc::new(CountingAudit::new("b5-b").with_rhc(false));
+        let c = Arc::new(CountingAudit::new("b5-c").with_rhc(false));
+        let ca = a.invocations.clone();
+        let cb = b.invocations.clone();
+        let cc = c.invocations.clone();
+        let registry =
+            AuditRegistry::with_audits(vec![a.clone(), b.clone(), c.clone()]);
+        let cfg = audits_cfg_bounded(&["b5-a", "b5-b", "b5-c"], 5);
+        let repo = fixture_repo();
+        run_due_audits(
+            &registry,
+            &ws,
+            &repo,
+            Some(&cfg),
+            &HashMap::new(),
+            None,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*ca.lock().unwrap(), 1);
+        assert_eq!(*cb.lock().unwrap(), 1);
+        assert_eq!(*cc.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn bound_zero_skips_all_audits_even_when_eligible() {
+        let (_t, ws) = init_workspace();
+        let a = Arc::new(CountingAudit::new("b0-a").with_rhc(false));
+        let b = Arc::new(CountingAudit::new("b0-b").with_rhc(false));
+        let ca = a.invocations.clone();
+        let cb = b.invocations.clone();
+        let registry = AuditRegistry::with_audits(vec![a.clone(), b.clone()]);
+        let cfg = audits_cfg_bounded(&["b0-a", "b0-b"], 0);
+        let repo = fixture_repo();
+        run_due_audits(
+            &registry,
+            &ws,
+            &repo,
+            Some(&cfg),
+            &HashMap::new(),
+            None,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*ca.lock().unwrap(), 0, "bound=0 must skip everything");
+        assert_eq!(*cb.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn bound_zero_skips_on_demand_queue_too() {
+        let (_t, ws) = init_workspace();
+        let a = Arc::new(CountingAudit::new("bz-a").with_rhc(false));
+        let ca = a.invocations.clone();
+        let registry = AuditRegistry::with_audits(vec![a.clone()]);
+        let cfg = audits_cfg_bounded(&["bz-a"], 0);
+        let repo = fixture_repo();
+        let mut queued = HashSet::new();
+        queued.insert("bz-a".to_string());
+        run_due_audits(
+            &registry,
+            &ws,
+            &repo,
+            Some(&cfg),
+            &HashMap::new(),
+            None,
+            &queued,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *ca.lock().unwrap(),
+            0,
+            "bound=0 must also defer on-demand queued audits"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_demand_queued_runs_count_against_the_bound() {
+        // Two queued + 1 cadence-eligible, bound=2 → both queued run
+        // first (declaration order), the cadence-eligible defers.
+        let (_t, ws) = init_workspace();
+        let q1 = Arc::new(CountingAudit::new("bq-q1").with_rhc(false));
+        let q2 = Arc::new(CountingAudit::new("bq-q2").with_rhc(false));
+        let ca = Arc::new(CountingAudit::new("bq-c").with_rhc(false));
+        let cq1 = q1.invocations.clone();
+        let cq2 = q2.invocations.clone();
+        let cca = ca.invocations.clone();
+        let registry = AuditRegistry::with_audits(vec![
+            q1.clone(),
+            q2.clone(),
+            ca.clone(),
+        ]);
+        let cfg = audits_cfg_bounded(&["bq-q1", "bq-q2", "bq-c"], 2);
+        let repo = fixture_repo();
+        let mut queued = HashSet::new();
+        queued.insert("bq-q1".to_string());
+        queued.insert("bq-q2".to_string());
+        run_due_audits(
+            &registry,
+            &ws,
+            &repo,
+            Some(&cfg),
+            &HashMap::new(),
+            None,
+            &queued,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*cq1.lock().unwrap(), 1, "queued q1 runs (drained first)");
+        assert_eq!(*cq2.lock().unwrap(), 1, "queued q2 runs (drained first)");
+        assert_eq!(
+            *cca.lock().unwrap(),
+            0,
+            "cadence-eligible audit defers because the bound was consumed by the queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_demand_queue_three_with_bound_one_runs_first_only() {
+        // Three queued audits + bound=1 → first runs; the other two
+        // remain queued for next iteration (queue ownership is the
+        // caller's; the scheduler just refuses to drain past the bound).
+        let (_t, ws) = init_workspace();
+        let q1 = Arc::new(CountingAudit::new("bq1-a").with_rhc(false));
+        let q2 = Arc::new(CountingAudit::new("bq1-b").with_rhc(false));
+        let q3 = Arc::new(CountingAudit::new("bq1-c").with_rhc(false));
+        let cq1 = q1.invocations.clone();
+        let cq2 = q2.invocations.clone();
+        let cq3 = q3.invocations.clone();
+        let registry = AuditRegistry::with_audits(vec![
+            q1.clone(),
+            q2.clone(),
+            q3.clone(),
+        ]);
+        let cfg = audits_cfg_bounded(&["bq1-a", "bq1-b", "bq1-c"], 1);
+        let repo = fixture_repo();
+        let mut queued = HashSet::new();
+        queued.insert("bq1-a".to_string());
+        queued.insert("bq1-b".to_string());
+        queued.insert("bq1-c".to_string());
+        run_due_audits(
+            &registry,
+            &ws,
+            &repo,
+            Some(&cfg),
+            &HashMap::new(),
+            None,
+            &queued,
+        )
+        .await
+        .unwrap();
+        // Only the first in declaration order runs this iteration.
+        assert_eq!(*cq1.lock().unwrap(), 1);
+        assert_eq!(*cq2.lock().unwrap(), 0);
+        assert_eq!(*cq3.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn cadence_skipped_audits_do_not_consume_a_slot() {
+        // a is not cadence-due (recent last_run), b IS due. With bound=1
+        // the scheduler must skip `a` (no slot consumed) and run `b`.
+        let (_t, ws) = init_workspace();
+        let a = Arc::new(CountingAudit::new("bs-a").with_rhc(false));
+        let b = Arc::new(CountingAudit::new("bs-b").with_rhc(false));
+        let ca = a.invocations.clone();
+        let cb = b.invocations.clone();
+        let registry = AuditRegistry::with_audits(vec![a.clone(), b.clone()]);
+        let cfg = audits_cfg_bounded(&["bs-a", "bs-b"], 1);
+        // Seed state so `a` has a recent run; `b` is unseeded (due).
+        let mut state = AuditState::default();
+        state.record(
+            "bs-a",
+            AuditRunEntry {
+                last_run_at: Utc::now() - chrono::Duration::hours(1),
+                last_run_sha: Some("recent".into()),
+                last_outcome: AuditOutcomeKind::NoFindings,
+            },
+        );
+        state.save(&ws).unwrap();
+        let repo = fixture_repo();
+        run_due_audits(
+            &registry,
+            &ws,
+            &repo,
+            Some(&cfg),
+            &HashMap::new(),
+            None,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*ca.lock().unwrap(), 0, "not-due audit must be skipped");
+        assert_eq!(
+            *cb.lock().unwrap(),
+            1,
+            "skipped audit did not consume the bound's slot, so b runs"
+        );
+    }
 }

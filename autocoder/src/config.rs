@@ -921,6 +921,18 @@ pub struct AuditsConfig {
     /// with a WARN.
     #[serde(default = "default_max_validation_retries")]
     pub max_validation_retries: u32,
+    /// Per-iteration cap on how many audits run before the scheduler
+    /// returns control to the iteration loop. Default `1` keeps audit
+    /// work as low-priority background — even when many audits become
+    /// eligible at once (e.g. after a HEAD change unblocks every
+    /// `requires_head_change` audit), only one runs per iteration so
+    /// pending changes still get attention each cycle. On-demand queued
+    /// runs also count against the bound. Values above the number of
+    /// registered audits clamp at the registry count with a WARN. Value
+    /// `0` is permitted and disables audits behaviourally (every
+    /// iteration skips the audit phase).
+    #[serde(default = "default_max_audits_per_iteration")]
+    pub max_audits_per_iteration: usize,
 }
 
 impl Default for AuditsConfig {
@@ -929,6 +941,7 @@ impl Default for AuditsConfig {
             defaults: HashMap::new(),
             settings: HashMap::new(),
             max_validation_retries: default_max_validation_retries(),
+            max_audits_per_iteration: default_max_audits_per_iteration(),
         }
     }
 }
@@ -960,6 +973,38 @@ pub fn clamp_max_validation_retries(requested: u32) -> (u32, Option<String>) {
         );
         tracing::warn!("{msg}");
         (MAX_VALIDATION_RETRIES_CEILING, Some(msg))
+    } else {
+        (requested, None)
+    }
+}
+
+/// Default per-iteration cap when the operator does not configure
+/// `audits.max_audits_per_iteration`. `1` matches the
+/// audit-as-low-priority-background-task design intent — even when many
+/// audits are eligible simultaneously, only one runs per iteration so
+/// pending-change processing continues to share each iteration's
+/// wall-clock.
+pub fn default_max_audits_per_iteration() -> usize {
+    1
+}
+
+/// If `audits.max_audits_per_iteration` exceeds `registry_count`, return
+/// the clamped value AND the WARN message that should be emitted at
+/// startup. Operators who request more than the number of registered
+/// audits get clamped to `registry_count` — running more audits than
+/// exist is impossible. Value `0` is permitted (every iteration skips
+/// the audit phase) and never warns.
+pub fn clamp_max_audits_per_iteration(
+    requested: usize,
+    registry_count: usize,
+) -> (usize, Option<String>) {
+    if requested > registry_count {
+        let msg = format!(
+            "audits.max_audits_per_iteration: requested {requested} exceeds the number of \
+             registered audits ({registry_count}); clamping to {registry_count}"
+        );
+        tracing::warn!("{msg}");
+        (registry_count, Some(msg))
     } else {
         (requested, None)
     }
@@ -1939,6 +1984,7 @@ github:
             "notify_on_clean",
             "extra",
             "max_validation_retries",
+            "max_audits_per_iteration",
         ];
 
         let path = example_yaml_path();
@@ -4038,6 +4084,95 @@ audits:
             msg.contains(&MAX_VALIDATION_RETRIES_CEILING.to_string()),
             "warn names clamped value: {msg}"
         );
+    }
+
+    #[test]
+    fn max_audits_per_iteration_defaults_to_one_when_field_absent() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    architecture_brightline: weekly
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let audits = cfg.audits.expect("audits block present");
+        assert_eq!(audits.max_audits_per_iteration, 1);
+    }
+
+    #[test]
+    fn max_audits_per_iteration_explicit_value_passes_through() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    architecture_brightline: weekly
+  max_audits_per_iteration: 3
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let audits = cfg.audits.expect("audits block present");
+        assert_eq!(audits.max_audits_per_iteration, 3);
+        // No clamp needed when within registry bound.
+        let (clamped, warn) = clamp_max_audits_per_iteration(3, 5);
+        assert_eq!(clamped, 3);
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn max_audits_per_iteration_zero_is_permitted() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    architecture_brightline: weekly
+  max_audits_per_iteration: 0
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let audits = cfg.audits.expect("audits block present");
+        assert_eq!(audits.max_audits_per_iteration, 0);
+        let (clamped, warn) = clamp_max_audits_per_iteration(0, 5);
+        assert_eq!(clamped, 0);
+        assert!(warn.is_none(), "no warn for 0");
+    }
+
+    #[test]
+    fn max_audits_per_iteration_above_registry_count_clamps_with_warn() {
+        // 50 requested, registry has 5 audits → clamps to 5 + WARN.
+        let (clamped, warn) = clamp_max_audits_per_iteration(50, 5);
+        assert_eq!(clamped, 5);
+        let msg = warn.expect("warn must be emitted when above registry count");
+        assert!(msg.contains("50"), "warn names requested value: {msg}");
+        assert!(msg.contains('5'), "warn names clamped value: {msg}");
+    }
+
+    #[test]
+    fn max_audits_per_iteration_at_registry_count_no_warn() {
+        let (clamped, warn) = clamp_max_audits_per_iteration(5, 5);
+        assert_eq!(clamped, 5);
+        assert!(warn.is_none(), "no warn at registry count");
     }
 
     #[test]

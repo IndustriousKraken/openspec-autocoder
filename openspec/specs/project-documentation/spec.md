@@ -520,3 +520,33 @@ The rule prevents two failure modes: (a) test fixtures leaking into production s
 - **AND** the paragraph explains the operator-visible effect: audit creation commits ship in one PR, audit-generated change implementations ship in a follow-up PR
 - **AND** the paragraph names the benefit: reviewers see proposal contents before implementation, and can `@<bot> revise <text>` the proposals before implementer runs in the next iteration
 
+### Requirement: OPERATIONS.md and CONFIG.md document `max_audits_per_iteration`
+`docs/OPERATIONS.md`'s `## Periodic audits` section SHALL include a paragraph describing the `audits.max_audits_per_iteration` bound, its default (`1`), the rationale (prevent storm patterns), the override pattern, AND the interaction with on-demand queued runs. `docs/CONFIG.md`'s `audits:` table SHALL gain a row for the field.
+
+#### Scenario: OPERATIONS.md describes the bound and its rationale
+- **WHEN** an operator reads `docs/OPERATIONS.md`'s `## Periodic audits` section
+- **THEN** a paragraph names `audits.max_audits_per_iteration` AND its default `1`
+- **AND** the paragraph explains the rationale (preventing audit storms when many audits become eligible simultaneously, e.g. after a HEAD change)
+- **AND** the paragraph names the typical override values (e.g. `3` for fast drainage during onboarding) AND the trade-off (longer iteration wall-clock per cycle)
+- **AND** the paragraph explains that on-demand queued audits count against the bound — operators queuing many audits via `@<bot> audit ...` see them drain one per iteration at the default
+
+#### Scenario: CONFIG.md documents the field
+- **WHEN** an operator reads `docs/CONFIG.md`'s `audits:` table
+- **THEN** the table contains a row for `max_audits_per_iteration` (type `usize`, default `1`, max `<count of registered audits>`)
+- **AND** the row cross-links to the OPERATIONS.md section for the full discussion
+
+### Requirement: OPERATIONS.md and CHATOPS.md document the transient vs. permanent classification
+`docs/OPERATIONS.md`'s workspace-recovery sections SHALL include a paragraph describing the mid-iteration classification (transient retries; permanent skips). `docs/CHATOPS.md`'s chatops-alert text examples SHALL show the new ` (transient; retrying)` AND ` (permanent; skipped until daemon restart) — operator inspection required` suffixes.
+
+#### Scenario: OPERATIONS.md names the classification rule
+- **WHEN** an operator reads `docs/OPERATIONS.md`'s workspace-recovery sections
+- **THEN** a paragraph names the mid-iteration classification AND enumerates the patterns that classify as transient (network, transport, auth blip) vs. permanent (config errors, irrecoverable state)
+- **AND** the paragraph notes that startup-time recovery is unchanged (still skip-for-lifetime for any failure)
+- **AND** the paragraph cross-links to the chatops-alert section for the visible suffix examples
+
+#### Scenario: CHATOPS.md alert examples show the new suffixes
+- **WHEN** an operator reads `docs/CHATOPS.md`'s `Throttled failure alerts` section
+- **THEN** the example alert text includes a transient case with the ` (transient; retrying)` suffix
+- **AND** the example includes a permanent case with the ` (permanent; skipped until daemon restart) — operator inspection required` suffix
+- **AND** a one-line note explains the operator action: transient → wait; permanent → SSH and investigate
+

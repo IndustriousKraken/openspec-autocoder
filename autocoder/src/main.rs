@@ -27,6 +27,7 @@ mod perma_stuck;
 mod polling_loop;
 mod proposal_requests;
 mod queue;
+mod recovery_classification;
 mod revisions;
 mod spec_revision;
 #[cfg(test)]

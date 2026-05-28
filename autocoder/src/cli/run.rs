@@ -13,7 +13,7 @@ use crate::chatops;
 use crate::code_reviewer::CodeReviewer;
 use crate::config::{
     AuditSettings, AuditsConfig, Config, ExecutorKind, GithubConfig, NotificationsConfig,
-    RepositoryConfig, validate_audit_type_names,
+    RepositoryConfig, clamp_max_audits_per_iteration, validate_audit_type_names,
 };
 use crate::control_socket::{
     self, ChatOpsHolder, ChatOpsSlot, ControlState, GithubHolder, RepoTaskHandle, RepoTaskMap,
@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
+pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     // Resolve + install the daemon-paths global BEFORE any callsite
     // that reads workspace / control-socket / log / state paths. The
     // resolution order (config → AUTOCODER_*_DIR → systemd → XDG →
@@ -362,7 +362,6 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
         .as_ref()
         .map(|a| a.settings.clone())
         .unwrap_or_default();
-    let audits_cfg_arc: Option<Arc<AuditsConfig>> = cfg.audits.clone().map(Arc::new);
     let mut registry = AuditRegistry::new();
     registry.register(Arc::new(ArchitectureBrightlineAudit::new(&audit_settings)));
     registry.register(Arc::new(DriftAudit::new(&audit_settings, &cfg.executor)));
@@ -382,6 +381,27 @@ pub async fn execute(cfg: Config, config_path: PathBuf) -> Result<()> {
     // registry. A typo here means the audit will silently never run, so
     // we fail fast at startup with the list of known names.
     validate_audit_type_names(&cfg, &registry.known_type_names())?;
+    // Clamp `audits.max_audits_per_iteration` against the registry size.
+    // The clamp lives at startup (not in `Config::load_from`) because the
+    // ceiling depends on how many audits are registered, which the
+    // config loader doesn't know.
+    let registry_count = registry.len();
+    if let Some(audits) = cfg.audits.as_mut() {
+        let (clamped, _) =
+            clamp_max_audits_per_iteration(audits.max_audits_per_iteration, registry_count);
+        audits.max_audits_per_iteration = clamped;
+    }
+    let audit_type_list = registry.known_type_names().join(", ");
+    let max_audits_per_iteration = cfg
+        .audits
+        .as_ref()
+        .map(|a| a.max_audits_per_iteration)
+        .unwrap_or_else(crate::config::default_max_audits_per_iteration);
+    tracing::info!(
+        max_per_iteration = max_audits_per_iteration,
+        "audits configured: {audit_type_list}; max_per_iteration={max_audits_per_iteration}"
+    );
+    let audits_cfg_arc: Option<Arc<AuditsConfig>> = cfg.audits.clone().map(Arc::new);
     let audit_registry: Arc<AuditRegistry> = Arc::new(registry);
     let audit_settings_arc: Arc<HashMap<String, AuditSettings>> =
         Arc::new(audit_settings);
@@ -992,6 +1012,13 @@ pub async fn ensure_forks_exist(
 /// `true` if the repository is healthy and a polling task should be spawned;
 /// `false` (with a logged error) if the workspace is dirty or cannot be
 /// initialized.
+///
+/// TODO(a14): a future spec could extend mid-iteration's
+/// `classify_recovery_failure` to startup too, so a transient
+/// `Could not resolve host` at boot waits for the next iteration instead
+/// of skipping the repo for the daemon's lifetime. For now startup keeps
+/// its conservative skip-for-lifetime contract: any failure here removes
+/// the repo from the polling set until the operator restarts the daemon.
 pub fn repo_passes_startup_check(repo: &RepositoryConfig, github: &GithubConfig) -> bool {
     let workspace_path = workspace::resolve_path(repo);
     let fork_url = match github.fork_owner.as_deref() {

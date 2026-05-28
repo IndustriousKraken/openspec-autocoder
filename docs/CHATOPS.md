@@ -439,10 +439,22 @@ One line per change pickup, fired immediately after the change's `.in-progress` 
 Emitted at most once every 24 hours per (repository, failure category) for three categories of *predictable* infrastructure failure: workspace init / clone failure, branch push rejection, and PR creation 4xx from GitHub.
 
 ```
-⚠️ `<repo-url>`: <category-label> for the past 24h. Latest: <error excerpt>
+⚠️ `<repo-url>`: <category-label>. Latest: <error excerpt>
 ```
 
 The 24h throttle state lives in a per-workspace `.alert-state.json` file. On the next successful iteration the file is removed, so a transient outage followed by recovery does not leave the next failure (whenever it occurs) silenced. Other failure surfaces — executor returning `Failed`, reviewer LLM call errors, the chatops post itself failing — are deliberately out of scope and never produce a categorized alert.
+
+**Mid-iteration recovery suffix (a14).** When the failure originates from the mid-iteration recovery path (workspace re-init, `git fetch`, dirty cleanup — see [OPERATIONS.md → Dirty workspace auto-recovery](OPERATIONS.md#dirty-workspace-auto-recovery)), the alert label is followed by a parenthetical naming the classification:
+
+```
+⚠️ `<repo-url>`: workspace init keeps failing (transient; retrying). Latest: fatal: Could not resolve host: github.com
+```
+
+```
+⚠️ `<repo-url>`: workspace dirty mid-iteration (permanent; skipped until daemon restart) — operator inspection required. Latest: workspace /tmp/workspaces/owner-repo still dirty after recovery; refusing to proceed: D foo.rs
+```
+
+Operator action: **transient → wait** (the next polling iteration will retry automatically); **permanent → SSH and investigate** (the iteration will fail the same way each tick until the underlying condition is resolved). Alerts originating outside the mid-iteration recovery path (branch push failure, PR creation failure, etc.) keep the un-suffixed legacy text.
 
 ### PR-opened (`✅`)
 

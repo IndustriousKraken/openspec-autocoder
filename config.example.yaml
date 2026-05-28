@@ -382,6 +382,20 @@ github:
 #   # chatops failure notification). Values above `5` are clamped down at
 #   # startup with a WARN log. Default: 1.
 #   max_validation_retries: 1
+#
+#   # Per-iteration cap on how many audits run before the scheduler
+#   # returns control to the iteration loop. When many audits become
+#   # eligible at once (typical pattern: a HEAD change unblocks every
+#   # `requires_head_change` audit simultaneously), the default `1` keeps
+#   # them from running back-to-back inside one iteration — instead they
+#   # stagger across iterations so pending-change work continues to share
+#   # each cycle's wall-clock. Both cadence-driven AND on-demand queued
+#   # runs (from chatops `@<bot> audit <name>`) count against the bound.
+#   # Values above the number of registered audits clamp at the registry
+#   # count with a WARN log. Value `0` is permitted and disables audits
+#   # behaviourally (every iteration skips the audit phase — useful for
+#   # diagnostics or temporary silencing). Default: 1.
+#   max_audits_per_iteration: 1
 
 # Daemon data directories. Each field is optional; absent fields fall
 # through to (in order): AUTOCODER_*_DIR env vars → systemd-set

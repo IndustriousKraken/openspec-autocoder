@@ -5,6 +5,7 @@
 
 use crate::alert_state::{AlertCategory, AlertEntry, AlertState};
 use crate::polling_loop::ChatOpsContext;
+use crate::recovery_classification::RecoveryFailureClass;
 use chrono::{Duration as ChronoDuration, Utc};
 use std::path::Path;
 
@@ -28,19 +29,24 @@ fn excerpt_str(s: &str) -> String {
     }
 }
 
-/// Format the alert text as `⚠️ <repo>: <label>. Latest: <excerpt>`.
-/// The 24h throttle that governs how often this category re-posts is an
-/// implementation detail of `handle_predictable_failure` — earlier
-/// wordings claimed "for the past 24h" inside the alert body, which
-/// operators read as a duration measurement rather than a throttle
-/// window. The duration claim is intentionally absent here.
-pub(crate) fn format_alert_text(
+/// Format the alert text as `⚠️ <repo>: <label>[<class-suffix>]. Latest:
+/// <excerpt>`. The 24h throttle that governs how often this category
+/// re-posts is an implementation detail of `handle_predictable_failure` —
+/// earlier wordings claimed "for the past 24h" inside the alert body,
+/// which operators read as a duration measurement rather than a throttle
+/// window. The duration claim is intentionally absent here. When `class`
+/// is `Some(_)`, the suffix from [`RecoveryFailureClass::alert_suffix`]
+/// is appended after the category label (pinned strings — operator-
+/// visible AND referenced in `docs/CHATOPS.md`).
+pub(crate) fn format_alert_text_with_class(
     repo_url: &str,
     category: AlertCategory,
     err: &anyhow::Error,
+    class: Option<RecoveryFailureClass>,
 ) -> String {
+    let suffix = class.map(|c| c.alert_suffix()).unwrap_or("");
     format!(
-        "⚠️ `{repo_url}`: {label}. Latest: {excerpt}",
+        "⚠️ `{repo_url}`: {label}{suffix}. Latest: {excerpt}",
         label = category.label(),
         excerpt = excerpt(err),
     )
@@ -62,6 +68,54 @@ pub async fn handle_predictable_failure(
     category: AlertCategory,
     err: &anyhow::Error,
 ) {
+    handle_predictable_failure_inner(
+        workspace,
+        repo_url,
+        chatops_ctx,
+        notifications_enabled,
+        category,
+        err,
+        None,
+    )
+    .await
+}
+
+/// Variant of [`handle_predictable_failure`] that records a mid-iteration
+/// recovery classification (transient vs. permanent). The class is
+/// rendered as a suffix on the alert text per
+/// [`RecoveryFailureClass::alert_suffix`]. The 24h throttle, persistence
+/// path, and silent-on-disabled behavior are identical to the un-classed
+/// helper.
+pub async fn handle_classified_recovery_failure(
+    workspace: &Path,
+    repo_url: &str,
+    chatops_ctx: Option<&ChatOpsContext>,
+    notifications_enabled: bool,
+    category: AlertCategory,
+    err: &anyhow::Error,
+    class: RecoveryFailureClass,
+) {
+    handle_predictable_failure_inner(
+        workspace,
+        repo_url,
+        chatops_ctx,
+        notifications_enabled,
+        category,
+        err,
+        Some(class),
+    )
+    .await
+}
+
+async fn handle_predictable_failure_inner(
+    workspace: &Path,
+    repo_url: &str,
+    chatops_ctx: Option<&ChatOpsContext>,
+    notifications_enabled: bool,
+    category: AlertCategory,
+    err: &anyhow::Error,
+    class: Option<RecoveryFailureClass>,
+) {
     if !notifications_enabled {
         return;
     }
@@ -78,7 +132,7 @@ pub async fn handle_predictable_failure(
         return;
     }
 
-    let text = format_alert_text(repo_url, category, err);
+    let text = format_alert_text_with_class(repo_url, category, err, class);
     if let Err(post_err) = ctx.chatops.post_notification(&ctx.channel, &text).await {
         // Per design.md: chatops failures are never re-routed through
         // chatops, and the timestamp is NOT updated so the next iteration
@@ -160,8 +214,12 @@ mod tests {
     #[test]
     fn format_alert_text_contains_repo_label_and_excerpt() {
         let err = anyhow!("server hangup");
-        let text =
-            format_alert_text("git@github.com:owner/repo.git", AlertCategory::BranchPushFailure, &err);
+        let text = format_alert_text_with_class(
+            "git@github.com:owner/repo.git",
+            AlertCategory::BranchPushFailure,
+            &err,
+            None,
+        );
         assert!(text.contains("git@github.com:owner/repo.git"));
         assert!(text.contains("branch push keeps failing"));
         assert!(text.contains("server hangup"));
@@ -176,10 +234,11 @@ mod tests {
     #[test]
     fn format_alert_text_does_not_claim_a_duration() {
         let err = anyhow!("anything");
-        let text = format_alert_text(
+        let text = format_alert_text_with_class(
             "git@github.com:owner/repo.git",
             AlertCategory::WorkspaceDirtyMidIteration,
             &err,
+            None,
         );
         assert!(
             !text.contains("for the past 24h"),
@@ -192,12 +251,46 @@ mod tests {
     }
 
     #[test]
-    fn format_alert_text_workspace_dirty_mid_iteration() {
-        let err = anyhow!("workspace /tmp/x is dirty before pass: D foo/bar");
-        let text = format_alert_text(
+    fn format_alert_text_with_transient_class_includes_retrying_suffix() {
+        let err = anyhow!("Could not resolve host github.com");
+        let text = format_alert_text_with_class(
+            "git@github.com:owner/repo.git",
+            AlertCategory::WorkspaceInitFailure,
+            &err,
+            Some(RecoveryFailureClass::Transient),
+        );
+        assert!(
+            text.contains("workspace init keeps failing (transient; retrying). Latest:"),
+            "alert must carry the transient-retrying suffix; got: {text}"
+        );
+        assert!(text.contains("Could not resolve host"));
+    }
+
+    #[test]
+    fn format_alert_text_with_permanent_class_includes_operator_action_suffix() {
+        let err = anyhow!("workspace still dirty after recovery");
+        let text = format_alert_text_with_class(
             "git@github.com:owner/repo.git",
             AlertCategory::WorkspaceDirtyMidIteration,
             &err,
+            Some(RecoveryFailureClass::Permanent),
+        );
+        assert!(
+            text.contains(
+                "workspace dirty mid-iteration (permanent; skipped until daemon restart) — operator inspection required. Latest:"
+            ),
+            "alert must carry the permanent-operator-action suffix; got: {text}"
+        );
+    }
+
+    #[test]
+    fn format_alert_text_workspace_dirty_mid_iteration() {
+        let err = anyhow!("workspace /tmp/x is dirty before pass: D foo/bar");
+        let text = format_alert_text_with_class(
+            "git@github.com:owner/repo.git",
+            AlertCategory::WorkspaceDirtyMidIteration,
+            &err,
+            None,
         );
         assert!(text.contains("git@github.com:owner/repo.git"));
         assert!(text.contains("workspace dirty mid-iteration"));
