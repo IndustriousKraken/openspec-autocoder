@@ -108,6 +108,31 @@ pub trait Executor: Send + Sync {
         })
     }
 
+    /// Scout-mode invocation for the `scout` chatops verb (a25). The
+    /// polling iteration's scout handler builds a rendered prompt
+    /// (template + interpolated inputs: README, docs index, code
+    /// overview, recent git log, optionally an open-issues listing,
+    /// AND the operator's guidance) AND passes it here. The backend's
+    /// job is to invoke the wrapped CLI under a read-only sandbox so
+    /// the LLM can read, search, AND run `gh` to surface candidate
+    /// items. The expected response is a JSON array of opportunity
+    /// items; the polling layer parses, validates, AND persists.
+    ///
+    /// Default impl returns `Failed { reason: "scout mode not supported"
+    /// }` so a backend without scout support degrades to a polite
+    /// refusal rather than a panic.
+    async fn run_scout(
+        &self,
+        workspace: &Path,
+        ctx: &ScoutContext,
+    ) -> Result<ExecutorOutcome> {
+        let _ = workspace;
+        let _ = ctx;
+        Ok(ExecutorOutcome::Failed {
+            reason: "scout mode not supported by this executor backend".to_string(),
+        })
+    }
+
     /// Chat-driven changelog stylist for the `changelog` chatops verb.
     /// The deterministic extractor has already produced the JSON payload
     /// in `ctx.changelog_json`; this method asks the wrapped CLI to read
@@ -166,6 +191,20 @@ pub struct ChangelogContext {
     /// invocation is a revision of a prior changelog PR; empty for the
     /// first stylist run.
     pub revision_text: String,
+}
+
+/// Context handed to `Executor::run_scout` (a25). Built by the polling
+/// iteration's scout handler from the operator's request AND the
+/// workspace's surface (README, docs index, code-symbol overview,
+/// recent git log, AND optionally open issues). The `rendered_prompt`
+/// holds the final prompt after the polling layer has substituted
+/// these inputs into the resolved template (embedded default OR
+/// `features.scout.prompt_path` override).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoutContext {
+    /// Fully rendered prompt: template + interpolated context. The
+    /// executor passes this verbatim to the wrapped CLI.
+    pub rendered_prompt: String,
 }
 
 /// Context handed to `Executor::run_brownfield_draft`. Built by the

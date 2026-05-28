@@ -492,6 +492,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         audit_registry: audit_registry.clone(),
         audits_cfg: audits_cfg_arc.clone(),
         audit_settings: audit_settings_arc.clone(),
+        scout_feature_cfg: Arc::new(cfg.features.scout.clone()),
         contradiction_ctx: contradiction_ctx.clone(),
         global_cancel: cancel.clone(),
         task_map: task_map.clone(),
@@ -685,7 +686,8 @@ async fn spawn_inbound_listener(
                     .collect::<Vec<_>>(),
             )
             .with_chatops(slot.backend.clone())
-            .with_brownfield_enabled(cfg.features.brownfield.enabled),
+            .with_brownfield_enabled(cfg.features.brownfield.enabled)
+            .with_scout_enabled(cfg.features.scout.enabled),
     );
     let task_map_for_provider = task_map.clone();
     let repos: Arc<dyn crate::chatops::operator_commands::RepoIdentityProvider> =
@@ -727,6 +729,7 @@ struct SpawnDeps {
     audit_registry: Arc<AuditRegistry>,
     audits_cfg: Option<Arc<AuditsConfig>>,
     audit_settings: Arc<HashMap<String, AuditSettings>>,
+    scout_feature_cfg: Arc<crate::config::ScoutFeatureConfig>,
     contradiction_ctx:
         Option<Arc<crate::preflight::change_contradiction::ContradictionCheckCtx>>,
     global_cancel: CancellationToken,
@@ -777,6 +780,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         let registry_for_task = deps.audit_registry.clone();
         let audits_cfg_for_task = deps.audits_cfg.clone();
         let audit_settings_for_task = deps.audit_settings.clone();
+        let scout_feature_cfg_for_task = deps.scout_feature_cfg.clone();
         let pending_rebuild: Arc<std::sync::atomic::AtomicBool> =
             Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending_rebuild_for_task = pending_rebuild.clone();
@@ -800,6 +804,24 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
             >,
         > = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let pending_brownfield_requests_for_task = pending_brownfield_requests.clone();
+        let pending_scout_requests: Arc<
+            std::sync::Mutex<
+                std::collections::VecDeque<crate::control_socket::ScoutRequest>,
+            >,
+        > = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let pending_scout_requests_for_task = pending_scout_requests.clone();
+        let pending_spec_it_requests: Arc<
+            std::sync::Mutex<
+                std::collections::VecDeque<crate::control_socket::SpecItRequest>,
+            >,
+        > = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let pending_spec_it_requests_for_task = pending_spec_it_requests.clone();
+        let pending_clear_scout_requests: Arc<
+            std::sync::Mutex<
+                std::collections::VecDeque<crate::control_socket::ClearScoutRequest>,
+            >,
+        > = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let pending_clear_scout_requests_for_task = pending_clear_scout_requests.clone();
         let iteration_cancel: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>> =
             Arc::new(std::sync::Mutex::new(None));
         let iteration_cancel_for_task = iteration_cancel.clone();
@@ -828,6 +850,10 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                 pending_proposal_requests_for_task,
                 pending_changelog_requests_for_task,
                 pending_brownfield_requests_for_task,
+                pending_scout_requests_for_task,
+                pending_spec_it_requests_for_task,
+                pending_clear_scout_requests_for_task,
+                scout_feature_cfg_for_task,
                 iteration_cancel_for_task,
                 iteration_drained_for_task,
                 cancel_for_task,
@@ -860,6 +886,9 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
                     pending_proposal_requests,
                     pending_changelog_requests,
                     pending_brownfield_requests,
+                    pending_scout_requests,
+                    pending_spec_it_requests,
+                    pending_clear_scout_requests,
                     iteration_cancel,
                     iteration_drained,
                 },

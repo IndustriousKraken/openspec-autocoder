@@ -780,6 +780,28 @@ autocoder's spec-driven workflow assumes `openspec/specs/<capability>/spec.md` a
 
 ---
 
+## Finding things to work on {#finding-things-to-work-on}
+
+`brownfield` AND `propose` both assume the operator has already decided what to look at. The `scout` → pick → `spec-it` loop is the recommended discovery pattern when the operator wants the daemon to help with the upstream "where do I even start?" question.
+
+**The three-step loop.**
+
+1. **`@<bot> scout <repo> [optional guidance]`** surfaces a curated triage list of opportunity items (security gaps, swallowed errors, type-tightening candidates, TODO/FIXME entries, open issues, etc.). The list groups items by category AND posts to the request's lifecycle thread; the full list also persists to `<workspace>/.state/scout_runs/<request_id>.json` for later reference. The scout prompt is explicitly anti-ranking — items are surfaced for consideration, not advocated for.
+2. **Operator review.** The operator reads the list AND picks one (or more) item ids to act on. Items the operator does not act on remain on disk; subsequent scouts add new state files. Each scout's HEAD SHA is recorded so later `spec-it` invocations can detect drift.
+3. **`@<bot> spec-it <N> [optional guidance]`** (replied inside the scout thread) promotes the picked item into the standard `propose` flow. The handler builds a propose-request text from the scouted item's metadata, optionally concatenates the operator's guidance, AND hands off to the canonical propose machinery. The resulting fixes / spec PR (per the standard two-PR mechanic) lands in the same lifecycle thread so the scout → pick → spec → PR flow stays in one visible conversation.
+
+See [CHATOPS.md → `### scout`](CHATOPS.md#surfacing-opportunities-to-consider-scout) AND [CHATOPS.md → `### spec-it`](CHATOPS.md#promoting-a-scouted-item-into-a-propose-request-spec-it) for the verb syntax, refusal cases, AND staleness-warning behavior.
+
+**OSS-contribution example.** An operator's `acme-fork` workspace tracks a busy upstream repo where they'd like to land small, targeted PRs. `@<bot> scout acme-fork focus on error handling and swallowed errors` surfaces a list of candidates the upstream maintainers might accept. The operator picks `@<bot> spec-it 4 stay narrow — single function only` from the resulting thread; the propose lifecycle produces a fix PR sized appropriately for an OSS contribution.
+
+**Owned-project example.** An operator periodically wants a "what would a fresh pair of eyes notice?" pass against a long-running owned repo. `@<bot> scout my-service` (no guidance — open survey) drops a triage list. The operator triages the list in their head, picks two or three items worth scoping, AND runs `@<bot> spec-it <N>` on each — without committing to fix anything else on the list.
+
+**Staleness.** The scout's `head_sha_at_run` AND `completed_at` timestamps are checked on each `spec-it`. When either signal trips (`features.scout.staleness_warn_days` days elapsed OR HEAD moved), the handler posts a single thread reply naming what changed AND still submits the propose-request. Operators who want fresh results re-run `scout` first.
+
+**Recovery.** `@<bot> clear-scout <repo>` wipes every scout state file under the workspace. Idempotent (a clear with no runs replies `Cleared 0 scout run(s)`); useful when the on-disk list is no longer interesting OR an operator wants a clean slate before a fresh scout pass.
+
+---
+
 ## Canonical-spec RAG
 
 When the operator configures `canonical_rag:` in `config.yaml` (see

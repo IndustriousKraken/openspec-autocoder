@@ -17,7 +17,7 @@ use super::event_log::{self, ActionKind, StructuredLogWriter};
 use super::json_event::{self, AssistantBlock, JsonEvent, UserBlock};
 use super::{
     BrownfieldDraftContext, ChangelogContext, ChatTriageContext, Executor, ExecutorOutcome,
-    ResumeHandle, TriageContext, UnimplementableTask,
+    ResumeHandle, ScoutContext, TriageContext, UnimplementableTask,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -88,6 +88,11 @@ const CHANGELOG_STYLIST_LOG_CHANGE_NAME: &str = "changelog-stylist";
 /// (a23). Like the triage modes, brownfield-draft does not target a
 /// pre-existing change directory at invocation time.
 const BROWNFIELD_DRAFT_LOG_CHANGE_NAME: &str = "brownfield-draft";
+
+/// Synthetic "change" name used for the scout-mode run-log path (a25).
+/// Scout does not target a pre-existing change directory; the name is
+/// only used to produce a per-run log file for diagnostics.
+const SCOUT_LOG_CHANGE_NAME: &str = "scout";
 
 pub struct ClaudeCliExecutor {
     command: String,
@@ -1394,6 +1399,23 @@ impl Executor for ClaudeCliExecutor {
             &outcome,
         );
         self.classify_outcome(workspace, CHANGELOG_STYLIST_LOG_CHANGE_NAME, outcome)
+            .await
+    }
+
+    async fn run_scout(
+        &self,
+        workspace: &Path,
+        ctx: &ScoutContext,
+    ) -> Result<ExecutorOutcome> {
+        let prompt = ctx.rendered_prompt.clone();
+        let _mcp_path = Self::write_mcp_config(workspace, SCOUT_LOG_CHANGE_NAME)?;
+        let outcome = self
+            .run_subprocess(workspace, SCOUT_LOG_CHANGE_NAME, &prompt)
+            .await;
+        Self::delete_mcp_config(workspace);
+        let outcome = outcome?;
+        persist_run_log(workspace, SCOUT_LOG_CHANGE_NAME, &prompt, &outcome);
+        self.classify_outcome(workspace, SCOUT_LOG_CHANGE_NAME, outcome)
             .await
     }
 }

@@ -75,6 +75,8 @@ pub enum PromptId {
     /// Wired through the loader by a future change.
     #[allow(dead_code)]
     ChangeContradictionCheck,
+    /// `prompts/scout.md` — chat-driven `scout` triage list generator (a25).
+    Scout,
 }
 
 const PROMPT_IMPLEMENTER: &str = include_str!("../../../prompts/implementer.md");
@@ -97,6 +99,7 @@ const PROMPT_DOCUMENTATION_AUDIT: &str =
 const PROMPT_BROWNFIELD_DRAFT: &str = include_str!("../../../prompts/brownfield-draft.md");
 const PROMPT_CHANGE_CONTRADICTION_CHECK: &str =
     include_str!("../../../prompts/change-contradiction-check.md");
+const PROMPT_SCOUT: &str = include_str!("../../../prompts/scout.md");
 
 impl PromptId {
     /// Embedded default template content, loaded at compile time.
@@ -115,6 +118,7 @@ impl PromptId {
             Self::AuditDocumentation => PROMPT_DOCUMENTATION_AUDIT,
             Self::BrownfieldDraft => PROMPT_BROWNFIELD_DRAFT,
             Self::ChangeContradictionCheck => PROMPT_CHANGE_CONTRADICTION_CHECK,
+            Self::Scout => PROMPT_SCOUT,
         }
     }
 
@@ -136,6 +140,7 @@ impl PromptId {
             Self::AuditDocumentation => "documentation-audit.md",
             Self::BrownfieldDraft => "brownfield-draft.md",
             Self::ChangeContradictionCheck => "change-contradiction-check.md",
+            Self::Scout => "scout.md",
         }
     }
 
@@ -155,6 +160,7 @@ impl PromptId {
             Self::AuditDocumentation => "AuditDocumentation",
             Self::BrownfieldDraft => "BrownfieldDraft",
             Self::ChangeContradictionCheck => "ChangeContradictionCheck",
+            Self::Scout => "Scout",
         }
     }
 
@@ -175,6 +181,7 @@ impl PromptId {
             Self::AuditDocumentation,
             Self::BrownfieldDraft,
             Self::ChangeContradictionCheck,
+            Self::Scout,
         ]
     }
 }

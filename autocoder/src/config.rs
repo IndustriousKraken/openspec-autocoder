@@ -212,13 +212,14 @@ impl CanonicalRagConfig {
 }
 
 /// Top-level feature-flag block. Each sub-block is opt-in; absent
-/// sub-blocks take their type-default behaviour. Today only
-/// `brownfield` is defined.
+/// sub-blocks take their type-default behaviour.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FeaturesConfig {
     #[serde(default)]
     pub brownfield: BrownfieldFeatureConfig,
+    #[serde(default)]
+    pub scout: ScoutFeatureConfig,
 }
 
 impl FeaturesConfig {
@@ -254,6 +255,59 @@ impl Default for BrownfieldFeatureConfig {
 fn default_brownfield_enabled() -> bool {
     true
 }
+
+/// Config for the `scout` chatops verb (a25). The verb is enabled
+/// per-workspace by default; operators opt out by setting
+/// `enabled: false`. The optional `prompt_path` points the scout
+/// polling handler at a custom prompt template; when unset OR the
+/// file does not exist at run time, the handler falls back to the
+/// embedded default `prompts/scout.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScoutFeatureConfig {
+    #[serde(default = "default_scout_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_path: Option<PathBuf>,
+    #[serde(default = "default_scout_max_items")]
+    pub max_items: usize,
+    #[serde(default = "default_scout_include_issues")]
+    pub include_issues: bool,
+    #[serde(default = "default_scout_staleness_warn_days")]
+    pub staleness_warn_days: u64,
+}
+
+impl Default for ScoutFeatureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_scout_enabled(),
+            prompt_path: None,
+            max_items: default_scout_max_items(),
+            include_issues: default_scout_include_issues(),
+            staleness_warn_days: default_scout_staleness_warn_days(),
+        }
+    }
+}
+
+fn default_scout_enabled() -> bool {
+    true
+}
+
+fn default_scout_max_items() -> usize {
+    30
+}
+
+fn default_scout_include_issues() -> bool {
+    true
+}
+
+fn default_scout_staleness_warn_days() -> u64 {
+    7
+}
+
+/// Valid range for `features.scout.max_items`. Values outside this range
+/// fail config-load with an error naming the offending field.
+pub const SCOUT_MAX_ITEMS_RANGE: std::ops::RangeInclusive<usize> = 1..=50;
 
 /// Modernized nested prompt-override block (a24). Used as the value
 /// type for every `<area>.<thing>` field that overrides an embedded
@@ -1590,6 +1644,17 @@ impl Config {
         if let Some(rag) = cfg.canonical_rag.as_mut() {
             let (top_k, _) = clamp_rag_top_k(rag.top_k);
             rag.top_k = top_k;
+        }
+        // features.scout.max_items: fail-fast on out-of-range values
+        // (a25). Range is `1..=50`; anything outside aborts config-load
+        // with an error naming the offending field AND the valid range.
+        let scout_max = cfg.features.scout.max_items;
+        if !SCOUT_MAX_ITEMS_RANGE.contains(&scout_max) {
+            return Err(anyhow!(
+                "features.scout.max_items = {scout_max} is outside the valid range {}..={}",
+                SCOUT_MAX_ITEMS_RANGE.start(),
+                SCOUT_MAX_ITEMS_RANGE.end(),
+            ));
         }
         Ok(cfg)
     }
@@ -5527,6 +5592,110 @@ reviewer:
         assert_eq!(
             rv.code_review.as_ref().and_then(|b| b.prompt_path.as_deref()),
             Some(Path::new("./prompts/review-custom.md"))
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // features.scout (a25)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn features_scout_block_omitted_uses_defaults() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("absent features.scout parses");
+        assert!(cfg.features.scout.enabled, "default enabled must be true");
+        assert!(cfg.features.scout.prompt_path.is_none());
+        assert_eq!(cfg.features.scout.max_items, 30);
+        assert!(cfg.features.scout.include_issues);
+        assert_eq!(cfg.features.scout.staleness_warn_days, 7);
+    }
+
+    #[test]
+    fn features_scout_all_fields_round_trip() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+features:
+  scout:
+    enabled: false
+    prompt_path: "./prompts/scout-custom.md"
+    max_items: 12
+    include_issues: false
+    staleness_warn_days: 14
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("explicit scout block parses");
+        assert!(!cfg.features.scout.enabled);
+        assert_eq!(
+            cfg.features.scout.prompt_path.as_deref(),
+            Some(Path::new("./prompts/scout-custom.md"))
+        );
+        assert_eq!(cfg.features.scout.max_items, 12);
+        assert!(!cfg.features.scout.include_issues);
+        assert_eq!(cfg.features.scout.staleness_warn_days, 14);
+    }
+
+    #[test]
+    fn features_scout_max_items_zero_fails_load() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+features:
+  scout:
+    max_items: 0
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path).expect_err("max_items=0 must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("features.scout.max_items") && msg.contains("1..=50"),
+            "error must name the field AND the valid range; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn features_scout_max_items_too_high_fails_load() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+features:
+  scout:
+    max_items: 100
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path).expect_err("max_items=100 must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("features.scout.max_items") && msg.contains("1..=50"),
+            "error must name the field AND the valid range; got: {msg}"
         );
     }
 

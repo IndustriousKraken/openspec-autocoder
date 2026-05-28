@@ -12,7 +12,9 @@ use crate::code_reviewer::{
     CodeReviewer, PerChangeContext, PerChangeReview, PerChangeSection, ReviewConcern,
     ReviewReport, ReviewVerdict, build_cross_change_preamble,
 };
-use crate::config::{AuditSettings, AuditsConfig, GithubConfig, RepositoryConfig};
+use crate::config::{
+    AuditSettings, AuditsConfig, GithubConfig, RepositoryConfig, ScoutFeatureConfig,
+};
 use crate::control_socket::{ChatOpsHolder, ChatOpsSlot, GithubHolder, ReviewerHolder};
 use crate::executor::{Executor, ExecutorOutcome, ResumeHandle, UnimplementableTask};
 use crate::recovery_classification::{RecoveryFailureClass, classify_recovery_failure};
@@ -96,6 +98,22 @@ pub async fn run(
             std::collections::VecDeque<crate::control_socket::BrownfieldRequest>,
         >,
     >,
+    pending_scout_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::ScoutRequest>,
+        >,
+    >,
+    pending_spec_it_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::SpecItRequest>,
+        >,
+    >,
+    pending_clear_scout_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::ClearScoutRequest>,
+        >,
+    >,
+    scout_feature_cfg: Arc<ScoutFeatureConfig>,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -121,6 +139,10 @@ pub async fn run(
         pending_proposal_requests,
         pending_changelog_requests,
         pending_brownfield_requests,
+        pending_scout_requests,
+        pending_spec_it_requests,
+        pending_clear_scout_requests,
+        scout_feature_cfg,
         iteration_cancel,
         iteration_drained,
         cancel,
@@ -190,6 +212,22 @@ pub async fn run_with_hooks(
             std::collections::VecDeque<crate::control_socket::BrownfieldRequest>,
         >,
     >,
+    pending_scout_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::ScoutRequest>,
+        >,
+    >,
+    pending_spec_it_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::SpecItRequest>,
+        >,
+    >,
+    pending_clear_scout_requests: Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::control_socket::ClearScoutRequest>,
+        >,
+    >,
+    scout_feature_cfg: Arc<ScoutFeatureConfig>,
     iteration_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     iteration_drained: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -452,6 +490,78 @@ pub async fn run_with_hooks(
                 url = snapshot_ref.url.as_str(),
                 request_id = req.request_id.as_str(),
                 "brownfield-request processing errored for {}: {error:#}",
+                snapshot_ref.url
+            );
+        }
+
+        // Drain ALL clear-scout requests at iteration start (a25).
+        // Clear-scout is a fast filesystem operation that does not need
+        // the executor, so processing the entire backlog every iteration
+        // keeps the latency low without contending for the executor.
+        let clear_scout_batch: Vec<crate::control_socket::ClearScoutRequest> = {
+            let mut g = pending_clear_scout_requests.lock().unwrap();
+            g.drain(..).collect()
+        };
+        for req in &clear_scout_batch {
+            if let Err(error) = crate::polling::scout::process_clear_scout(
+                &workspace,
+                chatops_ctx.as_ref(),
+                req,
+            )
+            .await
+            {
+                tracing::warn!(
+                    url = snapshot_ref.url.as_str(),
+                    "clear-scout processing errored for {}: {error:#}",
+                    snapshot_ref.url
+                );
+            }
+        }
+
+        // Drain at most ONE scout request per iteration (a25).
+        let scout_request: Option<crate::control_socket::ScoutRequest> = {
+            let mut g = pending_scout_requests.lock().unwrap();
+            g.pop_front()
+        };
+        if let Some(req) = scout_request
+            && let Err(error) = crate::polling::scout::process_pending_scout(
+                &workspace,
+                snapshot_ref,
+                executor.as_ref(),
+                &github_snap,
+                chatops_ctx.as_ref(),
+                &req,
+                scout_feature_cfg.as_ref(),
+            )
+            .await
+        {
+            tracing::error!(
+                url = snapshot_ref.url.as_str(),
+                request_id = req.request_id.as_str(),
+                "scout-request processing errored for {}: {error:#}",
+                snapshot_ref.url
+            );
+        }
+
+        // Drain at most ONE spec-it request per iteration (a25).
+        let spec_it_request: Option<crate::control_socket::SpecItRequest> = {
+            let mut g = pending_spec_it_requests.lock().unwrap();
+            g.pop_front()
+        };
+        if let Some(req) = spec_it_request
+            && let Err(error) = crate::polling::spec_it::process_pending_spec_it(
+                &workspace,
+                snapshot_ref,
+                chatops_ctx.as_ref(),
+                &req,
+                scout_feature_cfg.as_ref(),
+            )
+            .await
+        {
+            tracing::error!(
+                url = snapshot_ref.url.as_str(),
+                scout_request_id = req.scout_request_id.as_str(),
+                "spec-it processing errored for {}: {error:#}",
                 snapshot_ref.url
             );
         }
@@ -7015,6 +7125,16 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(crate::config::ScoutFeatureConfig::default()),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
                 cancel_for_task,
@@ -7222,6 +7342,16 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(crate::config::ScoutFeatureConfig::default()),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
                 cancel_for_task,
@@ -11566,6 +11696,16 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                std::sync::Arc::new(crate::config::ScoutFeatureConfig::default()),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
                 task_cancel,

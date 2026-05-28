@@ -521,6 +521,36 @@ github:
 #     # handler logs a WARN naming the path AND falls back to the
 #     # embedded default. Default: null (use embedded).
 #     # prompt_path: ./prompts/brownfield-custom.md
+#
+#   scout:
+#     # Config for the `scout`, `spec-it`, AND `clear-scout` chatops
+#     # verbs (a25). When `enabled: false`, all three verbs are refused
+#     # at parse time. Default: true.
+#     # enabled: true
+#
+#     # Workspace-relative path to a custom scout prompt template.
+#     # When unset OR the file does not exist at run time, the polling
+#     # handler falls back to the embedded `prompts/scout.md`. Default: null.
+#     # prompt_path: ./prompts/scout-custom.md
+#
+#     # Upper bound on the number of opportunity items the scout
+#     # handler accepts from the executor. Valid range: 1..=50.
+#     # Default: 30.
+#     # max_items: 30
+#
+#     # When true, the scout handler attempts `gh api repos/.../issues?state=open`
+#     # to include open issues in the prompt input. On `gh` failure the
+#     # handler logs a WARN AND falls through; the thread reply notes
+#     # the skip. Default: true.
+#     # include_issues: true
+#
+#     # Days-since-scout threshold for the spec-it staleness warning.
+#     # When a `spec-it` references a scout older than this OR the
+#     # workspace HEAD has moved, the handler posts a single warning
+#     # thread reply AND still submits the propose-request. Also used
+#     # as the `git log --since` window for the scout prompt's
+#     # recent-activity input (multiplied by 4). Default: 7.
+#     # staleness_warn_days: 7
 
 
 # Canonical-spec RAG (a21). Optional top-level block. When absent OR

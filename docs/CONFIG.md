@@ -163,6 +163,7 @@ override at all before the uniform loader landed.
 | `AuditDocumentation`             | `prompts/documentation-audit.md`           | `audits.settings.documentation_audit.prompt_path`            | —                                                          |
 | `BrownfieldDraft`                | `prompts/brownfield-draft.md`              | `features.brownfield.prompt_path`                            | —                                                          |
 | `ChangeContradictionCheck`       | `prompts/change-contradiction-check.md`    | `executor.change_internal_contradiction_check_prompt_path`   | —                                                          |
+| `Scout`                          | `prompts/scout.md`                         | `features.scout.prompt_path`                                 | —                                                          |
 
 **Naming convention going forward.** Any new embedded prompt added
 in a future change SHALL declare its override field using the
@@ -343,6 +344,32 @@ features:
 **Default behaviour.** Omitting the `features.brownfield` block (or omitting the entire `features:` parent block) is equivalent to `enabled: true` AND `prompt_path: null`. The verb works out of the box on a fresh install.
 
 **Forward-compatibility note.** The per-workspace prompt override knob's location is provisional. When the broader per-workspace-prompt schema lands (covering implementer, audit-triage, changelog-stylist, brownfield-draft, etc. under a unified shape), brownfield's override SHALL conform to it; the current `features.brownfield.prompt_path` MAY be relocated at that time. Operators using the override should expect a migration step in the corresponding release notes.
+
+### `features.scout` {#featuresscout}
+
+Config for the `scout`, `spec-it`, AND `clear-scout` chatops verbs (a25). The verbs implement the chat-driven discovery loop: scout surfaces a curated triage list of opportunity items, spec-it promotes a picked item into the standard propose flow, AND clear-scout wipes the scout state directory for an operator-initiated reset. See [`CHATOPS.md → scout`](CHATOPS.md#surfacing-opportunities-to-consider-scout) for the verb syntax AND [`OPERATIONS.md → finding things to work on`](OPERATIONS.md#finding-things-to-work-on) for the recommended loop.
+
+```yaml
+features:
+  scout:
+    enabled: true                  # default true; set false to refuse the three verbs at parse time
+    prompt_path: null              # default null; relative path to a custom scout prompt template
+    max_items: 30                  # default 30; valid range 1..=50
+    include_issues: true           # default true; controls whether the handler attempts `gh api`
+    staleness_warn_days: 7         # default 7; threshold for the spec-it staleness warning
+```
+
+| Field                  | Type             | Default | Description                                                                                                                                                                                                                                                                                                              |
+|------------------------|------------------|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `enabled`              | `bool`           | `true`  | Per-workspace enable flag. When `false`, the dispatcher refuses `@<bot> scout`, `@<bot> spec-it`, AND `@<bot> clear-scout` at parse time with `✗ scout: disabled in this workspace's config (features.scout.enabled=false).`.                                                                                          |
+| `prompt_path`          | `Option<String>` | `None`  | Workspace-relative path to a custom scout prompt template. Resolved via the uniform [`PromptLoader`](#prompt-overrides) — see the Prompt overrides table for the precedence rules. When unset OR the file does not exist at run time, the handler falls back to the embedded `prompts/scout.md`.                       |
+| `max_items`            | `usize`          | `30`    | Upper bound on the JSON-list size the scout handler accepts from the executor. Valid range `1..=50`; values outside this range fail config-load with an error naming the field AND the valid range.                                                                                                                       |
+| `include_issues`       | `bool`           | `true`  | When `true`, the scout handler attempts `gh api repos/<owner>/<repo>/issues?state=open --paginate` to include open issues in the prompt input. On `gh` failure (auth, rate-limit, network) the handler logs a WARN AND falls through with no issue input; the thread reply notes the skip.                              |
+| `staleness_warn_days`  | `u64`            | `7`     | Threshold (in days) for the spec-it staleness warning. When a `spec-it` references a scout older than this OR the workspace HEAD has moved, the handler posts a single warning thread reply AND still submits the propose-request. The handler ALSO uses `staleness_warn_days * 4` as the `git log --since` window for the scout prompt's recent-activity input. |
+
+**Default behaviour.** Omitting the `features.scout` block (or omitting the entire `features:` parent block) is equivalent to applying every default above. The verbs work out of the box on a fresh install.
+
+For the `prompt_path` entry, see the [Prompt overrides](#prompt-overrides) table — `Scout` follows the same `(nested override → legacy override → embedded default)` precedence as every other embedded template.
 
 
 ## `canonical_rag:` (optional)

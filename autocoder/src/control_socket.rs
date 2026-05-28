@@ -116,6 +116,54 @@ pub struct BrownfieldRequest {
     pub submitted_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One in-flight chat-driven scout-request awaiting the scout-mode
+/// executor pass (a25). The chatops dispatcher's `scout` verb appends
+/// to `RepoTaskHandle::pending_scout_requests`; the polling loop drains
+/// at most one entry per iteration AFTER the brownfield drain AND
+/// BEFORE the standard change-processing pass.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ScoutRequest {
+    pub request_id: String,
+    pub repo_url: String,
+    pub guidance: Option<String>,
+    pub channel: String,
+    /// Bot's ack-message ts; the request's lifecycle thread.
+    pub thread_ts: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One in-flight chat-driven spec-it request (a25). The chatops
+/// dispatcher's `spec-it` verb appends to
+/// `RepoTaskHandle::pending_spec_it_requests`; the polling loop
+/// drains at most one entry per iteration AFTER the scout drain.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SpecItRequest {
+    pub repo_url: String,
+    pub scout_request_id: String,
+    pub item_id: usize,
+    pub guidance: Option<String>,
+    pub channel: String,
+    /// Anchor thread (the scout's lifecycle thread).
+    pub thread_ts: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One in-flight chat-driven clear-scout request (a25). The chatops
+/// dispatcher's `clear-scout` verb appends to
+/// `RepoTaskHandle::pending_clear_scout_requests`; the polling loop
+/// drains the queue at iteration start AND posts the count cleared
+/// back to the request's channel.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ClearScoutRequest {
+    pub repo_url: String,
+    pub channel: String,
+    pub thread_ts: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Handle for a per-repository polling task. The reload handler uses
 /// `cancel` to ask one task to exit (without affecting siblings), and
 /// `config` to hot-swap the `RepositoryConfig` so a still-running task
@@ -173,6 +221,23 @@ pub struct RepoTaskHandle {
     /// `BrownfieldRequestState` file via `request_id`.
     pub pending_brownfield_requests:
         Arc<Mutex<std::collections::VecDeque<BrownfieldRequest>>>,
+    /// Queue of chat-driven scout requests awaiting the scout-mode
+    /// executor pass (`@<bot> scout`). The chatops dispatcher's
+    /// `scout` verb pushes here via the `queue_scout_request`
+    /// control-socket action; the polling loop drains at most ONE
+    /// entry per iteration AFTER the brownfield drain AND BEFORE the
+    /// standard change-processing pass.
+    pub pending_scout_requests:
+        Arc<Mutex<std::collections::VecDeque<ScoutRequest>>>,
+    /// Queue of chat-driven spec-it requests (`@<bot> spec-it <N>`).
+    /// Drained at most ONE per iteration AFTER the scout drain.
+    pub pending_spec_it_requests:
+        Arc<Mutex<std::collections::VecDeque<SpecItRequest>>>,
+    /// Queue of chat-driven clear-scout requests (`@<bot> clear-scout`).
+    /// Drained AT iteration start (all entries — clear-scout is a
+    /// fast filesystem operation that does NOT require the executor).
+    pub pending_clear_scout_requests:
+        Arc<Mutex<std::collections::VecDeque<ClearScoutRequest>>>,
     /// Per-iteration cancel token. The polling loop populates this with
     /// a child of the global cancel at iteration start and clears it
     /// back to `None` at iteration end (via an `IterationGuard` drop).
@@ -398,6 +463,9 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "queue_proposal_request" => handle_queue_proposal_request(&parsed, state),
         "queue_changelog_request" => handle_queue_changelog_request(&parsed, state),
         "queue_brownfield_request" => handle_queue_brownfield_request(&parsed, state),
+        "queue_scout_request" => handle_queue_scout_request(&parsed, state),
+        "queue_spec_it_request" => handle_queue_spec_it_request(&parsed, state),
+        "queue_clear_scout_request" => handle_queue_clear_scout_request(&parsed, state),
         "query_canonical_specs" => handle_query_canonical_specs(&parsed, state).await,
         other => json!({"ok": false, "error": format!("unknown action: {other}")}),
     }
@@ -1557,6 +1625,196 @@ fn handle_queue_brownfield_request(parsed: &Value, state: &ControlState) -> Valu
     })
 }
 
+/// Queue a chat-driven scout request for the repo's next polling
+/// iteration (a25). The dispatcher passes the inline scout request fields
+/// directly — scout state is created BY the polling handler, not by the
+/// dispatcher, so there is no on-disk file to load yet.
+fn handle_queue_scout_request(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let request_id = match require_str(parsed, "request_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let guidance = parsed
+        .get("guidance")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard.get(&url).map(|h| h.pending_scout_requests.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        if !g.iter().any(|r| r.request_id == request_id) {
+            g.push_back(ScoutRequest {
+                request_id: request_id.clone(),
+                repo_url: url.clone(),
+                guidance,
+                channel,
+                thread_ts,
+                submitted_at: chrono::Utc::now(),
+            });
+        }
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "request_id": request_id,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
+/// Queue a chat-driven spec-it request (a25). The dispatcher passes the
+/// inline fields directly — the polling handler resolves the scout
+/// state file by `scout_request_id`.
+fn handle_queue_spec_it_request(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let scout_request_id = match require_str(parsed, "scout_request_id") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let item_id = match parsed.get("item_id").and_then(|v| v.as_u64()) {
+        Some(n) => n as usize,
+        None => {
+            return json!({"ok": false, "error": "missing `item_id` field"});
+        }
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let guidance = parsed
+        .get("guidance")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard.get(&url).map(|h| h.pending_spec_it_requests.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        g.push_back(SpecItRequest {
+            repo_url: url.clone(),
+            scout_request_id: scout_request_id.clone(),
+            item_id,
+            guidance,
+            channel,
+            thread_ts,
+            submitted_at: chrono::Utc::now(),
+        });
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "scout_request_id": scout_request_id,
+        "item_id": item_id,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
+/// Queue a chat-driven clear-scout request (a25). Drained AT iteration
+/// start — the polling handler removes every scout state file under the
+/// workspace AND posts a reply naming the count cleared.
+fn handle_queue_clear_scout_request(parsed: &Value, state: &ControlState) -> Value {
+    let url = match require_str(parsed, "url") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let channel = match require_str(parsed, "channel") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let thread_ts = match require_str(parsed, "thread_ts") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let repo = match find_repo(state, &url) {
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let queue_slot = {
+        let guard = state.repo_tasks.lock().unwrap();
+        guard
+            .get(&url)
+            .map(|h| h.pending_clear_scout_requests.clone())
+    };
+    let queue = match queue_slot {
+        Some(q) => q,
+        None => {
+            return json!({
+                "ok": false,
+                "error": format!(
+                    "no live polling task for `{url}` (daemon may not have spawned it yet)"
+                ),
+            });
+        }
+    };
+    {
+        let mut g = queue.lock().unwrap();
+        g.push_back(ClearScoutRequest {
+            repo_url: url.clone(),
+            channel,
+            thread_ts,
+            submitted_at: chrono::Utc::now(),
+        });
+    }
+    json!({
+        "ok": true,
+        "url": url,
+        "poll_interval_sec": repo.poll_interval_sec,
+    })
+}
+
 /// Handle the `query_canonical_specs` action (a21). Looks up the
 /// workspace's `CanonicalRagStore` in the daemon's registry; on hit,
 /// runs the query and returns ranked chunks. Every error path is
@@ -1991,6 +2249,12 @@ mod tests {
                     pending_proposal_requests: Arc::new(Mutex::new(Vec::new())),
                     pending_changelog_requests: Arc::new(Mutex::new(Vec::new())),
                     pending_brownfield_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_scout_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_spec_it_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_clear_scout_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
@@ -3214,6 +3478,12 @@ github:
                     pending_proposal_requests: Arc::new(Mutex::new(Vec::new())),
                     pending_changelog_requests: Arc::new(Mutex::new(Vec::new())),
                     pending_brownfield_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_scout_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_spec_it_requests:
+                        Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                    pending_clear_scout_requests:
                         Arc::new(Mutex::new(std::collections::VecDeque::new())),
                     iteration_cancel: Arc::new(Mutex::new(None)),
                     iteration_drained: Arc::new(Notify::new()),
