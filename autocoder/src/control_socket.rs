@@ -436,7 +436,12 @@ async fn handle_repo_status(parsed: &Value, state: &ControlState) -> Value {
     };
     let workspace_path = workspace::resolve_path(&repo);
     let github_cfg = state.github.load_full();
-    match build_repo_status(&workspace_path, &repo, &github_cfg).await {
+    let stale_threshold = state
+        .last_config
+        .load_full()
+        .executor
+        .busy_marker_stale_threshold_secs();
+    match build_repo_status(&workspace_path, &repo, &github_cfg, stale_threshold).await {
         Ok(resp) => match serde_json::to_value(&resp) {
             Ok(body) => json!({"ok": true, "status": body}),
             Err(e) => json!({"ok": false, "error": format!("serializing status: {e}")}),
@@ -467,11 +472,16 @@ async fn handle_repo_status_all(state: &ControlState) -> Value {
             .collect()
     };
     let github_cfg = state.github.load_full();
+    let stale_threshold = state
+        .last_config
+        .load_full()
+        .executor
+        .busy_marker_stale_threshold_secs();
     let mut results = Vec::with_capacity(repos.len());
     for repo in repos {
         let workspace_path = workspace::resolve_path(&repo);
         let url = repo.url.clone();
-        let entry = match build_repo_status(&workspace_path, &repo, &github_cfg).await {
+        let entry = match build_repo_status(&workspace_path, &repo, &github_cfg, stale_threshold).await {
             Ok(resp) => match serde_json::to_value(&resp) {
                 Ok(body) => json!({"url": url, "ok": true, "status": body}),
                 Err(e) => json!({
@@ -507,6 +517,7 @@ async fn build_repo_status(
     workspace_path: &Path,
     repo: &RepositoryConfig,
     github_cfg: &GithubConfig,
+    stale_threshold_secs: u64,
 ) -> Result<RepoStatusResponse> {
     let mut resp = RepoStatusResponse {
         url: repo.url.clone(),
@@ -516,9 +527,11 @@ async fn build_repo_status(
     };
 
     // Currently-busy peek is workspace-relative but does not require the
-    // workspace dir to exist (the marker lives under <tempdir>/autocoder/busy),
-    // so populate it before the early-return.
-    resp.currently_busy = busy_marker::current(workspace_path);
+    // workspace dir to exist (the marker lives under the runtime dir),
+    // so populate it before the early-return. The full marker contents
+    // (stage, pid, audit-type-on-match) feed the new `currently:` line
+    // branches in `format_status_reply`.
+    resp.currently_busy = busy_marker::current(workspace_path, stale_threshold_secs);
 
     // Workspace may not exist yet (e.g. a freshly added repo whose initial
     // clone hasn't run). Treat that as "everything empty for the

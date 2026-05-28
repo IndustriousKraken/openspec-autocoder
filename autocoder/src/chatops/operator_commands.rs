@@ -792,13 +792,53 @@ pub struct PrSummary {
     pub age: chrono::Duration,
 }
 
-/// One-line summary of the per-repo busy marker, when held. `started_at`
-/// is the marker file's mtime — close enough to "when this iteration
-/// began" for the status display.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One-line summary of the per-repo busy marker, when held. Carries
+/// enough marker context for `format_status_reply` to surface the
+/// distinguishing variants of the `currently:` line (audit-in-flight,
+/// post-executor stage, stale-marker, etc.) rather than collapsing
+/// every non-`change` marker into a misleading `currently: idle`.
+///
+/// `started_at` is the marker's recorded `started_at` field (RFC3339
+/// from the JSON body); when the marker JSON is malformed and the
+/// daemon falls back to the file's mtime, the daemon writes the
+/// fallback into this field so downstream formatters never see the
+/// distinction.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BusySummary {
+    /// Slug of the OpenSpec change the daemon is currently working on,
+    /// or empty when the marker has no associated change (audit run,
+    /// post-executor stage, recovery operation, etc.).
+    #[serde(default)]
     pub change: String,
     pub started_at: DateTime<Utc>,
+    /// Marker's `stage` field as a string (`executor`, `commit`,
+    /// `review`, `push`, `pr`). Default `executor` for backwards
+    /// compatibility with pre-spec marker JSON that omitted the field
+    /// at the wire boundary.
+    #[serde(default)]
+    pub stage: String,
+    /// PID recorded in the marker. Used by the stale-marker branch of
+    /// the `currently:` line to surface "stale marker from pid <pid>".
+    #[serde(default)]
+    pub pid: u32,
+    /// `executor.busy_marker_stale_threshold_secs` resolved value, used
+    /// by the stale-marker branch's "recovery in <duration>" /
+    /// "recovery eligible now" heuristics. Zero when the threshold is
+    /// unconfigured (status falls back to a no-stale-warning behavior).
+    #[serde(default)]
+    pub stale_threshold_secs: u64,
+    /// Whether the marker's recorded PID is alive on the daemon host
+    /// as of the status snapshot. False means recovery would fire
+    /// immediately on the next iteration (per `a08`).
+    #[serde(default)]
+    pub pid_alive: bool,
+    /// When the marker has `stage=executor` AND `change` is empty AND
+    /// an audit log file's timestamp matches the marker's `started_at`
+    /// (within 1s), the daemon resolves the audit type from the
+    /// filename and records it here. `None` means the executor stage
+    /// is busy but no audit log matches.
+    #[serde(default)]
+    pub audit_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -905,18 +945,8 @@ pub fn format_status_reply(resp: &RepoStatusResponse) -> String {
         }
 
         out.push('\n');
-        match &resp.currently_busy {
-            Some(b) => {
-                let age = human_age_since(b.started_at);
-                out.push_str(&format!(
-                    "currently: working on {} (started {age} ago)\n",
-                    slack_escape(&b.change)
-                ));
-            }
-            None => {
-                out.push_str("currently: idle\n");
-            }
-        }
+        out.push_str(&format_currently_line(resp.currently_busy.as_ref()));
+        out.push('\n');
     }
 
     let has_markers =
@@ -1130,14 +1160,25 @@ pub fn format_wipe_confirmation(
     ));
     out.push('\n');
 
-    // Currently: clause.
+    // Currently: clause. The pre-spec form was `idle` OR `working on
+    // <change> (started <age> ago) — will be cancelled`. With a11 the
+    // marker may be present without a change (audit run, post-executor
+    // stage, recovery operation), so we surface the named change when
+    // available AND still warn that the in-flight work will be
+    // cancelled; otherwise we report the marker's classified
+    // `currently:` line as-is.
     let busy_clause = match &status.currently_busy {
-        Some(b) => {
-            let age = human_age_since(b.started_at);
+        Some(b) if !b.change.trim().is_empty() => {
+            let age = crate::busy_marker::format_age_human(currently_age_secs(b.started_at));
             format!(
                 "working on `{}` (started {age} ago) — will be cancelled",
                 slack_escape(&b.change)
             )
+        }
+        Some(_) => {
+            let inner = format_currently_line(status.currently_busy.as_ref());
+            let stripped = inner.strip_prefix("currently: ").unwrap_or(&inner);
+            format!("{stripped} — will be cancelled")
         }
         None => "idle".to_string(),
     };
@@ -1372,20 +1413,15 @@ fn menu_queue_segment(label: &str, list: &[String]) -> String {
     }
 }
 
-/// Busy clause for the per-repo menu section: `idle` when no busy marker
-/// is held, otherwise `working on <change> (started <age> ago)`. Change
-/// name passes through `slack_escape`.
+/// Busy clause for the per-repo menu section. Reuses the same branching
+/// rules as the per-repo `currently:` line so the bare-status menu and
+/// the detailed-status reply never disagree about whether a repo is
+/// idle, working on a change, running an audit, or sitting on a stale
+/// marker. The `currently: ` prefix is stripped — the menu's section
+/// header already implies "currently".
 fn menu_busy_clause(resp: &RepoStatusResponse) -> String {
-    match &resp.currently_busy {
-        None => "idle".to_string(),
-        Some(b) => {
-            let age = human_age_since(b.started_at);
-            format!(
-                "working on {} (started {age} ago)",
-                slack_escape(&b.change)
-            )
-        }
-    }
+    let line = format_currently_line(resp.currently_busy.as_ref());
+    line.strip_prefix("currently: ").unwrap_or(&line).to_string()
 }
 
 /// Last-iteration clause for the per-repo menu section: `no iteration
@@ -2633,6 +2669,135 @@ fn short_repo_label(url: &str) -> String {
 // Reply-formatting helpers (private)
 // ====================================================================
 
+/// Render the `currently:` line of the per-repo status reply by
+/// branching on the busy marker's contents per the a11 spec:
+///
+///   1. No marker present → `idle`.
+///   2. Marker present AND stale (dead pid OR age ≥ threshold per
+///      `a08`'s classification) → `stale marker from pid <pid>
+///      (age <age>, recovery <eligible-or-remaining>)`.
+///   3. Marker present AND `change` non-empty → `working on <change>
+///      (started <age> ago)`.
+///   4. Marker present AND `stage=executor` AND `change` empty AND an
+///      audit log matches the marker's `started_at` → `running audit
+///      <audit_type> (started <age> ago)`.
+///   5. Marker present AND `stage` ∈ {commit, review, push, pr} →
+///      `<stage> in progress (started <age> ago)`.
+///   6. Recovery-operation marker (no distinguishable stage today;
+///      reserved for future expansion) → `recovery in progress ...`.
+///   7. Fallback → `busy (stage=<stage>, started <age> ago)`.
+///
+/// The age format uses the busy-marker convention (`Xs` / `Xm` /
+/// `XhYm`) rather than the broader `human_age_duration` so older
+/// markers are reported as `2h17m ago` rather than `2h ago` — the
+/// stale-marker branch in particular needs the extra resolution so
+/// "stuck-feeling" markers' actual progress past the threshold is
+/// visible.
+pub fn format_currently_line(busy: Option<&BusySummary>) -> String {
+    let Some(b) = busy else {
+        return "currently: idle".to_string();
+    };
+    let age = currently_age_secs(b.started_at);
+    let age_human = crate::busy_marker::format_age_human(age);
+
+    // Step 2: stale-marker classification. The status surface mirrors
+    // `a08`'s acquire-time classification so an operator sees the same
+    // "this marker will be recovered" verdict the polling-loop's INFO
+    // log would emit on the next iteration. Note we deliberately do
+    // NOT consult the marker's `comm` field here — the status reply
+    // surfaces the operator-actionable view ("recovery will fire"),
+    // not the ambiguous PID-reuse case which never auto-recovers.
+    if !b.pid_alive {
+        return format!(
+            "currently: stale marker from pid {} (age {age_human}, recovery eligible now)",
+            b.pid
+        );
+    }
+    if b.stale_threshold_secs > 0 && age >= b.stale_threshold_secs {
+        return format!(
+            "currently: stale marker from pid {} (age {age_human}, threshold passed, recovery eligible next iteration)",
+            b.pid
+        );
+    }
+    if b.stale_threshold_secs > 0 {
+        // Heuristic: surface upcoming-recovery once the marker is past
+        // 80% of the threshold so "stuck-feeling" markers appear as
+        // visibly transitioning rather than as a wall of `working on
+        // ...` lines that suddenly flip to `stale marker`. The 80%
+        // cut-off is documented in the spec; if it ever moves, the
+        // CHATOPS.md example and the unit test for this branch both
+        // need updating in lock-step.
+        let warn_at = (b.stale_threshold_secs * 8) / 10;
+        if age > warn_at && age < b.stale_threshold_secs {
+            let remaining = b.stale_threshold_secs - age;
+            let remaining_human = crate::busy_marker::format_age_human(remaining);
+            return format!(
+                "currently: stale marker from pid {} (age {age_human}, recovery in {remaining_human})",
+                b.pid
+            );
+        }
+    }
+
+    // Step 3: change non-empty wins over stage-based variants — the
+    // operator wants to know the change slug before the lifecycle
+    // phase.
+    if !b.change.trim().is_empty() {
+        return format!(
+            "currently: working on {} (started {age_human} ago)",
+            slack_escape(&b.change)
+        );
+    }
+
+    // Step 4: audit-in-flight detection. `stage=executor` AND
+    // `change=""` is the marker shape the executor stamps after
+    // acquiring the marker but before the queue-walk selects a change
+    // (or while an audit runs against the workspace). The audit_type
+    // is resolved by the daemon at status-build time by matching the
+    // marker's `started_at` to an audit log filename. When the stage
+    // is executor but no audit matches, we fall through to the
+    // generic in-progress / fallback line below.
+    if b.stage == "executor"
+        && let Some(at) = &b.audit_type
+    {
+        return format!(
+            "currently: running audit {at} (started {age_human} ago)"
+        );
+    }
+
+    // Step 5: known post-executor lifecycle stage.
+    if matches!(b.stage.as_str(), "commit" | "review" | "push" | "pr") {
+        return format!(
+            "currently: {} in progress (started {age_human} ago)",
+            b.stage
+        );
+    }
+
+    // Step 6: recovery operations don't stamp distinguishable markers
+    // today (rebuild-specs and fork-recreation both run under the
+    // generic `executor` stage). Reserved for future expansion when
+    // those flows adopt their own stage variants.
+
+    // Step 7: fallback line for any unclassified marker shape — gives
+    // the operator the stage + age even when none of the branches
+    // above match.
+    format!(
+        "currently: busy (stage={}, started {age_human} ago)",
+        b.stage
+    )
+}
+
+/// Compute the age of a marker as a non-negative integer of seconds.
+/// Negative deltas (clock skew, future `started_at`) clamp to 0 so the
+/// formatter never emits a negative `-5s ago`.
+fn currently_age_secs(started_at: DateTime<Utc>) -> u64 {
+    let delta = Utc::now() - started_at;
+    if delta.num_seconds() < 0 {
+        0
+    } else {
+        delta.num_seconds() as u64
+    }
+}
+
 fn human_age_since(when: DateTime<Utc>) -> String {
     let delta = Utc::now() - when;
     human_age_duration(delta)
@@ -3564,6 +3729,11 @@ mod tests {
             currently_busy: Some(BusySummary {
                 change: "a05-foo".into(),
                 started_at: Utc::now() - chrono::Duration::minutes(2),
+                stage: "executor".into(),
+                pid: 4242,
+                stale_threshold_secs: 600,
+                pid_alive: true,
+                audit_type: None,
             }),
             ..RepoStatusResponse::default()
         };
@@ -3572,6 +3742,203 @@ mod tests {
             out.contains("currently: working on a05-foo (started 2m ago)"),
             "{out}"
         );
+    }
+
+    // ---------- format_currently_line: a11 variants ----------
+
+    fn busy(stage: &str, change: &str, started_secs_ago: i64) -> BusySummary {
+        BusySummary {
+            change: change.into(),
+            started_at: Utc::now() - chrono::Duration::seconds(started_secs_ago),
+            stage: stage.into(),
+            pid: 4242,
+            stale_threshold_secs: 600,
+            pid_alive: true,
+            audit_type: None,
+        }
+    }
+
+    #[test]
+    fn currently_line_idle_when_marker_absent() {
+        assert_eq!(format_currently_line(None), "currently: idle");
+    }
+
+    #[test]
+    fn currently_line_working_on_change_takes_priority_over_stage() {
+        // change non-empty wins even when stage is post-executor: the
+        // operator wants the change slug first.
+        let b = busy("commit", "a36-expense-tracking", 180);
+        assert_eq!(
+            format_currently_line(Some(&b)),
+            "currently: working on a36-expense-tracking (started 3m ago)"
+        );
+    }
+
+    #[test]
+    fn currently_line_running_audit_when_audit_type_resolved() {
+        // Threshold high enough that the marker isn't stale; the audit
+        // branch is what we're asserting here.
+        let mut b = busy("executor", "", 13 * 60);
+        b.stale_threshold_secs = 3600;
+        b.audit_type = Some("architecture_consultative".into());
+        assert_eq!(
+            format_currently_line(Some(&b)),
+            "currently: running audit architecture_consultative (started 13m ago)"
+        );
+    }
+
+    #[test]
+    fn currently_line_executor_without_audit_falls_through_to_fallback() {
+        // stage=executor + change empty + audit_type=None: step 4 (audit)
+        // fails to match, step 5 only covers {commit, review, push, pr},
+        // and steps 6 (recovery) isn't wired today — so the formatter
+        // lands on the step-7 fallback line.
+        let b = busy("executor", "", 30);
+        assert_eq!(
+            format_currently_line(Some(&b)),
+            "currently: busy (stage=executor, started 30s ago)"
+        );
+    }
+
+    #[test]
+    fn currently_line_post_executor_stage_in_progress() {
+        for (stage, label) in [
+            ("commit", "commit"),
+            ("review", "review"),
+            ("push", "push"),
+            ("pr", "pr"),
+        ] {
+            let b = busy(stage, "", 12);
+            let line = format_currently_line(Some(&b));
+            assert_eq!(
+                line,
+                format!("currently: {label} in progress (started 12s ago)")
+            );
+        }
+    }
+
+    #[test]
+    fn currently_line_stale_marker_dead_pid_is_eligible_now() {
+        let mut b = busy("executor", "", 53 * 60);
+        b.pid = 490170;
+        b.pid_alive = false;
+        assert_eq!(
+            format_currently_line(Some(&b)),
+            "currently: stale marker from pid 490170 (age 53m, recovery eligible now)"
+        );
+    }
+
+    #[test]
+    fn currently_line_stale_marker_live_pid_past_threshold_eligible_next_iteration() {
+        let mut b = busy("executor", "", 700);
+        b.pid = 490170;
+        b.stale_threshold_secs = 600;
+        b.pid_alive = true;
+        assert_eq!(
+            format_currently_line(Some(&b)),
+            "currently: stale marker from pid 490170 (age 11m, threshold passed, recovery eligible next iteration)"
+        );
+    }
+
+    #[test]
+    fn currently_line_stale_marker_approaching_threshold_surfaces_remaining_time() {
+        // age > 80% of threshold AND age < threshold → surface the
+        // upcoming recovery. Threshold=600s, age=540s → remaining=60s.
+        let mut b = busy("executor", "", 540);
+        b.pid = 490170;
+        b.stale_threshold_secs = 600;
+        b.pid_alive = true;
+        assert_eq!(
+            format_currently_line(Some(&b)),
+            "currently: stale marker from pid 490170 (age 9m, recovery in 1m)"
+        );
+    }
+
+    #[test]
+    fn currently_line_change_branch_does_not_get_stale_treatment_when_fresh() {
+        // Live pid AND age well under threshold → no stale-marker
+        // branch, just the working-on line.
+        let mut b = busy("executor", "a05-foo", 120);
+        b.stale_threshold_secs = 600;
+        assert_eq!(
+            format_currently_line(Some(&b)),
+            "currently: working on a05-foo (started 2m ago)"
+        );
+    }
+
+    #[test]
+    fn currently_line_stale_dead_pid_wins_over_working_on_change() {
+        // Even with a change set, a dead-pid marker is unactionable and
+        // the operator needs to see "stale" first.
+        let mut b = busy("executor", "a05-foo", 30);
+        b.pid = 12345;
+        b.pid_alive = false;
+        let out = format_currently_line(Some(&b));
+        assert!(
+            out.starts_with("currently: stale marker from pid 12345"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn currently_line_fallback_for_unknown_stage() {
+        // Defensive fallback: a marker with an unknown stage value
+        // (forward-compat from a newer daemon writing into an older
+        // status code path) still renders something useful.
+        let b = busy("rebuild_specs", "", 45);
+        assert_eq!(
+            format_currently_line(Some(&b)),
+            "currently: busy (stage=rebuild_specs, started 45s ago)"
+        );
+    }
+
+    #[test]
+    fn currently_line_change_escapes_slack_specials() {
+        let b = busy("executor", "<bad>", 60);
+        let out = format_currently_line(Some(&b));
+        assert!(out.contains("&lt;bad&gt;"), "{out}");
+        assert!(!out.contains("<bad>"), "raw `<bad>` must not leak: {out}");
+    }
+
+    #[test]
+    fn currently_line_age_uses_hours_plus_minutes_for_long_ages() {
+        // Older convention asked for `XhYm` resolution on the currently
+        // line so an operator reading "stale marker" sees a meaningful
+        // age past 1h.
+        let mut b = busy("executor", "", 8_220); // 2h17m
+        b.pid = 1;
+        b.pid_alive = false;
+        let out = format_currently_line(Some(&b));
+        assert!(out.contains("age 2h17m"), "{out}");
+    }
+
+    #[test]
+    fn currently_line_zero_threshold_disables_stale_branches() {
+        // stale_threshold_secs=0 → only the dead-pid branch can flag
+        // stale; live + old marker stays in its stage-based branch.
+        // For stage=push (in the step-5 set), the line is "push in
+        // progress" even at a wall-clock age that would otherwise
+        // exceed any sane threshold.
+        let mut b = busy("push", "", 9_999);
+        b.stale_threshold_secs = 0;
+        b.pid_alive = true;
+        let out = format_currently_line(Some(&b));
+        assert!(
+            !out.contains("stale marker"),
+            "threshold=0 must not synthesize a stale-marker line: {out}"
+        );
+        assert!(out.contains("push in progress"), "{out}");
+    }
+
+    #[test]
+    fn currently_line_recovery_remaining_format_matches_age_convention() {
+        // Threshold 1800 (30m), age 1620 (27m) → remaining 180s = 3m.
+        let mut b = busy("executor", "", 1620);
+        b.pid = 12345;
+        b.stale_threshold_secs = 1800;
+        b.pid_alive = true;
+        let out = format_currently_line(Some(&b));
+        assert!(out.contains("recovery in 3m"), "{out}");
     }
 
     #[test]
@@ -4543,6 +4910,11 @@ mod tests {
             currently_busy: Some(BusySummary {
                 change: "audit-proposal-self-validation".into(),
                 started_at: started_5m_ago,
+                stage: "executor".into(),
+                pid: 4242,
+                stale_threshold_secs: 600,
+                pid_alive: true,
+                audit_type: None,
             }),
             pending_changes: vec!["pr-body-tweak".into(), "queue-archive".into()],
             waiting_changes: vec![],
@@ -4963,6 +5335,11 @@ mod tests {
             currently_busy: Some(BusySummary {
                 change: "a05-foo".into(),
                 started_at: Utc::now() - chrono::Duration::minutes(2),
+                stage: "executor".into(),
+                pid: 4242,
+                stale_threshold_secs: 600,
+                pid_alive: true,
+                audit_type: None,
             }),
             ..RepoStatusResponse::default()
         };
@@ -5111,6 +5488,11 @@ mod tests {
             currently_busy: Some(BusySummary {
                 change: "<also-bad>".into(),
                 started_at: Utc::now() - chrono::Duration::minutes(1),
+                stage: "executor".into(),
+                pid: 4242,
+                stale_threshold_secs: 600,
+                pid_alive: true,
+                audit_type: None,
             }),
             ..RepoStatusResponse::default()
         };

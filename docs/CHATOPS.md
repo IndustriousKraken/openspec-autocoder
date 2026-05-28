@@ -242,7 +242,7 @@ A small set of admin verbs handles the SSH-and-edit recovery actions from chat i
 
 | Verb | Syntax | What it does |
 | --- | --- | --- |
-| `status` | `@<bot> status <repo-substring>` | Posts a multi-line threaded reply with five always-present sections — branches, last commit on each branch, latest PR from the agent branch, currently-busy state (`idle` or `working on <change>`), and the next-iteration estimate — followed by any active markers, currently-engaged 24h alert throttles, and the queue snapshot (compact one-liner when small, per-line when any list exceeds five entries). When called without `<repo-substring>`, returns a per-repo menu listing every watched repository. |
+| `status` | `@<bot> status <repo-substring>` | Posts a multi-line threaded reply with five always-present sections — branches, last commit on each branch, latest PR from the agent branch, currently-busy state (one of `idle`, `working on <change>`, `running audit <type>`, `<stage> in progress`, `stale marker from pid <pid>`, or the unclassified-fallback `busy (stage=<stage>)` — see [`currently:` line variants](#currently-line-variants) below), and the next-iteration estimate — followed by any active markers, currently-engaged 24h alert throttles, and the queue snapshot (compact one-liner when small, per-line when any list exceeds five entries). When called without `<repo-substring>`, returns a per-repo menu listing every watched repository. |
 | `clear-perma-stuck` | `@<bot> clear-perma-stuck <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.perma-stuck.json`. The next iteration will retry the change. |
 | `clear-revision` | `@<bot> clear-revision <repo-substring> <change-slug>` | Deletes `openspec/changes/<change>/.needs-spec-revision.json`. Use after you've edited `tasks.md` to remove or revise the unimplementable tasks. |
 | `wipe-workspace` | `@<bot> wipe-workspace <repo-substring>` | Destructive: removes the entire `<cache_dir>/workspaces/<sanitized-url>/` directory so the next iteration re-clones. Requires two-step confirmation (see below). |
@@ -253,7 +253,7 @@ The verbs `pause`, `resume`, and `clear-alert-throttle` are intentionally not in
 
 ### Bare `status` — the per-repo menu
 
-When you don't remember the exact substring of a configured repo, type `@<bot> status` with no arguments. The bot returns a one-line announcement followed by one two-line section per watched repository (URL on top, summary on the next line). The summary has three clauses joined by ` · `: a queue clause (`empty queue` when all three counts are zero, otherwise `<N> pending (<list>), <M> waiting (<list>), <K> excluded` with each list truncating after 5 entries), a busy clause (`idle` or `working on <change> (started <age> ago)`), and a last-iteration clause (`last iteration <age> ago` or `no iteration yet`). Example:
+When you don't remember the exact substring of a configured repo, type `@<bot> status` with no arguments. The bot returns a one-line announcement followed by one two-line section per watched repository (URL on top, summary on the next line). The summary has three clauses joined by ` · `: a queue clause (`empty queue` when all three counts are zero, otherwise `<N> pending (<list>), <M> waiting (<list>), <K> excluded` with each list truncating after 5 entries), a busy clause matching the per-repo `currently:` line variants (`idle`, `working on <change> (started <age> ago)`, `running audit <type> (started <age> ago)`, `<stage> in progress (started <age> ago)`, `stale marker from pid <pid> (...)`, or the unclassified-fallback `busy (stage=<stage>, ...)` — see [`currently:` line variants](#currently-line-variants)), and a last-iteration clause (`last iteration <age> ago` or `no iteration yet`). Example:
 
 ```
 📊 Watching 3 repositories. Reply `@<bot> status <repo-substring>` for details.
@@ -288,7 +288,7 @@ Reply 'confirm' within 60 seconds to proceed.
 
 What each section means:
 
-- **`Currently:`** — `idle` when no busy marker exists; `working on <change> (started <age> ago) — will be cancelled` when the daemon is mid-iteration. Always present so you see what state the wipe is acting on.
+- **`Currently:`** — `idle` when no busy marker exists; `working on <change> (started <age> ago) — will be cancelled` when the daemon is mid-iteration on a named change. When the daemon is busy without a named change (audit run, post-executor stage, recovery operation, or a stale marker), the line mirrors the per-repo `currently:` variants (`running audit <type> ... — will be cancelled`, `stale marker from pid <pid> ... — will be cancelled`, etc.). Always present so you see what state the wipe is acting on.
 - **`Queue (continues after wipe):`** — one-line summary in the same compact form as `status`'s queue clause. Collapses to `Queue (continues after wipe): empty queue` when pending, waiting, and excluded categories are all zero. The queue is preserved across the wipe: only the workspace directory is deleted; the daemon's per-repo state continues.
 - **`Active markers (git-tracked; preserved across the wipe):`** — only present when at least one `.perma-stuck.json` or `.needs-spec-revision.json` marker file exists. The "git-tracked; preserved" note reassures you the wipe does not lose marker state — markers are part of the repository tree and return from origin on the next re-clone.
 
@@ -326,6 +326,35 @@ latest PR: #42 "a08-foo: add deployment hook"  open · head=agent-q · 11m ago
 currently: working on a09-bar (started 2m ago)
 queue: 1 pending (a10-baz), 0 waiting, 0 excluded
 ```
+
+#### `currently:` line variants
+
+The `currently:` line surfaces the daemon's live busy-marker contents. It distinguishes between "truly idle," "working on a named change," "running an audit," "in a post-executor lifecycle phase," and "stale marker awaiting recovery" so an operator wondering why a pending change isn't being picked up can read the line and tell exactly what the daemon is doing:
+
+```
+currently: idle
+currently: working on a36-expense-tracking (started 3m ago)
+currently: running audit architecture_consultative (started 14m ago)
+currently: commit in progress (started 12s ago)
+currently: push in progress (started 8s ago)
+currently: stale marker from pid 490170 (age 9m, recovery in 1m)
+currently: stale marker from pid 490170 (age 11m40s, threshold passed, recovery eligible next iteration)
+currently: stale marker from pid 490170 (age 53m, recovery eligible now)
+currently: busy (stage=executor, started 30s ago)
+```
+
+The variants are computed by branching on the marker's contents in this priority order:
+
+1. **No marker present** → `idle`.
+2. **Marker present and stale** (dead pid OR age ≥ `executor.busy_marker_stale_threshold_secs`) → `stale marker from pid <pid> (age <age>, recovery <eligible-or-remaining>)`. Three sub-shapes: `recovery eligible now` when the recorded PID is no longer in `/proc` (recovery fires immediately on the next iteration); `threshold passed, recovery eligible next iteration` when the PID is still alive but past the threshold (SIGTERM fires on the next iteration per the busy-marker recovery flow); `recovery in <duration>` when the marker is past 80% of the threshold but not yet at it (recovery is upcoming, so operators see "stuck-feeling" markers as visibly transitioning rather than permanent).
+3. **Marker present and `change` non-empty** → `working on <change> (started <age> ago)`. The change branch wins over the stage-based variants because the operator wants to know the change slug before the lifecycle phase.
+4. **Marker present, `stage=executor`, `change` empty, and an audit log matches the marker's `started_at`** → `running audit <audit_type> (started <age> ago)`. The audit_type is parsed from the matching audit-log filename under `<logs_dir>/runs/<workspace>/audits/`.
+5. **Marker present and `stage` ∈ `{commit, review, push, pr}`** → `<stage> in progress (started <age> ago)`. Names the lifecycle phase so the operator sees which post-executor step is in flight.
+6. **Marker present but unclassifiable** (e.g. `stage=executor` with no matching audit log) → `busy (stage=<stage>, started <age> ago)` fallback.
+
+Why this matters: pre-spec, the line collapsed every non-`change` busy state into a misleading `currently: idle`, so an operator hitting "status myrepo" during an audit run would see `currently: idle` plus a non-empty queue and have no idea why the pending change wasn't being picked up. With the surfaced variants, the operator can distinguish "audit in flight, just wait" from "stale marker, need recovery to fire (or manual `rm`)" from "truly idle, something else is wrong." The busy-marker classification logic the stale-marker branches mirror is documented in [OPERATIONS.md](OPERATIONS.md)'s busy-marker section; the immediate-fix-by-hand path for a stale marker is in [TROUBLESHOOTING.md](TROUBLESHOOTING.md)'s stale-marker section.
+
+The age formatting matches the busy-marker convention: `Xs` under 1 minute, `Xm` under 1 hour, `XhYm` past 1 hour. Older "stuck-feeling" markers like `2h17m ago` retain their minute resolution so the operator can see meaningful progress.
 
 Branches and the busy-marker line are always present. `(none)` fills any always-present field whose underlying data is absent (fresh clone, no PR ever opened, etc.). If the GitHub API call fails or local `git log` errors, the affected line falls back to `(none)` and a WARN is logged — the reply still ships every other section so an operator can read the local-state half during a GitHub incident. The queue line uses the compact one-liner form when each of `pending` / `waiting` / `excluded` has ≤5 entries; larger lists fall back to the multi-line `queue snapshot:` format. Commit subjects and PR titles pass through a Slack-escape pass so author-supplied text like `<!channel>` cannot trigger channel-wide mentions when echoed into the reply.
 

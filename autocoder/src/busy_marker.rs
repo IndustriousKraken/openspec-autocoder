@@ -217,33 +217,102 @@ pub fn update_change(workspace: &Path, change: &str) {
     }
 }
 
-/// Read-only peek at the busy-marker file for `workspace`. Returns
-/// `Some(BusySummary)` with the recorded change slug and the marker
-/// file's mtime as `started_at` when a marker file exists AND has a
-/// non-empty `change` field; returns `None` when the file is absent,
-/// unreadable, malformed, or its `change` field is empty (acquired but
-/// no change selected yet).
+/// Read-only peek at the busy-marker file for `workspace`. Returns a
+/// `BusySummary` whenever the marker file exists AND parses — including
+/// the `change`-empty case (audit run, post-executor stage, etc.) so the
+/// chatops `status <repo>` reply can distinguish "audit in flight" from
+/// "stale marker" from "truly idle". The pre-spec implementation
+/// returned `None` for an empty-`change` marker, which collapsed every
+/// non-`change` busy state into a misleading `currently: idle`.
+///
+/// `stale_threshold_secs` is the daemon's
+/// `executor.busy_marker_stale_threshold_secs()` — the status formatter
+/// uses it to decide whether to surface the stale-marker variant of
+/// the `currently:` line. Pass 0 from callers that don't have access
+/// to the config snapshot (the formatter then skips the threshold
+/// branches and falls through to the normal in-progress / working-on
+/// branches).
 ///
 /// Does NOT take, hold, or release the marker — purely informational.
-/// Used by the chatops `status <repo>` verb to render the
-/// `currently: working on <change>` line.
 pub fn current(
     workspace: &Path,
+    stale_threshold_secs: u64,
+) -> Option<crate::chatops::operator_commands::BusySummary> {
+    current_with(workspace, stale_threshold_secs, &RealProcessOps)
+}
+
+/// Test-injectable variant of [`current`]. `ops` is used for the PID-
+/// liveness check so unit tests can simulate "dead pid" without having
+/// to find or kill a real process.
+pub fn current_with(
+    workspace: &Path,
+    stale_threshold_secs: u64,
+    ops: &dyn ProcessOps,
 ) -> Option<crate::chatops::operator_commands::BusySummary> {
     let path = marker_path(workspace);
     let raw = std::fs::read_to_string(&path).ok()?;
     let marker: BusyMarker = serde_json::from_str(&raw).ok()?;
-    if marker.change.trim().is_empty() {
-        return None;
-    }
-    let mtime = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok()?;
-    let started_at: chrono::DateTime<chrono::Utc> = mtime.into();
+    let pid_alive = ops.pid_alive(marker.pid);
+    let audit_type = if marker.stage == Stage::Executor && marker.change.trim().is_empty() {
+        find_audit_for_marker(workspace, marker.started_at)
+    } else {
+        None
+    };
     Some(crate::chatops::operator_commands::BusySummary {
         change: marker.change,
-        started_at,
+        started_at: marker.started_at,
+        stage: marker.stage.as_str().to_string(),
+        pid: marker.pid,
+        stale_threshold_secs,
+        pid_alive,
+        audit_type,
     })
+}
+
+/// Scan `<logs_dir>/runs/<workspace-basename>/audits/` for a log file
+/// whose filename's RFC3339 timestamp matches `started_at` (within ±1s
+/// of clock-skew tolerance). The filename shape is
+/// `<audit_type>-<RFC3339-with-Z-and-':'-as-'-'>.log` (see
+/// `AuditLogWriter::open`). Returns the audit_type segment on match,
+/// `None` when no log matches.
+///
+/// `None` is the common case for a `stage=executor` marker that is NOT
+/// associated with an audit run (e.g. the daemon is between change
+/// selection and the audit-scheduler step); the formatter then falls
+/// through to the generic `executor in progress` line.
+fn find_audit_for_marker(
+    workspace: &Path,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let basename = workspace.file_name().and_then(|n| n.to_str())?;
+    let dir = crate::paths::current().audit_logs_dir(basename);
+    let entries = std::fs::read_dir(&dir).ok()?;
+    // Candidate safe-timestamps: marker_started_at ± 1 second. Audit
+    // log files are opened immediately after the marker is stamped, so
+    // the timestamps usually differ by < 1s in practice; the ±1s
+    // window covers wall-clock drift between marker write and log
+    // open without false matches across distinct audit runs.
+    let candidates: Vec<String> = (-1i64..=1i64)
+        .map(|delta| {
+            (started_at + chrono::Duration::seconds(delta))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                .replace(':', "-")
+        })
+        .collect();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else { continue };
+        let Some(stem) = name_str.strip_suffix(".log") else { continue };
+        for candidate in &candidates {
+            if let Some(prefix) = stem.strip_suffix(candidate.as_str())
+                && let Some(audit_type) = prefix.strip_suffix('-')
+                && !audit_type.is_empty()
+            {
+                return Some(audit_type.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Best-effort read of the subprocess-sidecar file. Returns `None` if the
@@ -989,39 +1058,49 @@ mod tests {
     #[test]
     fn current_returns_none_when_marker_absent() {
         let (_dir, ws) = fixture_workspace();
-        assert!(current(&ws).is_none());
+        assert!(current(&ws, 600).is_none());
     }
 
     #[test]
-    fn current_returns_none_when_change_empty() {
+    fn current_returns_some_with_empty_change_when_change_unset() {
         let (_dir, ws) = fixture_workspace();
-        // Acquire to drop a marker; change defaults to empty.
+        // Acquire to drop a marker; change defaults to empty. Per the
+        // a11 spec the peek MUST still return Some so the status reply
+        // can surface the marker's actual contents (audit run,
+        // post-executor stage, etc.) instead of misleadingly
+        // collapsing to `currently: idle`.
         let _guard = match try_acquire(&ws, "git@github.com:test/repo.git", 1800).unwrap() {
             AcquireOutcome::Acquired(g) => g,
             _ => panic!("acquire failed"),
         };
-        // Marker exists but change is empty → peek returns None so the
-        // status formatter renders `currently: idle`.
-        assert!(current(&ws).is_none());
+        let summary = current(&ws, 600).expect("current must return Some for any present marker");
+        assert!(summary.change.is_empty());
+        assert_eq!(summary.stage, "executor");
+        assert_eq!(summary.pid, std::process::id());
+        assert_eq!(summary.stale_threshold_secs, 600);
+        // The live test process MUST be alive, so the formatter will not
+        // pick the stale branch on this fixture.
+        assert!(summary.pid_alive);
     }
 
     #[test]
-    fn current_reports_change_and_mtime_when_set() {
+    fn current_reports_change_and_started_at_when_set() {
         let (_dir, ws) = fixture_workspace();
         let _guard = match try_acquire(&ws, "git@github.com:test/repo.git", 1800).unwrap() {
             AcquireOutcome::Acquired(g) => g,
             _ => panic!("acquire failed"),
         };
         update_change(&ws, "a05-foo");
-        let summary = current(&ws).expect("current must return Some after update_change");
+        let summary = current(&ws, 600).expect("current must return Some after update_change");
         assert_eq!(summary.change, "a05-foo");
-        // mtime is "very recent" — within the last minute should be a
-        // safe wide window for CI clock skew.
+        // started_at is the marker's recorded RFC3339 timestamp; on the
+        // happy path it's "very recent" — within the last minute should
+        // be a safe wide window for CI clock skew.
         let now = chrono::Utc::now();
         let delta = now - summary.started_at;
         assert!(
             delta.num_seconds().abs() < 60,
-            "started_at should be ~now (mtime of marker); delta = {delta}"
+            "started_at should be ~now; delta = {delta}"
         );
     }
 
@@ -1035,7 +1114,7 @@ mod tests {
         update_change(&ws, "a05-foo");
         let marker_before = marker_path(&ws);
         assert!(marker_before.exists());
-        let _ = current(&ws);
+        let _ = current(&ws, 600);
         // Peek MUST NOT remove the marker.
         assert!(
             marker_before.exists(),
@@ -1043,6 +1122,87 @@ mod tests {
         );
         // Guard still holds the marker; dropping it cleans up normally.
         drop(guard);
+    }
+
+    #[test]
+    fn current_finds_audit_type_when_log_timestamp_matches() {
+        let (_dir, ws) = fixture_workspace();
+        // Pre-populate a marker with a known started_at, then drop a
+        // matching audit log next to it so current() can find_audit_for_marker
+        // and surface the audit_type on the summary.
+        let started = chrono::Utc::now() - chrono::Duration::seconds(180);
+        let safe_ts = started
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            .replace(':', "-");
+        let basename = ws.file_name().unwrap().to_str().unwrap().to_string();
+        let logs_dir = crate::paths::current().audit_logs_dir(&basename);
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let log_path = logs_dir.join(format!("architecture_consultative-{safe_ts}.log"));
+        std::fs::write(&log_path, "").unwrap();
+        let path = marker_path(&ws);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let marker = BusyMarker {
+            repo_url: "git@github.com:test/repo.git".into(),
+            pid: std::process::id(),
+            pgid: 1234,
+            comm: "claude".into(),
+            started_at: started,
+            stage: Stage::Executor,
+            change: String::new(),
+        };
+        write_atomic(&path, &marker).unwrap();
+        let summary = current(&ws, 600).expect("marker present");
+        assert_eq!(summary.audit_type.as_deref(), Some("architecture_consultative"));
+        // Cleanup so this fixture doesn't bleed into other tests sharing
+        // the same logs root.
+        let _ = std::fs::remove_file(&log_path);
+        let _ = std::fs::remove_file(marker_path(&ws));
+    }
+
+    #[test]
+    fn current_audit_type_none_when_no_log_matches() {
+        let (_dir, ws) = fixture_workspace();
+        let started = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let path = marker_path(&ws);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let marker = BusyMarker {
+            repo_url: "git@github.com:test/repo.git".into(),
+            pid: std::process::id(),
+            pgid: 1234,
+            comm: "claude".into(),
+            started_at: started,
+            stage: Stage::Executor,
+            change: String::new(),
+        };
+        write_atomic(&path, &marker).unwrap();
+        let summary = current(&ws, 600).expect("marker present");
+        assert!(summary.audit_type.is_none());
+        let _ = std::fs::remove_file(marker_path(&ws));
+    }
+
+    #[test]
+    fn current_audit_type_skipped_when_change_present() {
+        let (_dir, ws) = fixture_workspace();
+        // Marker with stage=executor BUT change non-empty: the audit
+        // branch is skipped and audit_type stays None. Belt-and-braces
+        // since the formatter's "change non-empty" branch wins anyway.
+        let started = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let path = marker_path(&ws);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let marker = BusyMarker {
+            repo_url: "git@github.com:test/repo.git".into(),
+            pid: std::process::id(),
+            pgid: 1234,
+            comm: "claude".into(),
+            started_at: started,
+            stage: Stage::Executor,
+            change: "a36-expense-tracking".into(),
+        };
+        write_atomic(&path, &marker).unwrap();
+        let summary = current(&ws, 600).expect("marker present");
+        assert_eq!(summary.change, "a36-expense-tracking");
+        assert!(summary.audit_type.is_none());
+        let _ = std::fs::remove_file(marker_path(&ws));
     }
 
     // -----------------------------------------------------------------
