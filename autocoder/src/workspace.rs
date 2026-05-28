@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 /// under the system temp dir, preserving pre-`DaemonPaths` behavior for
 /// existing test fixtures.
 pub fn workspace_root() -> PathBuf {
-    paths::current().cache.join("workspaces")
+    paths::current().workspaces_dir()
 }
 
 /// Derive a per-repo workspace path under `<cache_dir>/workspaces/`.

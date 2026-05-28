@@ -52,6 +52,92 @@ impl DaemonPaths {
             runtime: root.join("runtime"),
         }
     }
+
+    // ----- Per-state-shape helpers -----
+    //
+    // Every daemon-side state-file read OR write must route through one
+    // of these helpers (or through the four bare `state`/`cache`/`logs`/
+    // `runtime` fields when no shape-specific helper exists). The
+    // `path_literals_audit` integration test enforces this rule against
+    // the legacy hard-coded path prefix — adding a new state-file shape
+    // means adding a helper here, not hard-coding a path at the call
+    // site.
+    //
+    // `#[allow(dead_code)]` on the helpers that no production callsite
+    // exercises yet: they're forward-looking API surface for state-shape
+    // modules whose existing `(state_dir_root: &Path)` APIs will route
+    // through DaemonPaths in a follow-up refactor. The unit tests in
+    // this file exercise every helper.
+
+    /// `<state>/audit-threads/` — per-`thread_ts` state files for the
+    /// `audit-reply-acts` (send-it) flow.
+    #[allow(dead_code)]
+    pub fn audit_threads_dir(&self) -> PathBuf {
+        self.state.join("audit-threads")
+    }
+
+    /// `<runtime>/busy/` — per-workspace busy-marker JSON files and
+    /// their subprocess sidecar PIDs.
+    pub fn busy_markers_dir(&self) -> PathBuf {
+        self.runtime.join("busy")
+    }
+
+    /// `<state>/proposal-requests/` — per-`request_id` state files for
+    /// the `chat-request-triage` (propose) flow.
+    #[allow(dead_code)]
+    pub fn proposal_requests_dir(&self) -> PathBuf {
+        self.state.join("proposal-requests")
+    }
+
+    /// `<state>/changelog-requests/` — per-`request_id` state files for
+    /// the changelog-stylist flow.
+    #[allow(dead_code)]
+    pub fn changelog_requests_dir(&self) -> PathBuf {
+        self.state.join("changelog-requests")
+    }
+
+    /// `<state>/failure-state/` — per-repo failure counters keyed by
+    /// workspace basename.
+    #[allow(dead_code)]
+    pub fn failure_state_dir(&self) -> PathBuf {
+        self.state.join("failure-state")
+    }
+
+    /// `<state>/revisions/` — per-PR reviewer-revision state keyed by
+    /// workspace basename.
+    #[allow(dead_code)]
+    pub fn revisions_dir(&self) -> PathBuf {
+        self.state.join("revisions")
+    }
+
+    /// `<state>/audit-state/` — per-audit-type cadence + last-run state.
+    #[allow(dead_code)]
+    pub fn audit_state_dir(&self) -> PathBuf {
+        self.state.join("audit-state")
+    }
+
+    /// `<logs>/runs/<basename>/` — per-change run logs for the named
+    /// workspace.
+    pub fn run_logs_dir(&self, workspace_basename: &str) -> PathBuf {
+        self.logs.join("runs").join(workspace_basename)
+    }
+
+    /// `<logs>/runs/<basename>/audits/` — per-invocation audit logs
+    /// for the named workspace.
+    pub fn audit_logs_dir(&self, workspace_basename: &str) -> PathBuf {
+        self.run_logs_dir(workspace_basename).join("audits")
+    }
+
+    /// `<cache>/workspaces/` — per-repo cloned workspaces, keyed by
+    /// URL-sanitized basename.
+    pub fn workspaces_dir(&self) -> PathBuf {
+        self.cache.join("workspaces")
+    }
+
+    /// `<runtime>/control.sock` — the daemon's control socket.
+    pub fn control_socket_path(&self) -> PathBuf {
+        self.runtime.join("control.sock")
+    }
 }
 
 /// Resolve the four daemon paths from the (possibly partial) config
@@ -528,5 +614,52 @@ mod tests {
         assert_eq!(p.cache, PathBuf::from("/tmp/x/cache"));
         assert_eq!(p.logs, PathBuf::from("/tmp/x/logs"));
         assert_eq!(p.runtime, PathBuf::from("/tmp/x/runtime"));
+    }
+
+    /// Every per-state-shape helper composes a fixed subdirectory off
+    /// the appropriate root. Regression guard: if a helper is moved to
+    /// a different root or renamed, this test flags the change so the
+    /// matching docs (STATE-LAYOUT.md) and the audit test's allowlist
+    /// can be updated in lock-step.
+    #[test]
+    fn per_shape_helpers_resolve_under_expected_roots() {
+        let p = DaemonPaths {
+            state: PathBuf::from("/srv/state"),
+            cache: PathBuf::from("/srv/cache"),
+            logs: PathBuf::from("/srv/logs"),
+            runtime: PathBuf::from("/srv/runtime"),
+        };
+        assert_eq!(p.audit_threads_dir(), PathBuf::from("/srv/state/audit-threads"));
+        assert_eq!(p.busy_markers_dir(), PathBuf::from("/srv/runtime/busy"));
+        assert_eq!(
+            p.proposal_requests_dir(),
+            PathBuf::from("/srv/state/proposal-requests")
+        );
+        assert_eq!(
+            p.changelog_requests_dir(),
+            PathBuf::from("/srv/state/changelog-requests")
+        );
+        assert_eq!(
+            p.failure_state_dir(),
+            PathBuf::from("/srv/state/failure-state")
+        );
+        assert_eq!(p.revisions_dir(), PathBuf::from("/srv/state/revisions"));
+        assert_eq!(p.audit_state_dir(), PathBuf::from("/srv/state/audit-state"));
+        assert_eq!(
+            p.run_logs_dir("github_com_owner_repo"),
+            PathBuf::from("/srv/logs/runs/github_com_owner_repo")
+        );
+        assert_eq!(
+            p.audit_logs_dir("github_com_owner_repo"),
+            PathBuf::from("/srv/logs/runs/github_com_owner_repo/audits")
+        );
+        assert_eq!(
+            p.workspaces_dir(),
+            PathBuf::from("/srv/cache/workspaces")
+        );
+        assert_eq!(
+            p.control_socket_path(),
+            PathBuf::from("/srv/runtime/control.sock")
+        );
     }
 }

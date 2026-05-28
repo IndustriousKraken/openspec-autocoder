@@ -113,6 +113,8 @@ sudo systemctl start autocoder
 
 The per-change run logs (`<logs_dir>/runs/<basename>/<change>.log`) and the busy markers share the same daemon-paths root.
 
+If you're seeing operator-visible inconsistencies between writers and readers (`status` says idle while the busy marker exists; `send it` returns `?` on a real audit thread), check `journalctl` AND the resolved paths the daemon is using — this class of bug is prevented going forward by the `path_literals_audit` CI test introduced in `a09`, which fails the build on any new hard-coded `/tmp/autocoder/` literal in `autocoder/src/`. See [`docs/STATE-LAYOUT.md`](STATE-LAYOUT.md#path-resolution-rule) for the resolver-only rule.
+
 ## Per-change run log shape
 
 Each iteration writes a per-change log at `<logs_dir>/runs/<workspace-basename>/<change>.log`. The default shape (with `executor.output_format: json`) splits the log into four sections so operators can quickly judge what the agent was doing without scrolling through the raw JSON event stream:

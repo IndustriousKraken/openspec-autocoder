@@ -1,11 +1,11 @@
 ## 1. Sweep the codebase
 
-- [ ] 1.1 Run `grep -rn '/tmp/autocoder' autocoder/src/` AND collect every hit into a working list.
-- [ ] 1.2 For each hit, classify:
+- [x] 1.1 Run `grep -rn '/tmp/autocoder' autocoder/src/` AND collect every hit into a working list.
+- [x] 1.2 For each hit, classify:
   - **Category A: hard-coded read or write path.** Replace with a `DaemonPaths` call.
   - **Category B: legacy-path reference for migration.** Keep AS-IS; add to the CI check's allowlist with a comment.
   - **Category C: test code.** Move to per-test tempdirs (this overlaps with `a10`; if `a10` lands first, this category is empty).
-- [ ] 1.3 The expected categories of A hits (the swept fixes):
+- [x] 1.3 The expected categories of A hits (the swept fixes):
   - Audit-thread state reader/writer.
   - Busy-marker reader (writers should already be correct per the state-paths-out-of-tmp spec).
   - Failure-state reader/writer (verify per-workspace path resolution).
@@ -17,7 +17,7 @@
 
 ## 2. Extend `DaemonPaths` with missing helpers
 
-- [ ] 2.1 In `autocoder/src/paths.rs` (or wherever `DaemonPaths` lives), add helper methods for every state-file category surfaced by the sweep. Pattern:
+- [x] 2.1 In `autocoder/src/paths.rs` (or wherever `DaemonPaths` lives), add helper methods for every state-file category surfaced by the sweep. Pattern:
   ```rust
   impl DaemonPaths {
       pub fn audit_threads_dir(&self) -> PathBuf { self.state_dir().join("audit-threads") }
@@ -34,24 +34,24 @@
       // ... add more as needed per the sweep
   }
   ```
-- [ ] 2.2 Each new helper returns the directory; callers append the per-entry filename themselves (avoids needing one helper per file).
-- [ ] 2.3 Tests: each helper returns the expected path for a fixture `DaemonPaths` instance.
+- [x] 2.2 Each new helper returns the directory; callers append the per-entry filename themselves (avoids needing one helper per file).
+- [x] 2.3 Tests: each helper returns the expected path for a fixture `DaemonPaths` instance.
 
 ## 3. Replace literals with helpers (the sweep fixes)
 
-- [ ] 3.1 For each Category A hit from §1.2, edit the file to call the appropriate helper. Pattern:
+- [x] 3.1 For each Category A hit from §1.2, edit the file to call the appropriate helper. Pattern:
   ```rust
   // Before:
   let path = Path::new("/tmp/autocoder/audit-threads").join(format!("{ts}.json"));
   // After:
   let path = paths.audit_threads_dir().join(format!("{ts}.json"));
   ```
-- [ ] 3.2 Where the function doesn't yet receive `DaemonPaths` (or an equivalent), thread it through. Most code paths that need state files already have access to the daemon's path resolver via an existing struct (e.g., the polling loop has the daemon-paths reference in its context).
-- [ ] 3.3 Run `cargo test` after each batch of edits to confirm no regression. Smaller batches are safer than one big sweep.
+- [x] 3.2 Where the function doesn't yet receive `DaemonPaths` (or an equivalent), thread it through. Most code paths that need state files already have access to the daemon's path resolver via an existing struct (e.g., the polling loop has the daemon-paths reference in its context).
+- [x] 3.3 Run `cargo test` after each batch of edits to confirm no regression. Smaller batches are safer than one big sweep.
 
 ## 4. CI-enforceable path-literals audit
 
-- [ ] 4.1 New test file `autocoder/tests/path_literals_audit.rs`:
+- [x] 4.1 New test file `autocoder/tests/path_literals_audit.rs`:
   ```rust
   use std::fs;
   use std::path::Path;
@@ -82,25 +82,25 @@
               violations.join("\n"));
   }
   ```
-- [ ] 4.2 The allowlist is intentionally narrow: only files that legitimately reference the legacy path for migration purposes.
-- [ ] 4.3 Run the test against the swept codebase; assert it passes. If it fails, the remaining hits are bugs the sweep missed.
+- [x] 4.2 The allowlist is intentionally narrow: only files that legitimately reference the legacy path for migration purposes.
+- [x] 4.3 Run the test against the swept codebase; assert it passes. If it fails, the remaining hits are bugs the sweep missed.
 
 ## 5. Docs
 
-- [ ] 5.1 In `docs/STATE-LAYOUT.md`, add a section "Path resolution rule":
+- [x] 5.1 In `docs/STATE-LAYOUT.md`, add a section "Path resolution rule":
   - Every daemon-side state-file read or write SHALL route through the `DaemonPaths` resolver.
   - A CI test enforces "no hard-coded `/tmp/autocoder/` literals" outside an allowlist.
   - Future contributors who add new state-file shapes add a helper to `DaemonPaths` AND use it from the consumer side.
-- [ ] 5.2 In `docs/OPERATIONS.md`'s `## Busy marker` section, add a note: "If you're seeing operator-visible inconsistencies between writers and readers (`status` says idle while busy marker exists; `send it` returns `?` on a real thread), check `journalctl` AND the resolved paths; this class of bug is prevented by the path-literals CI test introduced in `a09`."
+- [x] 5.2 In `docs/OPERATIONS.md`'s `## Busy marker` section, add a note: "If you're seeing operator-visible inconsistencies between writers and readers (`status` says idle while busy marker exists; `send it` returns `?` on a real thread), check `journalctl` AND the resolved paths; this class of bug is prevented by the path-literals CI test introduced in `a09`."
 
 ## 6. Spec deltas
 
-- [ ] 6.1 `openspec/changes/a09-state-path-resolution-consistent/specs/orchestrator-cli/spec.md` ADDs one requirement covering the resolver-only rule, the CI check, AND the expected consequence (read/write path consistency).
-- [ ] 6.2 `openspec/changes/a09-state-path-resolution-consistent/specs/project-documentation/spec.md` ADDs one requirement covering the STATE-LAYOUT.md section.
+- [x] 6.1 `openspec/changes/a09-state-path-resolution-consistent/specs/orchestrator-cli/spec.md` ADDs one requirement covering the resolver-only rule, the CI check, AND the expected consequence (read/write path consistency).
+- [x] 6.2 `openspec/changes/a09-state-path-resolution-consistent/specs/project-documentation/spec.md` ADDs one requirement covering the STATE-LAYOUT.md section.
 
 ## 7. Verification
 
-- [ ] 7.1 `cargo test` passes (new + existing). The new path-literals audit test is part of `cargo test`.
-- [ ] 7.2 `openspec validate a12-state-path-resolution-consistent --strict` passes.
-- [ ] 7.3 `cargo clippy --all-targets --all-features -- -D warnings` produces no new warnings.
-- [ ] 7.4 Manual verification on a production-shaped deployment: `send it` on a fresh audit thread produces a PR (no `?` reaction).
+- [x] 7.1 `cargo test` passes (new + existing). The new path-literals audit test is part of `cargo test`.
+- [x] 7.2 `openspec validate a12-state-path-resolution-consistent --strict` passes. (Note: change is `a09`, not `a12` — `openspec validate a09-state-path-resolution-consistent --strict` passes.)
+- [x] 7.3 `cargo clippy --all-targets --all-features -- -D warnings` produces no new warnings. (87 errors pre- and post-change; baseline is unchanged.)
+- [ ] 7.4 Manual verification on a production-shaped deployment: `send it` on a fresh audit thread produces a PR (no `?` reaction). (NOT performed inside the autocoder sandbox — requires a live deployment with a configured Slack workspace and audit-thread state.)

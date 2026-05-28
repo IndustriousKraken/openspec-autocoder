@@ -133,8 +133,7 @@ pub fn marker_path(workspace: &Path) -> PathBuf {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
     crate::paths::current()
-        .runtime
-        .join("busy")
+        .busy_markers_dir()
         .join(format!("{basename}.json"))
 }
 
@@ -150,8 +149,7 @@ pub fn subprocess_marker_path(workspace: &Path) -> PathBuf {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
     crate::paths::current()
-        .runtime
-        .join("busy")
+        .busy_markers_dir()
         .join(format!("{basename}.subprocess"))
 }
 

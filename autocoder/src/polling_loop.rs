@@ -3392,7 +3392,7 @@ fn truncate_to_fit(body: String, max: usize) -> String {
     }
     let mut truncated = body[..cut].to_string();
     truncated.push_str(
-        "\n\n_[implementer summary truncated to fit GitHub comment limit; full output at /tmp/autocoder/logs/<workspace-basename>/<change>.log]_",
+        "\n\n_[implementer summary truncated to fit GitHub comment limit; full output at <logs_dir>/runs/<workspace-basename>/<change>.log]_",
     );
     truncated
 }

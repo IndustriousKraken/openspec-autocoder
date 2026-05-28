@@ -1352,7 +1352,7 @@ mod tests {
     #[tokio::test]
     async fn audit_run_log_written_per_invocation() {
         // Use a workspace with a unique basename so the global
-        // /tmp/autocoder/logs/<basename>/audits/ path is hermetic.
+        // <logs_dir>/runs/<basename>/audits/ path is hermetic.
         let basename = format!("audit-log-test-{}", uuid::Uuid::new_v4());
         let parent = TempDir::new().unwrap();
         let ws = parent.path().join(&basename);
@@ -1372,11 +1372,7 @@ mod tests {
         run_due_audits(&registry, &ws, &repo, Some(&cfg), &HashMap::new(), None, &HashSet::new())
             .await
             .unwrap();
-        let log_dir = crate::paths::current()
-            .logs
-            .join("runs")
-            .join(&basename)
-            .join("audits");
+        let log_dir = crate::paths::current().audit_logs_dir(&basename);
         assert!(log_dir.exists(), "audit log dir must be created at {}", log_dir.display());
         let entries: Vec<_> = std::fs::read_dir(&log_dir)
             .unwrap()
@@ -1391,9 +1387,7 @@ mod tests {
             log_dir.display()
         );
         // Clean up the global tmp dir we created.
-        let _ = std::fs::remove_dir_all(
-            crate::paths::current().logs.join("runs").join(&basename),
-        );
+        let _ = std::fs::remove_dir_all(crate::paths::current().run_logs_dir(&basename));
     }
 
     /// When the audit returns `WorkspaceUnavailable`, the scheduler must

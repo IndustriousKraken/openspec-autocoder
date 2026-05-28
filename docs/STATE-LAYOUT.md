@@ -43,6 +43,43 @@ value wins):
 All four paths must resolve to absolute, distinct directories. A
 relative path or a collision between two roles is a startup error.
 
+## Path resolution rule
+
+Every daemon-side state-file read AND write SHALL route through the
+`DaemonPaths` resolver in `autocoder/src/paths.rs`. The resolver exposes
+the four bare roots (`state`, `cache`, `logs`, `runtime`) plus a set of
+per-state-shape helpers — `audit_threads_dir()`, `busy_markers_dir()`,
+`proposal_requests_dir()`, `changelog_requests_dir()`,
+`failure_state_dir()`, `revisions_dir()`, `audit_state_dir()`,
+`run_logs_dir(<basename>)`, `audit_logs_dir(<basename>)`,
+`workspaces_dir()`, `control_socket_path()` — that callers use instead
+of constructing paths inline.
+
+The rule exists to prevent a defect class where readers and writers
+drift to different paths after the legacy-to-standard migration.
+Operator-visible symptoms of the defect class (now fixed by `a09`):
+
+- `send it` returning `?` for real audit threads, because the writer
+  stamped state at `<state>/audit-threads/` while a stale reader looked
+  under the legacy `/tmp/...` path and found only test fixtures.
+- `@<bot> status` reporting `idle` while the busy marker existed,
+  because the status reader and the busy-marker writer resolved their
+  paths through different code paths.
+
+The rule is **CI-enforced**. The integration test
+`autocoder/tests/path_literals_audit.rs` greps every `*.rs` file under
+`autocoder/src/` for the literal substring `/tmp/autocoder` and fails
+the build on any hit outside a narrow allowlist (today: only
+`src/migration.rs`, which references the legacy path on purpose so it
+knows what to move). The failure message names the offending
+`file:line:line-contents` AND points at the `DaemonPaths` resolver as
+the correct fix.
+
+**Adding a new state-file shape:** add a helper to `DaemonPaths`, use
+it from the consumer side. The CI test passes automatically — no
+allowlist edit needed unless the new code legitimately references the
+legacy path for migration purposes.
+
 ## Migration from `/tmp/`
 
 Pre-`state-paths-out-of-tmp`, autocoder wrote everything under `/tmp/`

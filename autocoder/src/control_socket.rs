@@ -214,7 +214,7 @@ pub struct ControlState {
 /// in dev mode); reboot-cleared tmpfs is the correct location for a
 /// socket that should never outlive the process that owns it.
 pub fn socket_path() -> PathBuf {
-    crate::paths::current().runtime.join("control.sock")
+    crate::paths::current().control_socket_path()
 }
 
 /// Bind the listener at the canonical socket path and accept connections

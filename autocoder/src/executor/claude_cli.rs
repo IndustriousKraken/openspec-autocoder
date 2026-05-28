@@ -1395,9 +1395,7 @@ pub(crate) fn run_log_path(workspace: &Path, change: &str) -> PathBuf {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
     crate::paths::current()
-        .logs
-        .join("runs")
-        .join(basename)
+        .run_logs_dir(&basename)
         .join(format!("{change}.log"))
 }
 

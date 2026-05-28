@@ -10,7 +10,9 @@
 //! - [`AuditRegistry`]: holds the `Arc<dyn Audit>` list iterated by the
 //!   scheduler.
 //! - [`AuditLogWriter`]: per-invocation log file under
-//!   `/tmp/autocoder/logs/<basename>/audits/<type>-<timestamp>.log`.
+//!   `<logs_dir>/runs/<basename>/audits/<type>-<timestamp>.log` (the
+//!   `logs_dir` here is the daemon's resolved logs root from
+//!   `DaemonPaths`).
 //! - [`state`]: persistence of `last_run_at` + `last_run_sha` per audit.
 //! - [`scheduler`]: cadence + change-guard + write-policy enforcement.
 
@@ -300,11 +302,7 @@ impl AuditLogWriter {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("workspace");
-        let dir = crate::paths::current()
-            .logs
-            .join("runs")
-            .join(basename)
-            .join("audits");
+        let dir = crate::paths::current().audit_logs_dir(basename);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating audit log dir {}", dir.display()))?;
         // Format: type-<RFC3339-with-Z>.log. Replace ':' with '-' so the
@@ -1382,7 +1380,7 @@ mod tests {
         assert!(contents.contains("(none)"));
         assert!(contents.contains("## output"));
         assert!(contents.contains("no findings"));
-        // Path lives under /tmp/autocoder/logs/<basename>/audits/...
+        // Path lives under <logs_dir>/runs/<basename>/audits/...
         let path_str = path.to_string_lossy();
         assert!(
             path_str.contains("/audits/"),
