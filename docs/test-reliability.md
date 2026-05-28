@@ -255,10 +255,37 @@ Post-fix (`spawn_with_etxtbsy_retry` in audit subprocess helpers):
 - Default parallelism (20 iterations): **20/20 ok**.
 - Stress (32 threads, 10 iterations): **10/10 ok**.
 
+## Test isolation
+
+Tests in `autocoder/` MUST NOT write to any path the live daemon would
+legitimately use. Concretely:
+
+- Tests that need daemon `state` / `cache` / `logs` / `runtime` roots
+  call `crate::testing::test_daemon_paths()` — it returns a
+  `(TempDir, DaemonPaths)` whose four roots live under a per-call
+  tempdir. The tempdir is dropped (and auto-cleaned) when the test's
+  binding goes out of scope.
+- Tests that need to exercise an `AUTOCODER_*_DIR` env-var path use a
+  scoped mechanism (e.g., `temp_env::with_var(name, value, || { ... })`)
+  so the env var is unset when the closure returns and parallel tests
+  do not race on a shared global.
+- No test references the legacy production path literal
+  (`/tmp/autocoder/...`). The `path_literals_audit` integration test in
+  `autocoder/tests/path_literals_audit.rs` scans both `src/` and
+  `tests/` and fails the build if any file outside its narrow allowlist
+  contains the substring; the `tests/` allowlist is empty.
+
+Operator note: existing dev machines that ran `cargo test` before
+this discipline was enforced may have left stale fixtures under
+`/tmp/autocoder/audit-threads/*.json` (and a few sibling dirs).
+`rm -rf /tmp/autocoder/` is safe to run — the daemon never reads from
+that prefix post-`a09`, and the test suite no longer writes there.
+
 ## Disposition summary
 
 | Test | Module | Category | Disposition | Notes |
 |---|---|---|---|---|
+| Tests writing to `/tmp/autocoder` | (sweep wide) | filesystem | `fixed-in-a10` | Test helper `crate::testing::test_daemon_paths()` introduced; `path_literals_audit` extended to scan `tests/` (empty allowlist) so regressions fail the build. |
 | `weekly_creates_about_52_occurrences` | — | (unlocatable) | `not-flaky-on-inspection` | Test does not exist in current tree or git history (see "Test name lookup"). Per-spec, documented as a ghost so future operators don't reopen the search. |
 | `audits::missing_tests::tests::post_run_detects_only_new_change_dirs` | `audits/missing_tests.rs` | filesystem (fork-after-write) | `fixed-in-this-change` | ETXTBSY race resolved by `spawn_with_etxtbsy_retry`. |
 | `audits::drift::tests::sandbox_settings_file_cleaned_up_after_run` | `audits/drift.rs` | filesystem (fork-after-write) | `fixed-in-this-change` | ETXTBSY race resolved by `spawn_with_etxtbsy_retry`. |

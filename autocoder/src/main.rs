@@ -29,6 +29,8 @@ mod proposal_requests;
 mod queue;
 mod revisions;
 mod spec_revision;
+#[cfg(test)]
+mod testing;
 mod workspace;
 
 #[tokio::main]
