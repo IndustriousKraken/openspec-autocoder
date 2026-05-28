@@ -1566,6 +1566,7 @@ async fn process_one_waiting(
             );
             let detail = SpecNeedsRevisionDetail {
                 unimplementable_tasks: unimplementable_tasks.clone(),
+                unarchivable_deltas: Vec::new(),
                 revision_suggestion: revision_suggestion.clone(),
             };
             if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
@@ -1858,6 +1859,29 @@ async fn process_one_pending_change(
     chatops_ctx: Option<&ChatOpsContext>,
     change: &str,
 ) -> Result<QueueStep> {
+    // Spec-delta archivability pre-flight (a17). Catches the a07-style
+    // class of failures — a `## MODIFIED Requirements` block whose
+    // `### Requirement:` header doesn't exist in canonical, etc. —
+    // BEFORE the executor runs. Saves the LLM cost on changes whose
+    // deltas would abort `openspec archive` later anyway. No lock is
+    // taken on this path: the marker file is the operator-action gate;
+    // failing-archivability changes never lock the queue dir.
+    match handle_archivability_preflight(workspace, repo, chatops_ctx, change).await {
+        Ok(Some(step)) => return Ok(step),
+        Ok(None) => {}
+        Err(e) => {
+            // Pre-flight should never fail (it's filesystem reads against
+            // the change's own dir), but if it does we log + proceed to
+            // the executor — better to incur a redundant Claude run than
+            // halt the queue on an unexpected I/O glitch.
+            tracing::warn!(
+                url = %repo.url,
+                change = %change,
+                "spec-archivability pre-flight check errored; proceeding to executor: {e:#}"
+            );
+        }
+    }
+
     queue::lock(workspace, change)
         .with_context(|| format!("locking change `{change}`"))?;
 
@@ -1885,6 +1909,159 @@ async fn process_one_pending_change(
     // dir, so the lock is gone, but `queue::unlock` is idempotent).
     let _ = queue::unlock(workspace, change);
     result
+}
+
+/// Run the spec-delta archivability pre-flight (a17) against `change`.
+/// On clean result: returns `Ok(None)` and the caller proceeds to the
+/// executor. On any violation: writes the `.needs-spec-revision.json`
+/// marker with `unarchivable_deltas` populated, posts the existing
+/// `AlertCategory::SpecNeedsRevision` chatops alert (subject to the 24h
+/// throttle), and returns `Ok(Some(QueueStep::SpecRevisionMarked))` so
+/// the caller short-circuits without invoking the executor.
+async fn handle_archivability_preflight(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    chatops_ctx: Option<&ChatOpsContext>,
+    change: &str,
+) -> Result<Option<QueueStep>> {
+    let violations = crate::preflight::spec_archivability::check_spec_deltas_archivable(
+        workspace, change,
+    )
+    .with_context(|| format!("spec-delta archivability check for `{change}`"))?;
+    if violations.is_empty() {
+        return Ok(None);
+    }
+    let suggestion = build_unarchivable_revision_suggestion(change, &violations);
+    tracing::warn!(
+        url = %repo.url,
+        change = %change,
+        violations = violations.len(),
+        "spec-delta archivability pre-flight FAILED; skipping executor and writing marker"
+    );
+    let detail = SpecNeedsRevisionDetail {
+        unimplementable_tasks: Vec::new(),
+        unarchivable_deltas: violations.clone(),
+        revision_suggestion: suggestion.clone(),
+    };
+    if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to write spec-needs-revision marker (pre-flight): {e:#}"
+        );
+    }
+    maybe_post_unarchivable_deltas_alert(chatops_ctx, repo, change, &violations, &suggestion)
+        .await;
+    Ok(Some(QueueStep::SpecRevisionMarked))
+}
+
+/// Compose the auto-generated `revision_suggestion` text written into
+/// the marker file when the pre-flight catches one or more unarchivable
+/// deltas. Names each violation and points the operator at the spec
+/// file to edit + the recovery verb.
+fn build_unarchivable_revision_suggestion(
+    change: &str,
+    violations: &[crate::preflight::spec_archivability::UnarchivableDelta],
+) -> String {
+    let mut out = format!(
+        "Pre-flight check found {} unarchivable spec delta{}:\n",
+        violations.len(),
+        if violations.len() == 1 { "" } else { "s" }
+    );
+    for v in violations {
+        out.push_str(&format!(
+            "- capability={cap} kind={kind} header=\"{hdr}\" reason=\"{reason}\"\n",
+            cap = v.capability,
+            kind = v.kind.as_str(),
+            hdr = v.header,
+            reason = v.reason,
+        ));
+    }
+    out.push_str(&format!(
+        "\nEdit openspec/changes/{change}/specs/<capability>/spec.md to use the\n\
+         exact canonical header. After fixing, push the spec change AND clear\n\
+         this marker via @<bot> clear-revision <repo> <change>.\n"
+    ));
+    out
+}
+
+/// Sibling of [`maybe_post_spec_revision_alert`] for the a17 pre-flight
+/// path. Body framing names "unarchivable spec deltas" rather than the
+/// agent-detected "unimplementable tasks", and lists each violation
+/// (`capability`, `kind`, `header`, `reason`). Throttle state, channel,
+/// and gating flag are identical to the existing alert so a single
+/// stream of `AlertCategory::SpecNeedsRevision` notifications covers
+/// both code paths.
+async fn maybe_post_unarchivable_deltas_alert(
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo: &RepositoryConfig,
+    change: &str,
+    violations: &[crate::preflight::spec_archivability::UnarchivableDelta],
+    revision_suggestion: &str,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let workspace = workspace::resolve_path(repo);
+    let mut state = AlertState::load_or_default(&workspace);
+    let now = Utc::now();
+    let should_alert = state
+        .spec_revision_alerts
+        .get(change)
+        .map(|entry| {
+            now - entry.last_alerted_at
+                >= ChronoDuration::hours(PERMA_STUCK_ALERT_THROTTLE_HOURS)
+        })
+        .unwrap_or(true);
+    if !should_alert {
+        return;
+    }
+    let marker_path = workspace
+        .join("openspec/changes")
+        .join(change)
+        .join(".needs-spec-revision.json");
+    let mut violations_block = String::new();
+    for v in violations {
+        violations_block.push_str(&format!(
+            "  - {cap} / {kind}: \"{hdr}\" — {reason}\n",
+            cap = v.capability,
+            kind = v.kind.as_str(),
+            hdr = v.header,
+            reason = v.reason,
+        ));
+    }
+    let text = format!(
+        "⚠️ `{repo_url}`: spec needs revision — `{change}` has unarchivable spec deltas (pre-flight)\n\nDeltas whose preconditions don't match canonical specs (would abort `openspec archive` later):\n{violations_block}\nSuggested revision:\n{suggestion}\nOperator action:\n  1. Edit openspec/changes/{change}/specs/<capability>/spec.md so each delta block's header matches canonical.\n  2. Commit + push to {base}.\n  3. `@<bot> clear-revision <repo> <change>` from chat (or delete the marker file).\n\nmarker: {marker}",
+        repo_url = repo.url,
+        change = change,
+        violations_block = violations_block,
+        suggestion = revision_suggestion,
+        base = repo.base_branch,
+        marker = marker_path.display(),
+    );
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "unarchivable-deltas chatops alert post failed: {e:#}"
+        );
+        return;
+    }
+    state.spec_revision_alerts.insert(
+        change.to_string(),
+        AlertEntry {
+            last_alerted_at: now,
+            last_error_excerpt: truncate_reason(revision_suggestion),
+        },
+    );
+    if let Err(e) = state.save(&workspace) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to persist unarchivable-deltas alert state: {e:#}"
+        );
+    }
 }
 
 /// Pre-flight archive-collision check. For each entry in `candidates`,
@@ -2796,6 +2973,7 @@ async fn handle_outcome(
             // is deterministic for a given tasks.md).
             let detail = SpecNeedsRevisionDetail {
                 unimplementable_tasks: unimplementable_tasks.clone(),
+                unarchivable_deltas: Vec::new(),
                 revision_suggestion: revision_suggestion.clone(),
             };
             if let Err(e) = spec_revision::write_marker(workspace, change, &detail) {
@@ -8331,6 +8509,269 @@ mod tests {
             1,
             "executor must run after the operator clears the marker"
         );
+    }
+
+    // ============================================================
+    // Spec-delta archivability pre-flight (a17)
+    // ============================================================
+
+    /// Write a canonical capability spec under
+    /// `openspec/specs/<cap>/spec.md` and commit it.
+    fn add_committed_canonical_spec(workspace: &Path, capability: &str, body: &str) {
+        let dir = workspace.join("openspec/specs").join(capability);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("spec.md"), body).unwrap();
+        let st = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(workspace)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let st = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", &format!("scaffold canonical {capability}")])
+            .current_dir(workspace)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+
+    /// Write a change with a spec delta block and commit it.
+    fn add_committed_change_with_spec(
+        workspace: &Path,
+        name: &str,
+        capability: &str,
+        delta_body: &str,
+    ) {
+        let dir = workspace.join("openspec/changes").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proposal.md"), format!("## Why\nfixture {name}\n")).unwrap();
+        std::fs::write(dir.join("tasks.md"), "- [ ] do thing\n").unwrap();
+        let spec_dir = dir.join("specs").join(capability);
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::write(spec_dir.join("spec.md"), delta_body).unwrap();
+        let st = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(workspace)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let st = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", &format!("scaffold {name}")])
+            .current_dir(workspace)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+
+    /// A change whose MODIFIED header doesn't match canonical (the a07
+    /// failure mode) is caught by the pre-flight: the executor is NOT
+    /// invoked, a `.needs-spec-revision.json` marker is written with
+    /// `unarchivable_deltas` populated, and the queue walk halts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preflight_catches_a07_style_modified_mismatch() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_canonical_spec(
+            &ws,
+            "code-reviewer",
+            "## Requirements\n\n### Requirement: AI-driven code-quality review\nThe reviewer SHALL accept.\n",
+        );
+        add_committed_change_with_spec(
+            &ws,
+            "a07-style-broken",
+            "code-reviewer",
+            "## MODIFIED Requirements\n\n### Requirement: Reviewer prompt budget is operator-configurable\nThe reviewer SHALL read.\n",
+        );
+        // A clean change that would run if the pre-flight didn't halt
+        // the queue. Its presence verifies the same-iteration halt
+        // semantics.
+        add_committed_change(&ws, "b-runs-if-not-halted", "fixture");
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Completed { final_answer: None })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+
+        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+
+        // Executor must NOT have been invoked for the broken change.
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "pre-flight must halt before any executor invocation"
+        );
+
+        // Marker is at the expected path with `unarchivable_deltas`
+        // populated and an auto-generated suggestion.
+        let marker_path =
+            ws.join("openspec/changes/a07-style-broken/.needs-spec-revision.json");
+        assert!(marker_path.exists(), "marker must be written");
+        let raw = std::fs::read_to_string(&marker_path).unwrap();
+        assert!(raw.contains("\"unarchivable_deltas\""));
+        assert!(raw.contains("\"code-reviewer\""));
+        assert!(raw.contains("\"Modified\""));
+        assert!(raw.contains("Reviewer prompt budget is operator-configurable"));
+        assert!(
+            raw.contains("a07-style"),
+            "auto-generated reason should mention a07-style class"
+        );
+        assert!(raw.contains("\"revision_suggestion\""));
+        assert!(
+            raw.contains("Pre-flight check found"),
+            "revision_suggestion should lead with pre-flight prefix"
+        );
+
+        // Marker excludes the change from list_pending. The clean
+        // second change is in the same iteration; the queue walk halts
+        // on the first marker write, so it must NOT have been processed.
+        assert!(
+            ws.join("openspec/changes/b-runs-if-not-halted").exists(),
+            "the clean trailing change must remain in pending"
+        );
+    }
+
+    /// A change whose spec deltas are clean against canonical passes
+    /// pre-flight and reaches the executor — the existing behavior is
+    /// preserved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preflight_passes_clean_change_through_to_executor() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_canonical_spec(
+            &ws,
+            "code-reviewer",
+            "## Requirements\n\n### Requirement: AI-driven code-quality review\nThe reviewer SHALL accept.\n",
+        );
+        add_committed_change_with_spec(
+            &ws,
+            "clean-modify",
+            "code-reviewer",
+            "## MODIFIED Requirements\n\n### Requirement: AI-driven code-quality review\nReplacement body SHALL.\n",
+        );
+
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Executor for Counter {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExecutorOutcome::Failed { reason: "fixture".into() })
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Counter(invocations.clone());
+
+        let _ = run_one_pass_with_threshold(&ws, &executor, u32::MAX).await;
+
+        // Executor IS invoked: pre-flight was a no-op for the clean change.
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "clean change must reach the executor"
+        );
+        // No marker written.
+        assert!(
+            !ws.join("openspec/changes/clean-modify/.needs-spec-revision.json").exists(),
+            "no marker for clean change"
+        );
+    }
+
+    /// The pre-flight chatops alert fires with body framing the failure
+    /// as "unarchivable spec deltas" and enumerating each violation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preflight_failure_posts_chatops_alert_with_deltas_body() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_canonical_spec(
+            &ws,
+            "code-reviewer",
+            "## Requirements\n\n### Requirement: AI-driven code-quality review\nThe reviewer SHALL accept.\n",
+        );
+        add_committed_change_with_spec(
+            &ws,
+            "alerted-broken",
+            "code-reviewer",
+            "## MODIFIED Requirements\n\n### Requirement: Invented Title\nBody SHALL.\n",
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        let chatops = fixture_chatops_for(&mut server).await;
+        let alert_mock = server
+            .mock("POST", "/chat.postMessage")
+            .match_body(mockito::Matcher::Regex("unarchivable spec deltas".into()))
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _other = server
+            .mock("POST", "/chat.postMessage")
+            .with_status(200)
+            .with_body(r#"{"ok":true,"ts":"1.0"}"#)
+            .create_async()
+            .await;
+
+        struct Noop;
+        #[async_trait::async_trait]
+        impl Executor for Noop {
+            async fn run(&self, _w: &Path, _c: &str) -> Result<ExecutorOutcome> {
+                unreachable!("pre-flight must short-circuit before executor.run")
+            }
+            async fn resume(
+                &self,
+                _h: crate::executor::ResumeHandle,
+                _a: &str,
+            ) -> Result<ExecutorOutcome> {
+                unreachable!()
+            }
+        }
+        let executor = Noop;
+        let chatops_ctx = ChatOpsContext {
+            chatops: chatops.clone(),
+            channel: "C_TEST".into(),
+            start_work_enabled: false,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: false,
+        };
+        let test_github = GithubConfig {
+            token_env: "X".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+        let _ = run_pass_through_commits(
+            &ws,
+            &fixture_repo(&ws),
+            &test_github,
+            &executor,
+            Some(&chatops_ctx),
+            u32::MAX,
+            u32::MAX,
+            &crate::audits::AuditRegistry::default(),
+            None,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .await;
+
+        alert_mock.assert_async().await;
     }
 
     // ============================================================

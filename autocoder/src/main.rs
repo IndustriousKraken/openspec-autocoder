@@ -26,6 +26,7 @@ mod openspec_archive;
 mod paths;
 mod perma_stuck;
 mod polling_loop;
+mod preflight;
 mod proposal_requests;
 mod queue;
 mod recovery_classification;

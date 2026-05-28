@@ -296,7 +296,13 @@ See also [Spec marked as needing revision](#spec-marked-as-needing-revision) —
 
 Sibling pattern to [Perma-stuck change detection](OPERATIONS.md#perma-stuck-change-detection). Where perma-stuck signals "the agent kept failing on this change," needs-spec-revision signals "the spec is asking the agent to do something it cannot do." Both are operator-action states; both are cleared by deleting the marker file.
 
-**What triggers it.** Before doing any work, the agent scans `tasks.md` for tasks that require capabilities outside its sandbox: `sudo` on a real host, missing CLI tools, real GitHub tag pushes, browser interactions, VM/container spin-up, smoke tests on specific hardware or OS versions, manual external observation. If any task matches, the agent emits an `=== AUTOCODER-OUTCOME ===` block flagging the unimplementable tasks and exits without modifying the workspace. autocoder writes `<workspace>/openspec/changes/<change>/.needs-spec-revision.json`, posts a chatops alert under `AlertCategory::SpecNeedsRevision` (same 24-hour throttle as perma-stuck), and halts the queue walk for the iteration.
+**What triggers it.** Two independent code paths can write this marker:
+
+1. **Agent-detected unimplementable tasks.** Before doing any work, the agent scans `tasks.md` for tasks that require capabilities outside its sandbox: `sudo` on a real host, missing CLI tools, real GitHub tag pushes, browser interactions, VM/container spin-up, smoke tests on specific hardware or OS versions, manual external observation. If any task matches, the agent emits an `=== AUTOCODER-OUTCOME ===` block flagging the unimplementable tasks and exits without modifying the workspace. autocoder writes `<workspace>/openspec/changes/<change>/.needs-spec-revision.json` with `unimplementable_tasks` populated and halts the queue walk.
+
+2. **Pre-flight spec-delta archivability check (a17).** Before invoking the executor, autocoder parses each `specs/<capability>/spec.md` in the change and verifies every `## ADDED Requirements` / `## MODIFIED Requirements` / `## REMOVED Requirements` / `## RENAMED Requirements` block's `### Requirement:` headers against the canonical `openspec/specs/<capability>/spec.md`. The four delta kinds enforce: ADDED title must NOT exist in canonical (catching duplicate-add); MODIFIED title MUST exist (catching the a07 class of bug where an invented title was used); REMOVED title MUST exist; RENAMED `from:` title MUST exist, `to:` title MUST NOT exist. On any precondition violation, autocoder writes the marker with `unarchivable_deltas` populated, posts the chatops alert, and halts the queue — the executor is never invoked. **Principal cost savings:** no LLM call against a change whose deltas would abort `openspec archive` later anyway. The marker's `revision_suggestion` is auto-generated and names exactly which deltas need to be fixed.
+
+Both code paths share the same `AlertCategory::SpecNeedsRevision` throttle (24-hour, same as perma-stuck) and the same operator-clears-the-marker recovery shape. The marker schema accommodates either (or both) populations: `unimplementable_tasks` for the agent-detected path, `unarchivable_deltas` for the pre-flight path.
 
 The agent does NOT auto-edit `tasks.md`. The flag-and-stop contract preserves the project invariant that no AI process edits its own marching orders without human review.
 
@@ -309,10 +315,15 @@ The agent does NOT auto-edit `tasks.md`. The flag-and-stop contract preserves th
   "unimplementable_tasks": [
     {"task_id": "5.2", "task_text": "...", "reason": "..."}
   ],
-  "revision_suggestion": "free-form text the agent wrote describing what to change",
-  "operator_action": "Edit openspec/changes/<change>/tasks.md to remove or revise the flagged tasks, commit + push, then delete this marker file."
+  "unarchivable_deltas": [
+    {"capability": "code-reviewer", "kind": "Modified", "header": "Reviewer prompt budget is operator-configurable", "reason": "header not found in canonical openspec/specs/code-reviewer/spec.md (this is the a07-style bug; check spelling AND capitalization)"}
+  ],
+  "revision_suggestion": "free-form text describing what to change (auto-generated for the pre-flight path)",
+  "operator_action": "Edit openspec/changes/<change>/(tasks.md OR specs/<capability>/spec.md), commit + push, then clear this marker (via @<bot> clear-revision <repo> <change> or by deleting the file directly)."
 }
 ```
+
+`unimplementable_tasks` and `unarchivable_deltas` are both optional (each elided from the JSON when empty). Pre-spec markers with only `unimplementable_tasks` continue to deserialize unchanged.
 
 The marker is registered in `.git/info/exclude` at workspace init so it does not trip the pre-pass dirty check and survives `git clean -fd` during per-iteration recovery (same treatment as `.perma-stuck.json`).
 

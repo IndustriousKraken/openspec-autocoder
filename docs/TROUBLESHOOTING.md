@@ -57,6 +57,34 @@ If `R == F`, your workspace is clean and you can safely edit the failed changes 
 
 Once the fixes are committed and pushed, trigger another rebuild. The chatops verb `@<bot> rebuild-specs <repo>` schedules it for the next polling iteration; the CLI form is `autocoder sync-specs --rebuild --workspace <path>`. The fresh rebuild starts from the same archive history and applies all 41 changes again — the just-fixed entries will succeed, and the cascade-blocked dependents will resolve in the same pass.
 
+## openspec archive aborts with 'MODIFIED failed for header'
+
+You see (or used to see, pre-a17) one of:
+
+```
+code-reviewer MODIFIED failed for header "### Requirement: Reviewer prompt budget is operator-configurable" - not found
+member-saved-cards MODIFIED failed for header "..." - not found
+```
+
+This is `openspec archive`'s late-stage rejection of a change whose `## MODIFIED Requirements` block names a `### Requirement: <title>` that doesn't exist in the canonical `openspec/specs/<capability>/spec.md`. It's a spec-content defect — the change's delta was authored against an invented title (typo, capitalisation drift, half-remembered header) and `openspec validate --strict` did not catch it because that pass only checks delta well-formedness.
+
+**Pre-a17 behavior.** The defect surfaced AFTER the implementer ran to completion: the executor read tasks.md, produced a working diff (often ~$3 of LLM cost), and only at the `openspec archive` step did the spec mismatch abort the pass. The change dropped into the Failed bucket; the next iteration retried; the LLM cost was burned again. After perma-stuck-threshold iterations the change ended up perma-stuck (the real incident on 2026-05-27 — see archived change `a07-reviewer-prompt-budget-and-per-change-mode`).
+
+**Post-a17 behavior.** The polling loop now runs a spec-delta archivability pre-flight BEFORE the executor. The check parses each delta block's `### Requirement:` headers and verifies the per-kind precondition against canonical:
+
+- ADDED title must NOT already exist in canonical.
+- MODIFIED title MUST exist (the a07 class — exact string match, including capitalisation).
+- REMOVED title MUST exist.
+- RENAMED `from:` MUST exist; `to:` MUST NOT exist.
+
+On any precondition violation, autocoder writes `<workspace>/openspec/changes/<change>/.needs-spec-revision.json` with an `unarchivable_deltas` array enumerating every mismatch, posts the existing `AlertCategory::SpecNeedsRevision` chatops alert with a body framing the failure as "unarchivable spec deltas (pre-flight)", and halts the queue. The executor is NEVER invoked. No LLM cost is incurred for changes whose deltas would fail at archive time anyway.
+
+**Where to find the diagnosis.** Read `unarchivable_deltas` in the marker file. Each entry names the capability, the delta kind, the offending header, and a one-line reason. The marker's `revision_suggestion` is auto-generated and lists every violation in a single block plus the next-step instructions.
+
+**Fix.** Edit `openspec/changes/<change>/specs/<capability>/spec.md` so each delta block's `### Requirement:` header matches the canonical title character-for-character. The `unarchivable_deltas` array names the offending headers in the order they appear in the spec. After committing + pushing, clear the marker via `@<bot> clear-revision <repo> <change>` from chat (or `rm <workspace>/openspec/changes/<change>/.needs-spec-revision.json` directly). The next iteration retries the change with the corrected spec.
+
+**Why this matters.** The pre-flight is sub-millisecond and runs on every change before every executor invocation (no caching — the canonical might have shifted since the prior check). The cost trade is dramatically favourable: a few markdown parses per iteration in exchange for never running an implementer against a change whose archive step is structurally guaranteed to fail.
+
 ## PR-comment revision keeps failing
 
 You comment `@<bot> revise <text>` on an open PR and the bot replies
