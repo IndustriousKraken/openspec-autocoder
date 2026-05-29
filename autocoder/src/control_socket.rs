@@ -2005,7 +2005,7 @@ fn handle_record_outcome(parsed: &Value, state: &ControlState) -> Value {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     match variant_tag.as_deref() {
-        Some("success") | Some("spec_needs_revision") => {}
+        Some("success") | Some("spec_needs_revision") | Some("iteration_request") => {}
         Some(other) => {
             return json!({
                 "ok": false,
@@ -3990,6 +3990,29 @@ github:
         assert_eq!(resp["ok"], serde_json::Value::Bool(false));
         let err = resp["error"].as_str().unwrap();
         assert!(err.contains("outcome"), "err: {err}");
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_outcome_round_trips_iteration_request_payload() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let record_req = r#"{"action":"record_outcome","workspace_basename":"my-repo","change":"a30-foo","outcome":{"type":"iteration_request","completed_tasks":["1","2"],"remaining_tasks":["3"],"reason":"task 3 needs a refactor I want to plan more carefully"}}"#;
+        let resp = send_request(&socket, record_req).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+
+        let consume_req = r#"{"action":"consume_outcome","workspace_basename":"my-repo","change":"a30-foo"}"#;
+        let resp = send_request(&socket, consume_req).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        // The consume_outcome response includes the new variant tag
+        // automatically thanks to serde::Serialize on the enum.
+        assert_eq!(resp["outcome"]["type"], "iteration_request");
+        assert_eq!(resp["outcome"]["completed_tasks"][0], "1");
+        assert_eq!(resp["outcome"]["completed_tasks"][1], "2");
+        assert_eq!(resp["outcome"]["remaining_tasks"][0], "3");
+        assert_eq!(
+            resp["outcome"]["reason"],
+            "task 3 needs a refactor I want to plan more carefully"
+        );
         cancel.cancel();
     }
 

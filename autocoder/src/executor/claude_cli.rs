@@ -309,7 +309,8 @@ impl ClaudeCliExecutor {
                 "`openspec instructions apply --change {change}` produced empty stdout"
             ));
         }
-        Ok(self.template.replace(PROMPT_BODY_PLACEHOLDER, &body))
+        let rendered = self.template.replace(PROMPT_BODY_PLACEHOLDER, &body);
+        Ok(append_iteration_continuation_block(workspace, change, rendered))
     }
 
     /// Build the revision-mode prompt for `change` by running `openspec
@@ -1081,7 +1082,7 @@ impl ClaudeCliExecutor {
         if let Some(recorded) =
             try_consume_outcome(&workspace_basename, change).await
         {
-            return Ok(map_recorded_outcome(recorded));
+            return Ok(map_recorded_outcome(workspace, change, recorded));
         }
 
         // Layer-1 first: the marker file is the authoritative signal. It
@@ -1209,6 +1210,76 @@ impl ClaudeCliExecutor {
     }
 }
 
+/// Append the "Prior iteration summary" continuation block to the
+/// rendered prompt when `.iteration-pending.json` is present (a27a1).
+///
+/// - Marker absent → returns `rendered` unchanged (first-iteration
+///   prompt is unchanged).
+/// - Marker present AND parseable → appends the canonical block AFTER
+///   the change body (per design.md D6: placement is load-bearing).
+/// - Marker present BUT corrupt → emits `tracing::warn!` AND returns
+///   `rendered` unchanged. The corrupt marker is NOT deleted (operator
+///   can inspect AND repair).
+pub(crate) fn append_iteration_continuation_block(
+    workspace: &Path,
+    change: &str,
+    rendered: String,
+) -> String {
+    match crate::iteration_pending::read_marker(workspace, change) {
+        Ok(Some(marker)) => {
+            let block = render_iteration_continuation_block(&marker);
+            format!("{rendered}\n{block}")
+        }
+        Ok(None) => rendered,
+        Err(e) => {
+            tracing::warn!(
+                change = %change,
+                "iteration-pending marker present but corrupt; building prompt as if absent: {e:#}"
+            );
+            rendered
+        }
+    }
+}
+
+/// Canonical "Prior iteration summary" block. Mirrors the executor
+/// capability deltas in this change's spec (verbatim text required so
+/// the agent's framing-cues are consistent across runs).
+fn render_iteration_continuation_block(
+    marker: &crate::iteration_pending::IterationPendingMarker,
+) -> String {
+    let completed = marker.completed_tasks.join(", ");
+    let remaining = marker.remaining_tasks.join(", ");
+    format!(
+        "--- BEGIN PRIOR ITERATION SUMMARY ---\n\
+\n\
+A previous iteration of this same change reached a structured stopping\n\
+point. Your job is to overcome the prior blocker AND finish the\n\
+remaining tasks. The previous iteration's working tree has already been\n\
+committed AND pushed to the agent branch — your starting state already\n\
+includes its progress.\n\
+\n\
+Cumulative completed (do NOT re-implement): {completed}\n\
+Remaining: {remaining}\n\
+Prior iteration's stated reason for stopping: {reason}\n\
+Current iteration: {iteration_number} of {cap} (cap)\n\
+\n\
+Do NOT assume the prior reason still holds. Re-evaluate the blocker\n\
+with fresh eyes — the prior iteration's model may have miscalibrated\n\
+the scope, AND a different angle of attack may resolve the work in\n\
+this iteration. If you genuinely cannot finish in this iteration,\n\
+call outcome_request_iteration again with an updated cumulative state\n\
+AND a more specific reason. Note that the iteration cap is 5; runs\n\
+beyond that are auto-failed.\n\
+\n\
+--- END PRIOR ITERATION SUMMARY ---\n",
+        completed = completed,
+        remaining = remaining,
+        reason = marker.reason,
+        iteration_number = marker.iteration_number,
+        cap = ITERATION_REQUEST_CAP,
+    )
+}
+
 fn build_handle(workspace: &Path, change: &str, session_id: Option<String>) -> ResumeHandle {
     let data = ClaudeResumeData {
         workspace: workspace.to_path_buf(),
@@ -1307,8 +1378,25 @@ async fn send_consume_outcome(
     Ok(value)
 }
 
+/// Hard cap on the number of iterations a single change may run
+/// through. A 6th `iteration_request` is overridden by the classifier
+/// to `ExecutorOutcome::Failed` so the operator is alerted rather than
+/// the agent being allowed to loop forever.
+pub(crate) const ITERATION_REQUEST_CAP: u32 = 5;
+
+/// Exact wording for the cap-exceeded failure reason. Operators grep
+/// for this AND scripts match against it; the literal `(5)` lets a
+/// future configurable cap evolve without breaking the contract.
+pub(crate) const ITERATION_CAP_EXCEEDED_REASON: &str =
+    "exceeded iteration-request cap (5); WIP on agent branch — review or restart from scratch";
+
 /// Map a daemon-recorded outcome to its `ExecutorOutcome` counterpart.
+/// The workspace + change parameters are used by the `IterationRequest`
+/// variant to read the current iteration-pending marker AND enforce the
+/// cap of [`ITERATION_REQUEST_CAP`] iterations per change.
 fn map_recorded_outcome(
+    workspace: &Path,
+    change: &str,
     recorded: crate::outcome_store::RecordedOutcome,
 ) -> ExecutorOutcome {
     match recorded {
@@ -1329,6 +1417,51 @@ fn map_recorded_outcome(
                 .collect(),
             revision_suggestion,
         },
+        crate::outcome_store::RecordedOutcome::IterationRequest {
+            completed_tasks,
+            remaining_tasks,
+            reason,
+        } => {
+            // Prior iteration_number comes from the workspace's
+            // `.iteration-pending.json` marker (if present). A missing
+            // marker means "no prior iteration_request has been
+            // recorded for this change," which is iteration_number 1
+            // (the just-finished run). A corrupt / unreadable marker
+            // is treated as absent (corrupt-as-absent) per design.md
+            // D5's degraded-recovery story.
+            let prior_iteration_number = match crate::iteration_pending::read_marker(
+                workspace, change,
+            ) {
+                Ok(Some(m)) => m.iteration_number,
+                Ok(None) => 1,
+                Err(e) => {
+                    tracing::warn!(
+                        change = %change,
+                        "iteration-pending marker unreadable / corrupt; treating as absent: {e:#}"
+                    );
+                    1
+                }
+            };
+            let next_iteration_number = prior_iteration_number + 1;
+            if next_iteration_number > ITERATION_REQUEST_CAP {
+                tracing::warn!(
+                    change = %change,
+                    cap = ITERATION_REQUEST_CAP,
+                    prior_iteration = prior_iteration_number,
+                    "iteration_request emitted for `{change}` would produce iteration {next_iteration_number}, exceeding cap {cap}; overriding to Failed AND preserving marker for operator triage",
+                    cap = ITERATION_REQUEST_CAP,
+                );
+                return ExecutorOutcome::Failed {
+                    reason: ITERATION_CAP_EXCEEDED_REASON.to_string(),
+                };
+            }
+            ExecutorOutcome::IterationRequested {
+                completed_tasks,
+                remaining_tasks,
+                reason,
+                iteration_number: next_iteration_number,
+            }
+        }
     }
 }
 
@@ -2136,6 +2269,96 @@ mod tests {
         assert!(
             prompt.contains("Apply: x") || prompt.contains("# proposal.md") || prompt.contains("change_body") == false,
             "expected change body between markers; got: {prompt}"
+        );
+    }
+
+    /// a27a1 Task 7.7: prompt-builder for a change with NO marker
+    /// produces output WITHOUT the continuation block.
+    #[tokio::test]
+    async fn build_prompt_without_marker_omits_continuation_block() {
+        let (_dir, ws) = fixture_workspace();
+        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30);
+        let prompt = executor.build_prompt(&ws, "x").unwrap();
+        assert!(
+            !prompt.contains("--- BEGIN PRIOR ITERATION SUMMARY ---"),
+            "first-iteration prompt must not contain continuation block: {prompt}"
+        );
+    }
+
+    /// a27a1 Task 7.6: prompt-builder for a change with a present-AND-
+    /// valid marker produces output containing the continuation block AND
+    /// every marker-field value verbatim.
+    #[tokio::test]
+    async fn build_prompt_with_marker_appends_continuation_block_verbatim() {
+        let (_dir, ws) = fixture_workspace();
+        // Write a valid marker for change "x" (the fixture creates it).
+        crate::iteration_pending::write_marker(
+            &ws,
+            "x",
+            &crate::iteration_pending::IterationPendingMarker {
+                completed_tasks: vec!["1".into(), "2".into()],
+                remaining_tasks: vec!["3".into()],
+                reason: "task 3 needs a refactor I want to plan more carefully".into(),
+                iteration_number: 2,
+            },
+        )
+        .unwrap();
+        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30);
+        let prompt = executor.build_prompt(&ws, "x").unwrap();
+        assert!(
+            prompt.contains("--- BEGIN PRIOR ITERATION SUMMARY ---"),
+            "continuation block start marker missing"
+        );
+        assert!(
+            prompt.contains("--- END PRIOR ITERATION SUMMARY ---"),
+            "continuation block end marker missing"
+        );
+        // Verbatim marker-field values are present.
+        assert!(
+            prompt.contains("Cumulative completed (do NOT re-implement): 1, 2"),
+            "completed_tasks rendering missing: {prompt}"
+        );
+        assert!(prompt.contains("Remaining: 3"));
+        assert!(prompt.contains(
+            "Prior iteration's stated reason for stopping: task 3 needs a refactor I want to plan more carefully"
+        ));
+        assert!(prompt.contains("Current iteration: 2 of 5 (cap)"));
+        // The block lands AFTER the change body — find the position of
+        // both and compare.
+        let change_body_pos = prompt.find("--- END CHANGE ---")
+            .or_else(|| prompt.find("--- BEGIN CHANGE ---"))
+            .unwrap_or(0);
+        let block_pos = prompt
+            .find("--- BEGIN PRIOR ITERATION SUMMARY ---")
+            .unwrap();
+        assert!(
+            block_pos > change_body_pos,
+            "continuation block must appear AFTER the change body (change_body_pos={change_body_pos}, block_pos={block_pos})"
+        );
+    }
+
+    /// a27a1 Task 7.8: prompt-builder for a change with a CORRUPT marker
+    /// logs a warning AND produces output WITHOUT the continuation block.
+    /// The corrupt marker file is NOT modified OR deleted by the builder.
+    #[tokio::test]
+    async fn build_prompt_with_corrupt_marker_logs_warning_and_omits_block() {
+        let (_dir, ws) = fixture_workspace();
+        // Inject a corrupt marker.
+        let marker_path = ws
+            .join("openspec/changes/x")
+            .join(crate::iteration_pending::MARKER_FILE);
+        std::fs::write(&marker_path, "{ truncated json").unwrap();
+        let executor = ClaudeCliExecutor::new("/bin/true".into(), 30);
+        let prompt = executor.build_prompt(&ws, "x").unwrap();
+        assert!(
+            !prompt.contains("--- BEGIN PRIOR ITERATION SUMMARY ---"),
+            "corrupt-marker prompt must not contain continuation block: {prompt}"
+        );
+        // The corrupt marker file is NOT modified OR deleted.
+        let raw = std::fs::read_to_string(&marker_path).unwrap();
+        assert_eq!(
+            raw, "{ truncated json",
+            "corrupt marker must be left as-is for operator inspection"
         );
     }
 
@@ -3842,10 +4065,13 @@ exit 0
     /// integration tests above are not the only coverage.
     #[test]
     fn map_recorded_outcome_round_trips_both_variants() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/x")).unwrap();
         let recorded_success = crate::outcome_store::RecordedOutcome::Success {
             final_answer: Some("ok".to_string()),
         };
-        match map_recorded_outcome(recorded_success) {
+        match map_recorded_outcome(ws, "x", recorded_success) {
             ExecutorOutcome::Completed { final_answer } => {
                 assert_eq!(final_answer.as_deref(), Some("ok"));
             }
@@ -3861,7 +4087,7 @@ exit 0
             ],
             revision_suggestion: "s".to_string(),
         };
-        match map_recorded_outcome(recorded_revision) {
+        match map_recorded_outcome(ws, "x", recorded_revision) {
             ExecutorOutcome::SpecNeedsRevision {
                 unimplementable_tasks,
                 revision_suggestion,
@@ -3870,6 +4096,138 @@ exit 0
                 assert_eq!(revision_suggestion, "s");
             }
             other => panic!("expected SpecNeedsRevision, got {other:?}"),
+        }
+    }
+
+    /// Task 3.3: a `RecordedOutcome::IterationRequest` with no marker
+    /// present maps to `IterationRequested { iteration_number: 2, ... }`.
+    #[test]
+    fn map_iteration_request_no_marker_yields_iteration_two() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/x")).unwrap();
+        let recorded = crate::outcome_store::RecordedOutcome::IterationRequest {
+            completed_tasks: vec!["1".into(), "2".into()],
+            remaining_tasks: vec!["3".into()],
+            reason: "ran out of time".into(),
+        };
+        match map_recorded_outcome(ws, "x", recorded) {
+            ExecutorOutcome::IterationRequested {
+                completed_tasks,
+                remaining_tasks,
+                reason,
+                iteration_number,
+            } => {
+                assert_eq!(completed_tasks, vec!["1".to_string(), "2".to_string()]);
+                assert_eq!(remaining_tasks, vec!["3".to_string()]);
+                assert_eq!(reason, "ran out of time");
+                assert_eq!(iteration_number, 2);
+            }
+            other => panic!("expected IterationRequested, got {other:?}"),
+        }
+    }
+
+    /// Task 3.4: marker showing iteration_number 4 maps to iteration 5
+    /// (5th iteration is still permitted under the cap).
+    #[test]
+    fn map_iteration_request_with_marker_iteration_four_yields_five() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/x")).unwrap();
+        crate::iteration_pending::write_marker(
+            ws,
+            "x",
+            &crate::iteration_pending::IterationPendingMarker {
+                completed_tasks: vec!["1".into(), "2".into(), "3".into()],
+                remaining_tasks: vec!["4".into()],
+                reason: "prior reason".into(),
+                iteration_number: 4,
+            },
+        )
+        .unwrap();
+        let recorded = crate::outcome_store::RecordedOutcome::IterationRequest {
+            completed_tasks: vec!["1".into(), "2".into(), "3".into(), "4a".into()],
+            remaining_tasks: vec!["4b".into()],
+            reason: "need more time".into(),
+        };
+        match map_recorded_outcome(ws, "x", recorded) {
+            ExecutorOutcome::IterationRequested {
+                iteration_number, ..
+            } => {
+                assert_eq!(iteration_number, 5);
+            }
+            other => panic!("expected IterationRequested at iteration 5, got {other:?}"),
+        }
+    }
+
+    /// Task 3.5: marker showing iteration_number 5 maps to Failed with
+    /// the cap-exceeded reason; the marker is NOT modified.
+    #[test]
+    fn map_iteration_request_with_marker_iteration_five_yields_failed_cap_exceeded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/x")).unwrap();
+        let prior_marker = crate::iteration_pending::IterationPendingMarker {
+            completed_tasks: vec!["1".into(), "2".into(), "3".into(), "4".into()],
+            remaining_tasks: vec!["5".into()],
+            reason: "prior reason".into(),
+            iteration_number: 5,
+        };
+        crate::iteration_pending::write_marker(ws, "x", &prior_marker).unwrap();
+        let recorded = crate::outcome_store::RecordedOutcome::IterationRequest {
+            completed_tasks: vec![
+                "1".into(),
+                "2".into(),
+                "3".into(),
+                "4".into(),
+                "5a".into(),
+            ],
+            remaining_tasks: vec!["5b".into()],
+            reason: "still need more time".into(),
+        };
+        match map_recorded_outcome(ws, "x", recorded) {
+            ExecutorOutcome::Failed { reason } => {
+                assert!(
+                    reason.starts_with("exceeded iteration-request cap (5)"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("expected Failed (cap-exceeded), got {other:?}"),
+        }
+        // Marker is NOT modified.
+        let still = crate::iteration_pending::read_marker(ws, "x")
+            .unwrap()
+            .expect("marker preserved");
+        assert_eq!(still, prior_marker);
+    }
+
+    /// Task 3.6: a corrupt marker file (truncated JSON) is treated as
+    /// "no marker present" — the classifier returns IterationRequested
+    /// at iteration_number 2.
+    #[test]
+    fn map_iteration_request_with_corrupt_marker_treats_as_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("openspec/changes/x")).unwrap();
+        // Inject a truncated marker.
+        std::fs::write(
+            ws.join("openspec/changes/x")
+                .join(crate::iteration_pending::MARKER_FILE),
+            "{\"completed_tasks\":[\"1\"]",
+        )
+        .unwrap();
+        let recorded = crate::outcome_store::RecordedOutcome::IterationRequest {
+            completed_tasks: vec!["1".into()],
+            remaining_tasks: vec!["2".into()],
+            reason: "fresh start".into(),
+        };
+        match map_recorded_outcome(ws, "x", recorded) {
+            ExecutorOutcome::IterationRequested {
+                iteration_number, ..
+            } => {
+                assert_eq!(iteration_number, 2);
+            }
+            other => panic!("expected IterationRequested at iteration 2 (corrupt-as-absent), got {other:?}"),
         }
     }
 }

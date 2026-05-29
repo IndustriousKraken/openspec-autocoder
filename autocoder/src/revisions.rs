@@ -760,6 +760,23 @@ async fn process_one_pr(
                 advance_seen(&mut latest_seen, comment.created_at);
                 write_state(workspace, &state)?;
             }
+            Ok(ExecutorOutcome::IterationRequested { .. }) => {
+                // Revisions are single-shot bug fixes against a merged PR;
+                // they don't have the iteration-pending state machine that
+                // pending changes do. Treat IterationRequested as a Failed-
+                // equivalent so the PR comment surfaces the unhandled case.
+                let body = format!(
+                    "✗ Revision attempt failed: executor returned IterationRequested (iteration sequences are not supported on the revise path). The PR is unchanged. Reply with another `@{} revise ...` to retry.",
+                    bot_username
+                );
+                let _ = github::post_issue_comment(
+                    api_base, token, owner, repo_name, pr.number, &body,
+                )
+                .await;
+                state.revisions_applied = state.revisions_applied.saturating_add(1);
+                advance_seen(&mut latest_seen, comment.created_at);
+                write_state(workspace, &state)?;
+            }
             Err(e) => {
                 tracing::warn!(
                     url = %repo.url,

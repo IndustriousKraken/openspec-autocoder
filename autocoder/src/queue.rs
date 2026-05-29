@@ -35,15 +35,30 @@ fn change_dir(workspace: &Path, change: &str) -> PathBuf {
 /// directory, do not begin with `.`, do not contain a `.in-progress` lock
 /// file, do not contain a `.question.json` waiting marker, do not contain
 /// a `.perma-stuck.json` marker, and contain at least a `proposal.md`
-/// file. Returns sorted ascending by entry name (UTF-8 byte order, which
-/// is alphabetical for ASCII names). Operators with stacked dependencies
-/// encode explicit order via numeric prefixes (`01-`, `02-`).
+/// file.
+///
+/// Returns a two-tier ordering (a27a1):
+/// - First tier: entries with `.iteration-pending.json` present, sorted
+///   by the marker's `iteration_number` ascending (lower iteration first).
+///   A corrupt marker is treated as `iteration_number: 0` for ordering;
+///   the enumeration does NOT error.
+/// - Second tier: entries WITHOUT the marker, sorted ascending by entry
+///   name (UTF-8 byte order, which is alphabetical for ASCII names).
+///
+/// Within each tier, ties on the primary key fall back to entry name
+/// ascending for determinism. Operators with stacked dependencies (in
+/// the unmarked tier) encode explicit order via numeric prefixes
+/// (`01-`, `02-`).
 pub fn list_pending(workspace: &Path) -> Result<Vec<String>> {
     let root = changes_dir(workspace);
     if !root.exists() {
         return Ok(Vec::new());
     }
-    let mut out: Vec<String> = Vec::new();
+    // Build two tiers:
+    // - marked: (iteration_number_for_ordering, name)
+    // - unmarked: name
+    let mut marked: Vec<(u32, String)> = Vec::new();
+    let mut unmarked: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&root)
         .with_context(|| format!("reading {}", root.display()))?
     {
@@ -81,9 +96,35 @@ pub fn list_pending(workspace: &Path) -> Result<Vec<String>> {
         if !dir.join(PROPOSAL_FILE).is_file() {
             continue;
         }
-        out.push(name);
+        // a27a1: iteration-pending tier check. The marker is NOT an
+        // exclusion (unlike `.question.json`); it's a front-insertion
+        // preference. A corrupt marker is treated as iteration_number 0
+        // for ordering (sorts ahead of any valid marked entries) AND
+        // does NOT cause `list_pending` to error.
+        let marker_path = dir.join(crate::iteration_pending::MARKER_FILE);
+        if marker_path.exists() {
+            let iteration_number = match crate::iteration_pending::read_marker(workspace, &name) {
+                Ok(Some(m)) => m.iteration_number,
+                // A truly absent marker shouldn't happen here (we just
+                // checked `exists()`), but treat absent like corrupt for
+                // safety — both produce iteration_number 0.
+                Ok(None) => 0,
+                Err(_) => 0,
+            };
+            marked.push((iteration_number, name));
+        } else {
+            unmarked.push(name);
+        }
     }
-    out.sort();
+    // Within marked: sort by iteration_number ascending, then by name
+    // ascending for ties.
+    marked.sort_by(|(a_n, a_name), (b_n, b_name)| {
+        a_n.cmp(b_n).then_with(|| a_name.cmp(b_name))
+    });
+    unmarked.sort();
+    let mut out: Vec<String> = Vec::with_capacity(marked.len() + unmarked.len());
+    out.extend(marked.into_iter().map(|(_, n)| n));
+    out.extend(unmarked);
     Ok(out)
 }
 
@@ -1375,6 +1416,121 @@ mod tests {
             msg.contains("neither the active path nor any archive entry exists"),
             "error must name the data-loss condition explicitly: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // a27a1: iteration-pending two-tier ordering tests
+    // -----------------------------------------------------------------
+
+    fn write_iteration_marker(workspace: &Path, change: &str, iteration_number: u32) {
+        let marker = crate::iteration_pending::IterationPendingMarker {
+            completed_tasks: vec!["1".into()],
+            remaining_tasks: vec!["2".into()],
+            reason: "fixture".into(),
+            iteration_number,
+        };
+        crate::iteration_pending::write_marker(workspace, change, &marker).unwrap();
+    }
+
+    /// Task 5.3: unmarked vs. marked — the iteration-pending entry
+    /// comes first despite alphabetical disadvantage.
+    #[test]
+    fn list_pending_iteration_marker_preempts_alphabetical_order() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a30-foo");
+        make_change(ws, "a31-bar");
+        write_iteration_marker(ws, "a31-bar", 2);
+        let listed = list_pending(ws).unwrap();
+        assert_eq!(
+            listed,
+            vec!["a31-bar".to_string(), "a30-foo".to_string()],
+            "iteration-pending entry must come first"
+        );
+    }
+
+    /// Task 5.4: among marked, lower iteration_number sorts first.
+    #[test]
+    fn list_pending_marked_tier_sorts_by_iteration_number_ascending() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a30-foo");
+        make_change(ws, "a31-bar");
+        write_iteration_marker(ws, "a30-foo", 3);
+        write_iteration_marker(ws, "a31-bar", 2);
+        let listed = list_pending(ws).unwrap();
+        assert_eq!(
+            listed,
+            vec!["a31-bar".to_string(), "a30-foo".to_string()],
+            "lower iteration_number must sort first within the marked tier"
+        );
+    }
+
+    /// Task 5.5: the existing alphabetical-among-unmarked behavior is
+    /// preserved (regression test against today's enumeration).
+    #[test]
+    fn list_pending_unmarked_tier_alphabetical_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "c-third");
+        make_change(ws, "a-first");
+        make_change(ws, "b-second");
+        let listed = list_pending(ws).unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                "a-first".to_string(),
+                "b-second".to_string(),
+                "c-third".to_string(),
+            ]
+        );
+    }
+
+    /// Task 5.6: a corrupt marker (unparseable JSON) is treated as
+    /// "iteration_number: 0" for ordering. The corrupt marker does NOT
+    /// cause `list_pending` to error.
+    #[test]
+    fn list_pending_corrupt_marker_treated_as_iteration_zero_and_does_not_error() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a30-corrupt");
+        make_change(ws, "a31-valid");
+        // Inject a corrupt marker for a30-corrupt.
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR)
+                .join("a30-corrupt")
+                .join(crate::iteration_pending::MARKER_FILE),
+            "{ truncated json",
+        )
+        .unwrap();
+        // Valid marker for a31-valid with iteration_number 2.
+        write_iteration_marker(ws, "a31-valid", 2);
+        let listed = list_pending(ws).unwrap();
+        // Both are marked; corrupt's iteration_number-for-ordering is 0
+        // (sorts ahead of the valid 2-iteration entry).
+        assert_eq!(
+            listed,
+            vec!["a30-corrupt".to_string(), "a31-valid".to_string()],
+        );
+    }
+
+    /// The marker is NOT an exclusion: an iteration-pending entry IS
+    /// returned in the pending list (not excluded), AND the existing
+    /// `.question.json` / `.perma-stuck.json` exclusion behavior is
+    /// unchanged for entries with those markers.
+    #[test]
+    fn list_pending_iteration_marker_is_not_an_exclusion() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a30-ready");
+        make_change(ws, "a31-iteration");
+        write_iteration_marker(ws, "a31-iteration", 2);
+        let listed = list_pending(ws).unwrap();
+        assert!(
+            listed.contains(&"a31-iteration".to_string()),
+            "iteration-pending change must be returned in the pending list"
+        );
+        assert!(listed.contains(&"a30-ready".to_string()));
     }
 
     /// Self-heal integration contract: when `queue::archive` returns

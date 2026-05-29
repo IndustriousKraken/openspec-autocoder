@@ -1538,6 +1538,7 @@ pub async fn run_pass_through_commits(
         let (pending_processed, pending_self_heal) = walk_queue(
             workspace,
             repo,
+            github_cfg,
             executor,
             chatops_ctx,
             perma_stuck_threshold,
@@ -1817,6 +1818,15 @@ async fn process_one_waiting(
                     "failed to write spec-needs-revision marker (resume): {e:#}"
                 );
             }
+            // a27a1: same lifecycle as the pending path — SpecNeedsRevision
+            // terminates the iteration sequence; drop the marker.
+            if let Err(e) = crate::iteration_pending::remove_marker(workspace, change) {
+                tracing::warn!(
+                    url = %repo.url,
+                    change = %change,
+                    "failed to remove iteration-pending marker on SpecNeedsRevision (resume): {e:#}"
+                );
+            }
             maybe_post_spec_revision_alert(
                 Some(ctx),
                 repo,
@@ -1826,6 +1836,29 @@ async fn process_one_waiting(
             )
             .await;
             (ResumeDisposition::SpecRevisionMarked, None)
+        }
+        Ok(ExecutorOutcome::IterationRequested { .. }) => {
+            // a27a1: resume returning IterationRequested is unusual but
+            // possible (e.g. the operator's answer pointed the agent at
+            // additional work it can complete in another iteration).
+            // Today's resume path doesn't have the WIP-commit + push
+            // plumbing the pending arm has, AND the iteration cap is
+            // enforced at the classifier which already produced this
+            // variant. Treat it as a Failed-equivalent so the operator
+            // sees the unhandled case rather than silent loss; the next
+            // polling iteration will re-enter the change normally.
+            tracing::warn!(
+                url = %repo.url,
+                change = %change,
+                "resume returned IterationRequested; treating as Failed (resume-side iteration sequences not yet supported)"
+            );
+            (
+                ResumeDisposition::Failed,
+                Some(
+                    "resume returned IterationRequested (unsupported on the resume path)"
+                        .to_string(),
+                ),
+            )
         }
     };
 
@@ -1939,6 +1972,7 @@ async fn escalate_to_chatops(
 async fn walk_queue(
     workspace: &Path,
     repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
     perma_stuck_threshold: u32,
@@ -1949,8 +1983,15 @@ async fn walk_queue(
     let mut includes_self_heal = false;
 
     for change in pending {
-        let result =
-            process_one_pending_change(workspace, repo, executor, chatops_ctx, &change).await;
+        let result = process_one_pending_change(
+            workspace,
+            repo,
+            github_cfg,
+            executor,
+            chatops_ctx,
+            &change,
+        )
+        .await;
 
         let outcome_label = match &result {
             Ok(QueueStep::Archived) => "archived",
@@ -1959,6 +2000,7 @@ async fn walk_queue(
             Ok(QueueStep::Escalated) => "escalated",
             Ok(QueueStep::AskUserExitEarly) => "ask_user_exit_early",
             Ok(QueueStep::SpecRevisionMarked) => "spec_needs_revision",
+            Ok(QueueStep::IterationPending) => "iteration_pending",
             Err(_) => "error",
         };
         tracing::info!(
@@ -2064,6 +2106,23 @@ async fn walk_queue(
                 );
                 break;
             }
+            Ok(QueueStep::IterationPending) => {
+                // a27a1: the executor wants another iteration on this
+                // change. The WIP has been committed + force-pushed to
+                // the agent branch, `.iteration-pending.json` carries the
+                // continuation state, AND `.in-progress` has been dropped
+                // inside `handle_outcome`. The next polling iteration on
+                // this repo will pick the change up first (queue front-
+                // insertion via marker preference). Halt the walk now —
+                // we do NOT chain a follow-up commit on top of the WIP
+                // (PRs are reserved for the FINAL `Completed`).
+                tracing::info!(
+                    url = %repo.url,
+                    change = %change,
+                    "change requested another iteration; halting queue walk this iteration"
+                );
+                break;
+            }
             Err(e) => {
                 // The per-change processing function returned Err from a
                 // non-executor source (e.g. queue::archive collision,
@@ -2105,6 +2164,7 @@ async fn walk_queue(
 async fn process_one_pending_change(
     workspace: &Path,
     repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
     executor: &dyn Executor,
     chatops_ctx: Option<&ChatOpsContext>,
     change: &str,
@@ -2176,7 +2236,8 @@ async fn process_one_pending_change(
     maybe_post_start_of_work(workspace, repo, chatops_ctx, change).await;
 
     let outcome = executor.run(workspace, change).await;
-    let result = handle_outcome(workspace, repo, chatops_ctx, change, outcome).await;
+    let result =
+        handle_outcome(workspace, repo, github_cfg, chatops_ctx, change, outcome).await;
     // Always unlock, even after a Completed → archive (archive moved the
     // dir, so the lock is gone, but `queue::unlock` is idempotent).
     let _ = queue::unlock(workspace, change);
@@ -2555,6 +2616,7 @@ async fn apply_archive_collision_preflight(
     kept
 }
 
+#[derive(Debug)]
 enum QueueStep {
     Archived,
     /// Same archive bookkeeping as `Archived`, but the implementation was
@@ -2577,6 +2639,15 @@ enum QueueStep {
     /// this MUST NOT increment the perma-stuck counter — the marker
     /// handles exclusion directly, the counter is irrelevant here.
     SpecRevisionMarked,
+    /// a27a1: the executor returned `IterationRequested`. The WIP has
+    /// been committed + force-pushed to the agent branch AND the
+    /// `.iteration-pending.json` marker has been written. The walker
+    /// halts this iteration; the next polling iteration picks the
+    /// change up first via the queue's marker-preference ordering.
+    /// Unlike `Failed`, this MUST NOT increment the perma-stuck counter
+    /// — iteration sequences are part of the normal lifecycle, not a
+    /// repeat-execution-failure.
+    IterationPending,
 }
 
 /// Increment the per-change failure counter, and on threshold transition
@@ -3404,6 +3475,7 @@ async fn maybe_post_refork_notification(
 async fn handle_outcome(
     workspace: &Path,
     repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
     chatops_ctx: Option<&ChatOpsContext>,
     change: &str,
     outcome: Result<ExecutorOutcome>,
@@ -3452,6 +3524,18 @@ async fn handle_outcome(
                     "failed to write spec-needs-revision marker: {e:#}"
                 );
             }
+            // a27a1: SpecNeedsRevision terminates the iteration sequence
+            // (operator action is required from here on); drop the
+            // iteration-pending marker so the change reverts to normal
+            // queue ordering on the next iteration. Idempotent — absent
+            // marker is OK.
+            if let Err(e) = crate::iteration_pending::remove_marker(workspace, change) {
+                tracing::warn!(
+                    url = %repo.url,
+                    change = %change,
+                    "failed to remove iteration-pending marker on SpecNeedsRevision: {e:#}"
+                );
+            }
             // (c) Post the chatops alert. Best-effort: any failure is
             // logged at WARN and does not propagate.
             maybe_post_spec_revision_alert(
@@ -3485,12 +3569,37 @@ async fn handle_outcome(
                 Ok(QueueStep::AskUserExitEarly)
             }
         },
+        Ok(ExecutorOutcome::IterationRequested {
+            completed_tasks,
+            remaining_tasks,
+            reason,
+            iteration_number,
+        }) => {
+            handle_iteration_requested(
+                workspace,
+                repo,
+                github_cfg,
+                change,
+                completed_tasks,
+                remaining_tasks,
+                reason,
+                iteration_number,
+            )
+            .await
+        }
         Ok(ExecutorOutcome::Completed { .. }) => {
             // Remove the `.in-progress` lock BEFORE inspecting the working
             // tree: the lock file is untracked and would otherwise show up
             // in `git status --porcelain`, contaminating the dirty check
             // and getting swept into the commit by `git add -A`.
             queue::unlock(workspace, change)?;
+            // a27a1: lifecycle — if a stale `.iteration-pending.json`
+            // marker is present (the prior iteration emitted
+            // IterationRequested AND this iteration emitted Completed),
+            // delete it after the commit + archive step completes
+            // successfully. This is done AFTER the archive section
+            // below; we just stash the workspace + change here so the
+            // delete-after-success site is easy to spot.
             let dirty = git::status_porcelain(workspace)?;
             if dirty.is_empty() {
                 // Self-heal probe: if every task is `[x]` AND
@@ -3565,6 +3674,20 @@ async fn handle_outcome(
                 // reads `openspec/changes/<change>/proposal.md`, which the
                 // archive step moves to `openspec/changes/archive/...`.
                 let subject = build_commit_subject(workspace, change)?;
+                // a27a1: lifecycle — if this Completed terminates a
+                // multi-iteration sequence, delete `.iteration-pending.json`
+                // BEFORE the archive rename so the archived directory
+                // does not carry the marker. Idempotent — absent marker
+                // is fine.
+                if let Err(e) =
+                    crate::iteration_pending::remove_marker(workspace, change)
+                {
+                    tracing::warn!(
+                        url = %repo.url,
+                        change = %change,
+                        "failed to remove iteration-pending marker on Completed: {e:#}"
+                    );
+                }
                 // Archive BEFORE the commit so the single commit captures
                 // both the executor's implementation diff AND the archive
                 // rename. After this sequence the working tree is clean,
@@ -3578,6 +3701,160 @@ async fn handle_outcome(
             Ok(QueueStep::Archived)
         }
     }
+}
+
+/// Polling-loop arm for `ExecutorOutcome::IterationRequested` (a27a1).
+/// Performs, in order:
+///
+/// 1. Commit the workspace's diff to the agent branch with the message
+///    `iteration <N> of <change>: <reason-truncated-to-80-chars>`. If
+///    the working tree is clean (the agent emitted iteration_request
+///    without modifying anything), the commit step is skipped with a
+///    `tracing::warn!` AND the function proceeds to step 3.
+/// 2. Force-push the agent branch to the remote. Push failure aborts:
+///    `tracing::error!` AND skip steps 3 (no marker written, so the next
+///    polling iteration treats the change as normally-pending).
+/// 3. Write `.iteration-pending.json` atomically with the new state.
+/// 4. Drop `.in-progress`.
+///
+/// Step 4 ALWAYS runs (even on push failure, AND even if the marker
+/// write also fails), so the change is never left locked.
+///
+/// This arm SHALL NOT call any PR-open OR PR-comment routine. PRs are
+/// reserved for the FINAL iteration's `Completed` outcome.
+#[allow(clippy::too_many_arguments)]
+async fn handle_iteration_requested(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    change: &str,
+    completed_tasks: Vec<String>,
+    remaining_tasks: Vec<String>,
+    reason: String,
+    iteration_number: u32,
+) -> Result<QueueStep> {
+    // Always unlock at the end of the arm — collect any deferred
+    // errors first AND treat unlock as a best-effort cleanup.
+    let result = run_iteration_requested_steps(
+        workspace,
+        repo,
+        github_cfg,
+        change,
+        completed_tasks,
+        remaining_tasks,
+        reason,
+        iteration_number,
+    )
+    .await;
+    if let Err(e) = queue::unlock(workspace, change) {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            "failed to drop .in-progress on IterationRequested arm: {e:#}"
+        );
+    }
+    result
+}
+
+/// Inner workflow of [`handle_iteration_requested`]. Pulled out so the
+/// outer wrapper can guarantee `.in-progress` is dropped on every exit
+/// path (success, push failure, marker-write failure).
+#[allow(clippy::too_many_arguments)]
+async fn run_iteration_requested_steps(
+    workspace: &Path,
+    repo: &RepositoryConfig,
+    github_cfg: &GithubConfig,
+    change: &str,
+    completed_tasks: Vec<String>,
+    remaining_tasks: Vec<String>,
+    reason: String,
+    iteration_number: u32,
+) -> Result<QueueStep> {
+    // Step 1: commit the diff (or skip if clean).
+    // The .in-progress file is untracked, but `git add -A` would sweep
+    // it into the commit. Drop the lock first (matches the other
+    // outcome arms' discipline). The outer wrapper's unlock-on-exit is
+    // idempotent against this drop.
+    queue::unlock(workspace, change)?;
+    let dirty = git::status_porcelain(workspace)?;
+    if dirty.is_empty() {
+        tracing::warn!(
+            url = %repo.url,
+            change = %change,
+            iteration_number,
+            "IterationRequested with clean working tree: agent emitted iteration_request without modifying any files; writing marker anyway (lack-of-progress will count against the cap on the next iteration)"
+        );
+    } else {
+        let subject = build_iteration_commit_subject(change, iteration_number, &reason);
+        git::add_all(workspace)?;
+        if let Err(e) = git::commit(workspace, &subject) {
+            // Mirror the clean-tree case: log AND proceed to write the
+            // marker. A non-clean tree that nonetheless fails to commit
+            // is an anomaly (probably a config issue like missing
+            // user.email); the marker still belongs because the agent
+            // INTENDED to advance, AND the cap will catch a loop.
+            tracing::warn!(
+                url = %repo.url,
+                change = %change,
+                iteration_number,
+                "iteration-request commit failed (proceeding to marker): {e:#}"
+            );
+        }
+    }
+
+    // Step 2: force-push the agent branch to the remote.
+    let push_remote = if github_cfg.fork_owner.is_some() {
+        "fork"
+    } else {
+        "origin"
+    };
+    if let Err(e) =
+        git::push_force_with_lease(workspace, &repo.agent_branch, push_remote)
+    {
+        tracing::error!(
+            url = %repo.url,
+            change = %change,
+            iteration_number,
+            "iteration-request force-push failed; NOT writing marker: {e:#}"
+        );
+        // Per D5: push failure leaves no marker. The change reverts to
+        // normal pending behaviour on the next polling cycle.
+        return Ok(QueueStep::IterationPending);
+    }
+
+    // Step 3: write `.iteration-pending.json` atomically.
+    let marker = crate::iteration_pending::IterationPendingMarker {
+        completed_tasks,
+        remaining_tasks,
+        reason,
+        iteration_number,
+    };
+    if let Err(e) = crate::iteration_pending::write_marker(workspace, change, &marker) {
+        tracing::error!(
+            url = %repo.url,
+            change = %change,
+            iteration_number,
+            "iteration-pending marker write failed; next iteration will see no continuation context: {e:#}"
+        );
+    }
+    Ok(QueueStep::IterationPending)
+}
+
+/// Build the commit subject for an `IterationRequested` arm's WIP
+/// commit. Format: `iteration <N> of <change>: <reason>` truncated to
+/// keep the subject under 80 chars (the same discipline as
+/// `build_commit_subject`).
+fn build_iteration_commit_subject(
+    change: &str,
+    iteration_number: u32,
+    reason: &str,
+) -> String {
+    const MAX_SUBJECT_LEN: usize = 80;
+    let prefix = format!("iteration {iteration_number} of {change}: ");
+    let room = MAX_SUBJECT_LEN.saturating_sub(prefix.len());
+    let trimmed_reason: String =
+        reason.lines().next().unwrap_or("").trim().chars().take(room).collect();
+    format!("{prefix}{trimmed_reason}")
 }
 
 /// Detect the lazy-archive failure mode: the executor returned Completed
@@ -4799,6 +5076,20 @@ pub async fn process_audit_triages(
                 )
                 .await;
             }
+            Ok(crate::executor::ExecutorOutcome::IterationRequested { .. }) => {
+                tracing::warn!(
+                    url = %repo.url,
+                    thread_ts = %thread_ts,
+                    "audit-triage: executor returned IterationRequested; treating as failure (iteration sequences not applicable to triage mode)"
+                );
+                mark_triage_failed(
+                    &state_root,
+                    &mut state,
+                    "executor returned IterationRequested during triage".to_string(),
+                    chatops_ctx,
+                )
+                .await;
+            }
             Err(e) => {
                 tracing::error!(
                     url = %repo.url,
@@ -5379,6 +5670,20 @@ pub async fn process_proposal_requests(
                     &state_root,
                     &mut state,
                     "executor flagged SpecNeedsRevision during chat-triage".to_string(),
+                    chatops_ctx,
+                )
+                .await;
+            }
+            Ok(crate::executor::ExecutorOutcome::IterationRequested { .. }) => {
+                tracing::warn!(
+                    url = %repo.url,
+                    request_id = %state.request_id,
+                    "chat-triage: executor returned IterationRequested; treating as failure (iteration sequences not applicable to chat-triage mode)"
+                );
+                mark_proposal_failed(
+                    &state_root,
+                    &mut state,
+                    "executor returned IterationRequested during chat-triage".to_string(),
                     chatops_ctx,
                 )
                 .await;
@@ -14191,5 +14496,290 @@ mod tests {
             subjects.contains("audit: security_bug proposals (1 change(s))"),
             "audit's commit subject must be present on remote agent-q; got: {subjects}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // a27a1: IterationRequested polling-loop arm tests
+    // -----------------------------------------------------------------
+
+    /// build_iteration_commit_subject keeps the subject under 80 chars
+    /// AND uses the canonical `iteration N of <change>: <reason>` shape.
+    #[test]
+    fn build_iteration_commit_subject_truncates_long_reason() {
+        let long_reason = "a".repeat(200);
+        let s = build_iteration_commit_subject("a30-foo", 2, &long_reason);
+        assert!(s.len() <= 80, "subject too long: {} chars: {s}", s.len());
+        assert!(s.starts_with("iteration 2 of a30-foo: "), "subject: {s}");
+    }
+
+    #[test]
+    fn build_iteration_commit_subject_uses_first_line_of_reason() {
+        let multi_line = "first line\nsecond line";
+        let s = build_iteration_commit_subject("a30-foo", 3, multi_line);
+        assert_eq!(s, "iteration 3 of a30-foo: first line");
+    }
+
+    /// Task 4.7: integration test. An `IterationRequested` outcome
+    /// dispatched through `handle_outcome` (a) commits the workspace
+    /// diff to the agent branch with the iteration-numbered subject,
+    /// (b) force-pushes the agent branch to the remote, AND (c) writes
+    /// `.iteration-pending.json` with the documented payload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iteration_requested_commits_pushes_and_writes_marker() {
+        let (dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "a31-bar", "fixture reason");
+        // Switch to agent-q so the iteration arm's commit + push hits the
+        // expected branch. `recreate_branch` is idempotent here.
+        git::recreate_branch(&ws, "agent-q").unwrap();
+        // Establish the change's .in-progress lock — the arm must drop
+        // it as part of its cleanup.
+        queue::lock(&ws, "a31-bar").unwrap();
+        // Modify a workspace file so there's a real diff to commit.
+        std::fs::write(ws.join("artifact.txt"), "iteration 2 progress\n").unwrap();
+
+        let repo = fixture_repo(&ws);
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+        let outcome = Ok(ExecutorOutcome::IterationRequested {
+            completed_tasks: vec!["1".into(), "2".into()],
+            remaining_tasks: vec!["3".into()],
+            reason: "task 3 needs a refactor I want to plan more carefully".into(),
+            iteration_number: 2,
+        });
+        let step =
+            handle_outcome(&ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
+        assert!(
+            matches!(step, QueueStep::IterationPending),
+            "expected IterationPending QueueStep; got {step:?}"
+        );
+
+        // (a) The marker was written with the documented payload.
+        let marker =
+            crate::iteration_pending::read_marker(&ws, "a31-bar").unwrap().unwrap();
+        assert_eq!(marker.iteration_number, 2);
+        assert_eq!(marker.completed_tasks, vec!["1".to_string(), "2".to_string()]);
+        assert_eq!(marker.remaining_tasks, vec!["3".to_string()]);
+        assert_eq!(
+            marker.reason,
+            "task 3 needs a refactor I want to plan more carefully"
+        );
+
+        // (b) The agent-branch's HEAD subject is the iteration commit.
+        let head_subject = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%s"])
+            .current_dir(&ws)
+            .output()
+            .unwrap();
+        let subject = String::from_utf8_lossy(&head_subject.stdout).to_string();
+        assert!(
+            subject.starts_with("iteration 2 of a31-bar:"),
+            "agent-branch HEAD subject must be the iteration commit; got: {subject}"
+        );
+
+        // (c) The remote's agent-q ref also has the new commit (the
+        // arm force-pushed). Look up the remote agent-q's log subjects.
+        let remote = dir.path().join("remote");
+        let remote_log = std::process::Command::new("git")
+            .args(["log", "agent-q", "--format=%s"])
+            .current_dir(&remote)
+            .output()
+            .unwrap();
+        let remote_subjects = String::from_utf8_lossy(&remote_log.stdout).to_string();
+        assert!(
+            remote_log.status.success(),
+            "agent-q must exist on the remote after force-push: {remote_subjects}"
+        );
+        assert!(
+            remote_subjects.contains("iteration 2 of a31-bar:"),
+            "remote agent-q must contain the iteration commit; got: {remote_subjects}"
+        );
+
+        // (d) The .in-progress lock was dropped.
+        assert!(
+            !ws.join("openspec/changes/a31-bar/.in-progress").exists(),
+            ".in-progress must be dropped by the IterationRequested arm"
+        );
+
+        // (e) No PR-related routine was called — verify by absence of
+        // any HTTP mock setup. This test does NOT set up mockito for
+        // GitHub; if the arm tried to open a PR it would fail with a
+        // connection error AND fall over before this assertion.
+    }
+
+    /// Task 6.5: Completed deletes `.iteration-pending.json`. Self-heal
+    /// AND main Completed paths both archive (which itself moves the
+    /// directory); the explicit deletion happens BEFORE the archive
+    /// rename, so the archived directory does not carry the marker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_arm_deletes_iteration_pending_marker() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "a31-bar", "fixture reason");
+        // Establish a stale marker (prior iteration's IterationRequested).
+        crate::iteration_pending::write_marker(
+            &ws,
+            "a31-bar",
+            &crate::iteration_pending::IterationPendingMarker {
+                completed_tasks: vec!["1".into(), "2".into()],
+                remaining_tasks: vec!["3".into()],
+                reason: "prior reason".into(),
+                iteration_number: 2,
+            },
+        )
+        .unwrap();
+        queue::lock(&ws, "a31-bar").unwrap();
+        // Make a real diff so the Completed arm reaches its archive +
+        // commit branch.
+        std::fs::write(ws.join("artifact.txt"), "final work\n").unwrap();
+
+        let repo = fixture_repo(&ws);
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+        let outcome = Ok(ExecutorOutcome::Completed { final_answer: None });
+        let step =
+            handle_outcome(&ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
+        assert!(matches!(step, QueueStep::Archived), "expected Archived; got {step:?}");
+        // Marker was deleted BEFORE the archive rename, so the
+        // archived directory should NOT carry it either.
+        assert!(
+            !crate::iteration_pending::marker_exists(&ws, "a31-bar"),
+            "iteration-pending marker must be removed on Completed"
+        );
+        // (sanity) the active dir is gone (it was archived).
+        assert!(
+            !ws.join("openspec/changes/a31-bar").exists(),
+            "active change dir must have been archived"
+        );
+    }
+
+    /// Task 6.5: SpecNeedsRevision deletes `.iteration-pending.json`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spec_needs_revision_arm_deletes_iteration_pending_marker() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "a31-bar", "fixture reason");
+        crate::iteration_pending::write_marker(
+            &ws,
+            "a31-bar",
+            &crate::iteration_pending::IterationPendingMarker {
+                completed_tasks: vec!["1".into()],
+                remaining_tasks: vec!["2".into()],
+                reason: "prior".into(),
+                iteration_number: 2,
+            },
+        )
+        .unwrap();
+        queue::lock(&ws, "a31-bar").unwrap();
+
+        let repo = fixture_repo(&ws);
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+        let outcome = Ok(ExecutorOutcome::SpecNeedsRevision {
+            unimplementable_tasks: vec![crate::executor::UnimplementableTask {
+                task_id: "6.4".into(),
+                task_text: "manual".into(),
+                reason: "sandbox".into(),
+            }],
+            revision_suggestion: "do a thing".into(),
+        });
+        let step =
+            handle_outcome(&ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
+        assert!(
+            matches!(step, QueueStep::SpecRevisionMarked),
+            "expected SpecRevisionMarked; got {step:?}"
+        );
+        assert!(
+            !crate::iteration_pending::marker_exists(&ws, "a31-bar"),
+            "iteration-pending marker must be removed on SpecNeedsRevision"
+        );
+    }
+
+    /// Task 6.5: Failed arm leaves `.iteration-pending.json` untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_arm_preserves_iteration_pending_marker() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "a31-bar", "fixture reason");
+        let marker = crate::iteration_pending::IterationPendingMarker {
+            completed_tasks: vec!["1".into()],
+            remaining_tasks: vec!["2".into()],
+            reason: "prior".into(),
+            iteration_number: 2,
+        };
+        crate::iteration_pending::write_marker(&ws, "a31-bar", &marker).unwrap();
+        queue::lock(&ws, "a31-bar").unwrap();
+
+        let repo = fixture_repo(&ws);
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+        let outcome = Ok(ExecutorOutcome::Failed {
+            reason: "timeout".into(),
+        });
+        let step =
+            handle_outcome(&ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
+        assert!(
+            matches!(step, QueueStep::Failed { .. }),
+            "expected Failed; got {step:?}"
+        );
+        let still =
+            crate::iteration_pending::read_marker(&ws, "a31-bar").unwrap().unwrap();
+        assert_eq!(still, marker, "Failed must NOT touch the marker");
+    }
+
+    /// Task 6.5: AskUser arm leaves `.iteration-pending.json` untouched.
+    /// AskUser without chatops_ctx returns `AskUserExitEarly` AND does
+    /// NOT touch the marker (the agent's question may resolve into a
+    /// continuation; the iteration context stays available).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ask_user_arm_preserves_iteration_pending_marker() {
+        let (_dir, ws) = fixture_workspace_with_remote();
+        add_committed_change(&ws, "a31-bar", "fixture reason");
+        let marker = crate::iteration_pending::IterationPendingMarker {
+            completed_tasks: vec!["1".into()],
+            remaining_tasks: vec!["2".into()],
+            reason: "prior".into(),
+            iteration_number: 2,
+        };
+        crate::iteration_pending::write_marker(&ws, "a31-bar", &marker).unwrap();
+        queue::lock(&ws, "a31-bar").unwrap();
+
+        let repo = fixture_repo(&ws);
+        let github_cfg = GithubConfig {
+            token_env: "DOES_NOT_EXIST".into(),
+            token: None,
+            owner_tokens: None,
+            fork_owner: None,
+            recreate_fork_on_reinit: false,
+        };
+        let outcome = Ok(ExecutorOutcome::AskUser {
+            question: "what next?".into(),
+            resume_handle: crate::executor::ResumeHandle(serde_json::json!({})),
+        });
+        let step =
+            handle_outcome(&ws, &repo, &github_cfg, None, "a31-bar", outcome).await.unwrap();
+        assert!(
+            matches!(step, QueueStep::AskUserExitEarly),
+            "expected AskUserExitEarly (no chatops_ctx); got {step:?}"
+        );
+        let still =
+            crate::iteration_pending::read_marker(&ws, "a31-bar").unwrap().unwrap();
+        assert_eq!(still, marker, "AskUser must NOT touch the marker");
     }
 }

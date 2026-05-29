@@ -39,6 +39,11 @@ pub enum RecordedOutcome {
         unimplementable_tasks: Vec<RecordedUnimplementableTask>,
         revision_suggestion: String,
     },
+    IterationRequest {
+        completed_tasks: Vec<String>,
+        remaining_tasks: Vec<String>,
+        reason: String,
+    },
 }
 
 /// Shared, mutex-protected map for in-flight outcomes. Cheap to clone:
@@ -160,5 +165,43 @@ mod tests {
         let json = serde_json::json!({ "type": "success" });
         let back: RecordedOutcome = serde_json::from_value(json).unwrap();
         assert_eq!(back, RecordedOutcome::Success { final_answer: None });
+    }
+
+    fn sample_iteration_request() -> RecordedOutcome {
+        RecordedOutcome::IterationRequest {
+            completed_tasks: vec!["1".to_string(), "2".to_string()],
+            remaining_tasks: vec!["3".to_string()],
+            reason: "task 3 needs a refactor I want to plan more carefully".to_string(),
+        }
+    }
+
+    #[test]
+    fn iteration_request_variant_round_trips_serde_with_tag() {
+        let v = sample_iteration_request();
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["type"], "iteration_request");
+        assert_eq!(json["completed_tasks"][0], "1");
+        assert_eq!(json["completed_tasks"][1], "2");
+        assert_eq!(json["remaining_tasks"][0], "3");
+        assert_eq!(
+            json["reason"],
+            "task 3 needs a refactor I want to plan more carefully"
+        );
+        let back: RecordedOutcome = serde_json::from_value(json).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn iteration_request_record_then_consume_round_trip_byte_for_byte() {
+        let store = OutcomeStore::new();
+        let v = sample_iteration_request();
+        store.record("my-repo".into(), "a30-foo".into(), v.clone());
+        let got = store.consume("my-repo", "a30-foo").unwrap();
+        // Byte-for-byte equivalence: serde_json::to_value of both
+        // produces identical JSON.
+        let v_json = serde_json::to_value(&v).unwrap();
+        let got_json = serde_json::to_value(&got).unwrap();
+        assert_eq!(v_json, got_json);
+        assert_eq!(got, v);
     }
 }

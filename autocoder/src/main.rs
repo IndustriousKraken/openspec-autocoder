@@ -19,6 +19,7 @@ mod git;
 mod github;
 mod github_credentials;
 mod ignore_for_queue;
+mod iteration_pending;
 mod llm;
 mod log_retention;
 mod mcp_askuser_server;

@@ -203,6 +203,17 @@ pub async fn process_pending_brownfield(
             let _ = git::reset_hard_head(workspace);
             let _ = git::clean_force(workspace);
         }
+        Ok(ExecutorOutcome::IterationRequested { .. }) => {
+            mark_failed(
+                workspace,
+                &mut state,
+                "executor returned IterationRequested during brownfield-draft (iteration sequences not applicable)".to_string(),
+                chatops_ctx,
+            )
+            .await;
+            let _ = git::reset_hard_head(workspace);
+            let _ = git::clean_force(workspace);
+        }
         Err(e) => {
             mark_failed(
                 workspace,

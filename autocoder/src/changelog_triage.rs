@@ -223,6 +223,9 @@ async fn process_one_request(
         ExecutorOutcome::SpecNeedsRevision { .. } => Err(anyhow!(
             "executor flagged SpecNeedsRevision during changelog run"
         )),
+        ExecutorOutcome::IterationRequested { .. } => Err(anyhow!(
+            "executor returned IterationRequested during changelog run (iteration sequences not applicable)"
+        )),
     }
 }
 
@@ -620,6 +623,11 @@ async fn re_run_stylist_and_force_push(
         }
         ExecutorOutcome::SpecNeedsRevision { .. } => {
             return Err(anyhow!("executor returned SpecNeedsRevision; not supported here"));
+        }
+        ExecutorOutcome::IterationRequested { .. } => {
+            return Err(anyhow!(
+                "executor returned IterationRequested; not supported here"
+            ));
         }
     }
     let porcelain = git::status_porcelain(workspace)

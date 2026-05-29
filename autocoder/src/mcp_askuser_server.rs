@@ -147,6 +147,32 @@ fn handle_request<W: Write>(
                         }
                     },
                     {
+                        "name": "outcome_request_iteration",
+                        "description": "Signal that you completed some tasks but want another iteration to finish the rest. Use this when you started implementation honestly but ran out of capacity in this iteration — NOT for unimplementable tasks (use `outcome_spec_needs_revision` for those). The cumulative completed/remaining lists carry forward across iterations; the reason field documents the concrete blocker. Input is schema-validated at the MCP layer; empty arrays and placeholder-shaped strings (e.g. `<concrete blocker>`) are rejected with a tool error that you can correct AND retry in the same session.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "completed_tasks": {
+                                    "type": "array",
+                                    "description": "Cumulative across iterations — every task id (e.g. \"1.2\") that has been completed so far, including those from prior iterations. Non-empty.",
+                                    "items": { "type": "string" },
+                                    "minItems": 1
+                                },
+                                "remaining_tasks": {
+                                    "type": "array",
+                                    "description": "Task ids still pending after this iteration. Non-empty.",
+                                    "items": { "type": "string" },
+                                    "minItems": 1
+                                },
+                                "reason": {
+                                    "type": "string",
+                                    "description": "Concrete one-line blocker — what specifically prevented you from finishing this iteration. No placeholder-shaped strings."
+                                }
+                            },
+                            "required": ["completed_tasks", "remaining_tasks", "reason"]
+                        }
+                    },
+                    {
                         "name": "outcome_spec_needs_revision",
                         "description": "Signal that tasks.md names one or more tasks the agent cannot complete in this sandbox. Use this INSTEAD OF emitting the legacy `=== AUTOCODER-OUTCOME ===` stdout block. Input is schema-validated at the MCP layer; placeholder-shaped strings (e.g. `<id-from-tasks-md>`) are rejected with a tool error that you can correct AND retry in the same session.",
                         "inputSchema": {
@@ -289,6 +315,36 @@ fn handle_request<W: Write>(
                                     "outcome_success: control-socket relay failed: {e}"
                                 ),
                             )?;
+                        }
+                    }
+                }
+                "outcome_request_iteration" => {
+                    match validate_request_iteration_args(&call.arguments) {
+                        Ok(payload) => match relay_record_outcome(&payload) {
+                            Ok(()) => {
+                                let text = "Outcome recorded: iteration_request.";
+                                let result = serde_json::json!({
+                                    "content": [
+                                        { "type": "text", "text": text }
+                                    ],
+                                    "isError": false,
+                                    "structuredContent": { "ok": true }
+                                });
+                                emit_result(writer, id, result)?;
+                            }
+                            Err(e) => {
+                                emit_error(
+                                    writer,
+                                    id,
+                                    -32603,
+                                    &format!(
+                                        "outcome_request_iteration: control-socket relay failed: {e}"
+                                    ),
+                                )?;
+                            }
+                        },
+                        Err(msg) => {
+                            emit_error(writer, id, -32602, &msg)?;
                         }
                     }
                 }
@@ -506,6 +562,78 @@ pub(crate) fn validate_spec_needs_revision_args(
         "type": "spec_needs_revision",
         "unimplementable_tasks": validated_tasks,
         "revision_suggestion": revision_str,
+    }))
+}
+
+/// Validate the `outcome_request_iteration` tool arguments at the MCP
+/// layer. Returns `Err(<message>)` on any schema violation; the control
+/// socket is NOT contacted on failure. On success, returns the variant-
+/// tagged outcome payload ready to ship to the daemon's `record_outcome`
+/// action.
+pub(crate) fn validate_request_iteration_args(
+    args: &serde_json::Value,
+) -> std::result::Result<serde_json::Value, String> {
+    fn validate_string_array(
+        args: &serde_json::Value,
+        field: &str,
+    ) -> std::result::Result<Vec<String>, String> {
+        let val = args.get(field).ok_or_else(|| {
+            format!("outcome_request_iteration: missing required field `{field}`")
+        })?;
+        let array = val.as_array().ok_or_else(|| {
+            format!("outcome_request_iteration: `{field}` must be an array")
+        })?;
+        if array.is_empty() {
+            return Err(format!(
+                "outcome_request_iteration: `{field}` must be a non-empty array"
+            ));
+        }
+        let mut out: Vec<String> = Vec::with_capacity(array.len());
+        for (i, entry) in array.iter().enumerate() {
+            let s = entry.as_str().ok_or_else(|| {
+                format!(
+                    "outcome_request_iteration: `{field}[{i}]` must be a string"
+                )
+            })?;
+            if s.is_empty() {
+                return Err(format!(
+                    "outcome_request_iteration: `{field}[{i}]` must be a non-empty string"
+                ));
+            }
+            if contains_placeholder_marker(s) {
+                return Err(format!(
+                    "outcome_request_iteration: `{field}[{i}]` contains placeholder-shaped text (`<...>`). Substitute concrete values AND retry."
+                ));
+            }
+            out.push(s.to_string());
+        }
+        Ok(out)
+    }
+
+    let completed_tasks = validate_string_array(args, "completed_tasks")?;
+    let remaining_tasks = validate_string_array(args, "remaining_tasks")?;
+    let reason_val = args.get("reason").ok_or_else(|| {
+        "outcome_request_iteration: missing required field `reason`".to_string()
+    })?;
+    let reason_str = reason_val.as_str().ok_or_else(|| {
+        "outcome_request_iteration: `reason` must be a string".to_string()
+    })?;
+    if reason_str.is_empty() {
+        return Err(
+            "outcome_request_iteration: `reason` must be a non-empty string".to_string(),
+        );
+    }
+    if contains_placeholder_marker(reason_str) {
+        return Err(
+            "outcome_request_iteration: `reason` contains placeholder-shaped text (`<...>`). Substitute a concrete blocker AND retry."
+                .to_string(),
+        );
+    }
+    Ok(serde_json::json!({
+        "type": "iteration_request",
+        "completed_tasks": completed_tasks,
+        "remaining_tasks": remaining_tasks,
+        "reason": reason_str,
     }))
 }
 
@@ -1182,6 +1310,240 @@ mod tests {
             std::env::remove_var(ENV_CHANGE);
         }
     }
+
+    // ----- a27a1: outcome_request_iteration -----
+
+    #[test]
+    fn tools_list_advertises_outcome_request_iteration() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":200,"method":"tools/list"}"#],
+        );
+        let tools = resps[0]["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> =
+            tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(
+            names.contains(&"outcome_request_iteration"),
+            "names: {names:?}"
+        );
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "outcome_request_iteration")
+            .unwrap();
+        let required: Vec<&str> = tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"completed_tasks"));
+        assert!(required.contains(&"remaining_tasks"));
+        assert!(required.contains(&"reason"));
+        // minItems: 1 documented for both arrays.
+        assert_eq!(
+            tool["inputSchema"]["properties"]["completed_tasks"]["minItems"], 1
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["remaining_tasks"]["minItems"], 1
+        );
+    }
+
+    #[test]
+    fn validate_request_iteration_accepts_valid_input() {
+        let args = serde_json::json!({
+            "completed_tasks": ["1", "2"],
+            "remaining_tasks": ["3"],
+            "reason": "task 3 needs a refactor I want to plan more carefully"
+        });
+        let out = validate_request_iteration_args(&args).unwrap();
+        assert_eq!(out["type"], "iteration_request");
+        assert_eq!(out["completed_tasks"][0], "1");
+        assert_eq!(out["remaining_tasks"][0], "3");
+        assert_eq!(
+            out["reason"],
+            "task 3 needs a refactor I want to plan more carefully"
+        );
+    }
+
+    #[test]
+    fn validate_request_iteration_rejects_empty_completed_tasks() {
+        let args = serde_json::json!({
+            "completed_tasks": [],
+            "remaining_tasks": ["3"],
+            "reason": "r"
+        });
+        let err = validate_request_iteration_args(&args).unwrap_err();
+        assert!(err.contains("completed_tasks"), "err: {err}");
+        assert!(err.contains("non-empty"), "err: {err}");
+    }
+
+    #[test]
+    fn validate_request_iteration_rejects_empty_remaining_tasks() {
+        let args = serde_json::json!({
+            "completed_tasks": ["1"],
+            "remaining_tasks": [],
+            "reason": "r"
+        });
+        let err = validate_request_iteration_args(&args).unwrap_err();
+        assert!(err.contains("remaining_tasks"), "err: {err}");
+        assert!(err.contains("non-empty"), "err: {err}");
+    }
+
+    #[test]
+    fn validate_request_iteration_rejects_empty_reason() {
+        let args = serde_json::json!({
+            "completed_tasks": ["1"],
+            "remaining_tasks": ["3"],
+            "reason": ""
+        });
+        let err = validate_request_iteration_args(&args).unwrap_err();
+        assert!(err.contains("reason"), "err: {err}");
+        assert!(err.contains("non-empty"), "err: {err}");
+    }
+
+    #[test]
+    fn validate_request_iteration_rejects_placeholder_in_reason() {
+        let args = serde_json::json!({
+            "completed_tasks": ["1"],
+            "remaining_tasks": ["3"],
+            "reason": "<concrete blocker>"
+        });
+        let err = validate_request_iteration_args(&args).unwrap_err();
+        assert!(err.contains("placeholder"), "err: {err}");
+        assert!(err.contains("reason"), "err: {err}");
+    }
+
+    #[test]
+    fn validate_request_iteration_rejects_placeholder_in_completed_tasks_element() {
+        let args = serde_json::json!({
+            "completed_tasks": ["1", "<task-id>"],
+            "remaining_tasks": ["3"],
+            "reason": "r"
+        });
+        let err = validate_request_iteration_args(&args).unwrap_err();
+        assert!(err.contains("placeholder"), "err: {err}");
+        assert!(err.contains("completed_tasks"), "err: {err}");
+    }
+
+    #[test]
+    fn validate_request_iteration_rejects_placeholder_in_remaining_tasks_element() {
+        let args = serde_json::json!({
+            "completed_tasks": ["1"],
+            "remaining_tasks": ["<task-id>"],
+            "reason": "r"
+        });
+        let err = validate_request_iteration_args(&args).unwrap_err();
+        assert!(err.contains("placeholder"), "err: {err}");
+        assert!(err.contains("remaining_tasks"), "err: {err}");
+    }
+
+    #[test]
+    fn outcome_request_iteration_invalid_input_returns_invalid_params() {
+        // The MCP layer must short-circuit on validation failure WITHOUT
+        // contacting the control socket. Pointing ENV_CONTROL_SOCKET at a
+        // nonexistent path verifies the short-circuit: if the validator
+        // FAILED to fire, the relay would attempt a connection AND produce
+        // -32603. We assert -32602, which proves the socket wasn't touched.
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_CONTROL_SOCKET, "/nonexistent/control.sock");
+            std::env::set_var(ENV_WORKSPACE_BASENAME, "test-ws");
+            std::env::set_var(ENV_CHANGE, "a30-foo");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":201,"method":"tools/call","params":{"name":"outcome_request_iteration","arguments":{"completed_tasks":["1"],"remaining_tasks":["3"],"reason":"<concrete blocker>"}}}"#],
+        );
+        assert_eq!(resps[0]["error"]["code"], -32602);
+        let msg = resps[0]["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("placeholder"), "msg: {msg}");
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+            std::env::remove_var(ENV_CHANGE);
+        }
+    }
+
+    #[test]
+    fn outcome_request_iteration_relays_via_socket_on_valid_input() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let socket_dir = TempDir::new().unwrap();
+        let socket_path = socket_dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let received: Arc<Mutex<Option<serde_json::Value>>> =
+            Arc::new(Mutex::new(None));
+        let received_clone = received.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = String::new();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            std::io::BufRead::read_line(&mut reader, &mut buf).unwrap();
+            let req: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+            *received_clone.lock().unwrap() = Some(req);
+            let response = serde_json::json!({"ok": true});
+            let mut s = serde_json::to_string(&response).unwrap();
+            s.push('\n');
+            stream.write_all(s.as_bytes()).unwrap();
+        });
+        unsafe {
+            std::env::set_var(
+                ENV_CONTROL_SOCKET,
+                socket_path.to_string_lossy().to_string(),
+            );
+            std::env::set_var(ENV_WORKSPACE_BASENAME, "test-ws");
+            std::env::set_var(ENV_CHANGE, "a30-foo");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":202,"method":"tools/call","params":{"name":"outcome_request_iteration","arguments":{"completed_tasks":["1","2"],"remaining_tasks":["3"],"reason":"task 3 needs a refactor"}}}"#],
+        );
+        handle.join().unwrap();
+        assert_eq!(resps[0]["result"]["isError"], false);
+        let recv = received.lock().unwrap().take().unwrap();
+        assert_eq!(recv["action"], "record_outcome");
+        assert_eq!(recv["workspace_basename"], "test-ws");
+        assert_eq!(recv["change"], "a30-foo");
+        assert_eq!(recv["outcome"]["type"], "iteration_request");
+        assert_eq!(recv["outcome"]["completed_tasks"][0], "1");
+        assert_eq!(recv["outcome"]["completed_tasks"][1], "2");
+        assert_eq!(recv["outcome"]["remaining_tasks"][0], "3");
+        assert_eq!(recv["outcome"]["reason"], "task 3 needs a refactor");
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+            std::env::remove_var(ENV_CHANGE);
+        }
+    }
+
+    #[test]
+    fn outcome_request_iteration_socket_unreachable_returns_internal_error() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_CONTROL_SOCKET, "/nonexistent/control.sock");
+            std::env::set_var(ENV_WORKSPACE_BASENAME, "test-ws");
+            std::env::set_var(ENV_CHANGE, "a30-foo");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":203,"method":"tools/call","params":{"name":"outcome_request_iteration","arguments":{"completed_tasks":["1"],"remaining_tasks":["3"],"reason":"r"}}}"#],
+        );
+        assert_eq!(resps[0]["error"]["code"], -32603);
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+            std::env::remove_var(ENV_CHANGE);
+        }
+    }
+
+    // ----- end a27a1 -----
 
     // ----- end a27a0 -----
 

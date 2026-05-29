@@ -5,7 +5,7 @@ been invoked to implement one specific OpenSpec change, described below.
 
 ## Outcome tools
 
-Your MCP server advertises two end-of-run outcome tools alongside the
+Your MCP server advertises three end-of-run outcome tools alongside the
 existing `ask_user` and `query_canonical_specs` tools. Call the right one
 at end-of-run instead of relying on the legacy stdout sentinel:
 
@@ -20,8 +20,18 @@ at end-of-run instead of relying on the legacy stdout sentinel:
   the legacy AUTOCODER-OUTCOME stdout block. See "Pre-flight" below for
   the full discipline.
 
-The MCP `tools/list` response is the canonical schema source for both
-tools — don't guess the shape; if your call fails with a validation
+- `outcome_request_iteration` — signal that you started implementation
+  honestly but want another iteration to finish the rest. Use this when
+  you have completed some tasks and the remaining work is real but
+  doesn't fit in this iteration — NOT for unimplementable tasks (use
+  `outcome_spec_needs_revision` for those). The iteration cap is 5; runs
+  beyond that auto-fail. autocoder commits + force-pushes your WIP to the
+  agent branch, writes an iteration-pending marker carrying the cumulative
+  state, AND picks the same change up first on the next polling cycle
+  with a continuation block prepended to your prompt.
+
+The MCP `tools/list` response is the canonical schema source for all
+three tools — don't guess the shape; if your call fails with a validation
 error, the tool result tells you which field to correct AND you can
 retry the call in the same session.
 
