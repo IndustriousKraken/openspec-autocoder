@@ -1068,6 +1068,22 @@ impl ClaudeCliExecutor {
         change: &str,
         outcome: SubprocessOutcome,
     ) -> Result<ExecutorOutcome> {
+        // Tool-recorded outcome lookup (a27a0). The per-execution MCP
+        // child relays `outcome_success` / `outcome_spec_needs_revision`
+        // tool calls to the daemon via `record_outcome`; we drain via
+        // `consume_outcome`. A recorded outcome is the agent's
+        // deliberate, schema-validated end-of-run emission and is more
+        // authoritative than ANY inferred state (timeout, exit status,
+        // stdout content). Runs without a recorded outcome fall through
+        // to today's exact classifier ordering, preserving behavior for
+        // pre-a27a0 implementer prompts.
+        let workspace_basename = workspace_basename_for(workspace);
+        if let Some(recorded) =
+            try_consume_outcome(&workspace_basename, change).await
+        {
+            return Ok(map_recorded_outcome(recorded));
+        }
+
         // Layer-1 first: the marker file is the authoritative signal. It
         // may have been written even if the wrapped CLI exited non-zero.
         if let Some(question) = Self::check_askuser_marker(workspace, change)? {
@@ -1116,7 +1132,18 @@ impl ClaudeCliExecutor {
             && let Some(payload) = Self::extract_outcome_sentinel(source)
         {
             match Self::try_parse_spec_needs_revision(&payload) {
-                Ok(Some(spec_revision)) => return Ok(spec_revision),
+                Ok(Some(spec_revision)) => {
+                    // a27a0 deprecation: this path is the legacy stdout
+                    // sentinel match. The canonical replacement is the
+                    // `outcome_spec_needs_revision` MCP tool. Emit a
+                    // warning so operator logs surface the use of the
+                    // deprecated path; scheduled removal is a27a2.
+                    tracing::warn!(
+                        change = %change,
+                        "legacy stdout sentinel matched for change {change}; please call the outcome_spec_needs_revision MCP tool instead (stdout sentinel parsing is scheduled for removal in a27a2)",
+                    );
+                    return Ok(spec_revision);
+                }
                 Ok(None) => {
                     // Sentinel present but not a spec_needs_revision payload.
                     // Other parsers (none today) could match here; fall
@@ -1189,6 +1216,120 @@ fn build_handle(workspace: &Path, change: &str, session_id: Option<String>) -> R
         session_id,
     };
     ResumeHandle(serde_json::to_value(data).expect("handle serializes"))
+}
+
+/// Resolve the workspace basename routing key the daemon uses to key
+/// the outcome store. Mirrors how `ClaudeCliExecutor::write_mcp_config`
+/// resolves it (env var if set, falling back to the path's file name).
+fn workspace_basename_for(workspace: &Path) -> String {
+    std::env::var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME).unwrap_or_else(|_| {
+        workspace
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown_workspace")
+            .to_string()
+    })
+}
+
+/// Send a `consume_outcome` action to the daemon's control socket. The
+/// socket path is read from `ENV_CONTROL_SOCKET`; tests that have not
+/// set the env get an immediate `None` so the classifier falls through
+/// to legacy behavior. Transport failures log a warning and return
+/// `None` — the deliberate outcome signal is best-effort; the legacy
+/// path remains as a safety net for the deprecation window.
+async fn try_consume_outcome(
+    workspace_basename: &str,
+    change: &str,
+) -> Option<crate::outcome_store::RecordedOutcome> {
+    let socket = std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET).ok()?;
+    let request = serde_json::json!({
+        "action": "consume_outcome",
+        "workspace_basename": workspace_basename,
+        "change": change,
+    });
+    let socket_path = std::path::PathBuf::from(socket);
+    // The daemon's control socket may not exist in some test runs that
+    // exercise `classify_outcome` without starting the daemon. Probe
+    // before connecting so a missing socket is a quiet `None` instead
+    // of an error log line in every test.
+    if !socket_path.exists() {
+        return None;
+    }
+    let resp = match send_consume_outcome(&socket_path, request).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                workspace_basename = %workspace_basename,
+                change = %change,
+                "consume_outcome relay failed; falling through to legacy classifier: {e:#}"
+            );
+            return None;
+        }
+    };
+    if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let outcome_val = resp.get("outcome")?;
+    if outcome_val.is_null() {
+        return None;
+    }
+    serde_json::from_value(outcome_val.clone()).ok()
+}
+
+/// One-shot UDS round trip: send the JSON request followed by a newline,
+/// read the single-line JSON response. Bounded by a 10-second timeout
+/// matching the MCP child's relay primitive.
+async fn send_consume_outcome(
+    socket_path: &Path,
+    request: serde_json::Value,
+) -> Result<serde_json::Value> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let timeout = Duration::from_secs(10);
+    let stream = tokio::time::timeout(timeout, tokio::net::UnixStream::connect(socket_path))
+        .await
+        .map_err(|_| anyhow!("control socket connect timed out"))??;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut bytes = serde_json::to_vec(&request)?;
+    bytes.push(b'\n');
+    tokio::time::timeout(timeout, write_half.write_all(&bytes))
+        .await
+        .map_err(|_| anyhow!("control socket write timed out"))??;
+    tokio::time::timeout(timeout, write_half.shutdown())
+        .await
+        .map_err(|_| anyhow!("control socket shutdown timed out"))??;
+    let mut reader = tokio::io::BufReader::new(read_half);
+    let mut line = String::new();
+    tokio::time::timeout(timeout, reader.read_line(&mut line))
+        .await
+        .map_err(|_| anyhow!("control socket read timed out"))??;
+    let value: serde_json::Value = serde_json::from_str(line.trim())
+        .with_context(|| format!("decoding consume_outcome response: {line:?}"))?;
+    Ok(value)
+}
+
+/// Map a daemon-recorded outcome to its `ExecutorOutcome` counterpart.
+fn map_recorded_outcome(
+    recorded: crate::outcome_store::RecordedOutcome,
+) -> ExecutorOutcome {
+    match recorded {
+        crate::outcome_store::RecordedOutcome::Success { final_answer } => {
+            ExecutorOutcome::Completed { final_answer }
+        }
+        crate::outcome_store::RecordedOutcome::SpecNeedsRevision {
+            unimplementable_tasks,
+            revision_suggestion,
+        } => ExecutorOutcome::SpecNeedsRevision {
+            unimplementable_tasks: unimplementable_tasks
+                .into_iter()
+                .map(|t| UnimplementableTask {
+                    task_id: t.task_id,
+                    task_text: t.task_text,
+                    reason: t.reason,
+                })
+                .collect(),
+            revision_suggestion,
+        },
+    }
 }
 
 struct SubprocessOutcome {
@@ -2739,6 +2880,52 @@ some narrative output before the sentinel\n\
         }
     }
 
+    /// a27a0 task 4.5: any JSON snippet shown in the prompt SHALL
+    /// deserialize cleanly into the corresponding Rust type via
+    /// `serde_json::from_str`. The bundled prompt now shows TWO
+    /// examples: one for the `outcome_spec_needs_revision` MCP tool's
+    /// `arguments` object, AND the legacy stdout sentinel (still
+    /// retained for the deprecation cycle). Both must round-trip.
+    #[test]
+    fn bundled_implementer_prompt_outcome_tool_example_validates_at_mcp_layer() {
+        // Extract the FIRST `{...}` JSON object inside a fenced
+        // markdown block after the "Worked example" heading. We don't
+        // need a full markdown parser — the prompt format is stable
+        // and the heading is unique.
+        let prompt = DEFAULT_IMPLEMENTER_TEMPLATE;
+        let heading_idx = prompt
+            .find("Worked example")
+            .expect("prompt must document a worked example for the outcome tool");
+        let after = &prompt[heading_idx..];
+        // First triple-backtick opens the fence; find it.
+        let fence_open = after.find("```").expect("worked example must be fenced");
+        let body_start = fence_open + 3;
+        // Advance past the language identifier line, if any.
+        let body_start = body_start
+            + after[body_start..]
+                .find('\n')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+        let body_after = &after[body_start..];
+        let fence_close = body_after.find("```").expect("fenced block must close");
+        let body = &body_after[..fence_close];
+        let value: serde_json::Value = serde_json::from_str(body.trim())
+            .unwrap_or_else(|e| panic!("worked-example JSON does not parse: {e}\n---\n{body}"));
+        // The body should validate cleanly through the MCP-layer
+        // validator AND every string field must contain a concrete
+        // (non-placeholder) value.
+        let validated = crate::mcp_askuser_server::validate_spec_needs_revision_args(&value)
+            .unwrap_or_else(|e| {
+                panic!("worked example failed MCP-layer validation: {e}\n---\n{body}")
+            });
+        assert_eq!(validated["type"], "spec_needs_revision");
+        // The shape that the daemon's outcome store will store/round-trip:
+        // deserialize the full variant-tagged object into RecordedOutcome.
+        let _round_trip: crate::outcome_store::RecordedOutcome =
+            serde_json::from_value(validated.clone())
+                .expect("validated payload must deserialize as RecordedOutcome");
+    }
+
     #[test]
     fn bundled_implementer_prompt_worked_example_parses() {
         // Per a20a1: the implementer prompt's worked example must
@@ -3409,5 +3596,280 @@ exit 0
             "JSON-mode FINAL ANSWER section must be absent"
         );
         assert!(body.contains("final summary text from text mode"));
+    }
+
+    // ---------------------------------------------------------------
+    // a27a0: tool-recorded outcome precedence + deprecation warning
+    // ---------------------------------------------------------------
+
+    /// Serialize env-var-touching tests so concurrent runs do not race
+    /// on the `ENV_CONTROL_SOCKET` / `ENV_WORKSPACE_BASENAME` mutation.
+    /// Mirrors the lock in `mcp_askuser_server.rs`'s test module.
+    static A27A0_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Spin up a Unix-domain-socket listener that handles ONE
+    /// `consume_outcome` action by returning the canned `outcome`
+    /// payload (or null when `None`). Returns the socket path; the
+    /// listener exits after one round trip.
+    async fn spawn_consume_outcome_responder(
+        outcome: Option<serde_json::Value>,
+    ) -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(read_half);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let resp = serde_json::json!({
+                "ok": true,
+                "outcome": outcome.unwrap_or(serde_json::Value::Null),
+            });
+            let mut bytes = serde_json::to_vec(&resp).unwrap();
+            bytes.push(b'\n');
+            let _ = write_half.write_all(&bytes).await;
+            let _ = write_half.shutdown().await;
+        });
+        (dir, socket)
+    }
+
+    /// 3.5 — tool-recorded `Success` outcome takes precedence over a
+    /// stdout sentinel block in the same captured event stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn tool_recorded_success_takes_precedence_over_stdout_sentinel() {
+        let _g = A27A0_ENV_LOCK.lock().unwrap();
+        let success_payload = serde_json::json!({
+            "type": "success",
+            "final_answer": "from-the-tool"
+        });
+        let (_sock_dir, socket) =
+            spawn_consume_outcome_responder(Some(success_payload)).await;
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        // SAFETY: tests serialize via A27A0_ENV_LOCK.
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME,
+                ws.file_name().unwrap(),
+            );
+        }
+        let executor = fixture_executor_text();
+        // stdout contains a well-formed spec_needs_revision block —
+        // pre-a27a0 this would have produced SpecNeedsRevision. Now
+        // the tool-recorded Success wins.
+        use std::os::unix::process::ExitStatusExt;
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(0)),
+            stdout: "\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"x\",\"reason\":\"r\"}],\"revision_suggestion\":\"s\"}\n".to_string(),
+            stderr: String::new(),
+            final_answer: None,
+            streamed_log: false,
+        };
+        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+            std::env::remove_var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME);
+        }
+        match result {
+            ExecutorOutcome::Completed { final_answer } => {
+                assert_eq!(final_answer.as_deref(), Some("from-the-tool"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// 3.6 — tool-recorded `SpecNeedsRevision` outcome takes precedence
+    /// over the timeout flag.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn tool_recorded_spec_revision_takes_precedence_over_timeout() {
+        let _g = A27A0_ENV_LOCK.lock().unwrap();
+        let revision_payload = serde_json::json!({
+            "type": "spec_needs_revision",
+            "unimplementable_tasks": [
+                {"task_id": "6.4", "task_text": "Manual: SSH", "reason": "no SSH"}
+            ],
+            "revision_suggestion": "Mock systemctl"
+        });
+        let (_sock_dir, socket) =
+            spawn_consume_outcome_responder(Some(revision_payload)).await;
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME,
+                ws.file_name().unwrap(),
+            );
+        }
+        let executor = fixture_executor_json();
+        let outcome = SubprocessOutcome {
+            timed_out: true,
+            exit_status: None,
+            stdout: String::new(),
+            stderr: "timeout".to_string(),
+            final_answer: None,
+            streamed_log: true,
+        };
+        let result = executor.classify_outcome(&ws, "x", outcome).await.unwrap();
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+            std::env::remove_var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME);
+        }
+        match result {
+            ExecutorOutcome::SpecNeedsRevision {
+                unimplementable_tasks,
+                revision_suggestion,
+            } => {
+                assert_eq!(unimplementable_tasks[0].task_id, "6.4");
+                assert_eq!(revision_suggestion, "Mock systemctl");
+            }
+            other => panic!("expected SpecNeedsRevision, got {other:?}"),
+        }
+    }
+
+    /// 3.7 — when `consume_outcome` returns `None` AND the legacy
+    /// stdout sentinel matches, today's behavior is preserved AND
+    /// a deprecation warning is emitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn legacy_stdout_sentinel_match_emits_deprecation_warning() {
+        use tracing_subscriber::fmt::MakeWriter;
+
+        // tracing-subscriber capture: a thread-local sink that records
+        // every `tracing::warn!` line emitted under the dispatched
+        // subscriber.
+        #[derive(Clone, Default)]
+        struct CaptureWriter {
+            buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.buf.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let _g = A27A0_ENV_LOCK.lock().unwrap();
+        let (_sock_dir, socket) = spawn_consume_outcome_responder(None).await;
+        let (_tmp, ws) = fixture_workspace_for_classify();
+        // SAFETY: tests serialize via A27A0_ENV_LOCK.
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME,
+                ws.file_name().unwrap(),
+            );
+        }
+        let executor = fixture_executor_text();
+        use std::os::unix::process::ExitStatusExt;
+        let outcome = SubprocessOutcome {
+            timed_out: false,
+            exit_status: Some(std::process::ExitStatus::from_raw(0)),
+            stdout: "\
+=== AUTOCODER-OUTCOME ===\n\
+{\"type\":\"spec_needs_revision\",\"unimplementable_tasks\":[{\"task_id\":\"5.2\",\"task_text\":\"x\",\"reason\":\"r\"}],\"revision_suggestion\":\"s\"}\n".to_string(),
+            stderr: String::new(),
+            final_answer: None,
+            streamed_log: false,
+        };
+
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        // `set_default` returns a guard scoped to the current thread,
+        // so all `tracing::warn!` emitted while the guard is alive go
+        // through our capture writer. This stays inside the running
+        // tokio runtime — no nested `block_on`.
+        let result = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            executor.classify_outcome(&ws, "x", outcome).await.unwrap()
+        };
+        unsafe {
+            std::env::remove_var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET);
+            std::env::remove_var(crate::mcp_askuser_server::ENV_WORKSPACE_BASENAME);
+        }
+
+        assert!(
+            matches!(result, ExecutorOutcome::SpecNeedsRevision { .. }),
+            "legacy path must still classify as SpecNeedsRevision; got {result:?}"
+        );
+        let captured = String::from_utf8_lossy(&writer.buf.lock().unwrap()).into_owned();
+        assert!(
+            captured.contains("legacy stdout sentinel matched"),
+            "deprecation marker missing from log: {captured}"
+        );
+        assert!(
+            captured.contains("outcome_spec_needs_revision"),
+            "directive sentence missing: {captured}"
+        );
+        assert!(
+            captured.contains("a27a2"),
+            "planned-removal target missing: {captured}"
+        );
+    }
+
+    /// Daemon-recorded outcome maps correctly to `ExecutorOutcome` for
+    /// both variants. Unit-level test of the mapping function so the
+    /// integration tests above are not the only coverage.
+    #[test]
+    fn map_recorded_outcome_round_trips_both_variants() {
+        let recorded_success = crate::outcome_store::RecordedOutcome::Success {
+            final_answer: Some("ok".to_string()),
+        };
+        match map_recorded_outcome(recorded_success) {
+            ExecutorOutcome::Completed { final_answer } => {
+                assert_eq!(final_answer.as_deref(), Some("ok"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        let recorded_revision = crate::outcome_store::RecordedOutcome::SpecNeedsRevision {
+            unimplementable_tasks: vec![
+                crate::outcome_store::RecordedUnimplementableTask {
+                    task_id: "1".into(),
+                    task_text: "t".into(),
+                    reason: "r".into(),
+                },
+            ],
+            revision_suggestion: "s".to_string(),
+        };
+        match map_recorded_outcome(recorded_revision) {
+            ExecutorOutcome::SpecNeedsRevision {
+                unimplementable_tasks,
+                revision_suggestion,
+            } => {
+                assert_eq!(unimplementable_tasks[0].task_id, "1");
+                assert_eq!(revision_suggestion, "s");
+            }
+            other => panic!("expected SpecNeedsRevision, got {other:?}"),
+        }
     }
 }

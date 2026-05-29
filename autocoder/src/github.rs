@@ -882,7 +882,7 @@ pub async fn list_issue_comments_since(
     since: DateTime<Utc>,
 ) -> Result<Vec<IssueComment>> {
     let url = format!("{api_base}/repos/{owner}/{repo}/issues/{pr_number}/comments");
-    let since_str = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let since_str = since.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let resp = reqwest::Client::new()
         .get(&url)
         .query(&[("since", since_str.as_str()), ("per_page", "100")])
@@ -1967,7 +1967,7 @@ mod tests {
         let mock = server
             .mock("GET", "/repos/owner/repo/issues/42/comments")
             .match_query(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::UrlEncoded("since".into(), "2026-05-25T10:00:00Z".into()),
+                mockito::Matcher::UrlEncoded("since".into(), "2026-05-25T10:00:00.000Z".into()),
                 mockito::Matcher::UrlEncoded("per_page".into(), "100".into()),
             ]))
             .match_header("authorization", "token testtoken")
@@ -2052,6 +2052,77 @@ mod tests {
         .expect_err("500 must surface as Err");
         let msg = format!("{err:#}");
         assert!(msg.contains("500"));
+    }
+
+    #[tokio::test]
+    async fn list_issue_comments_since_uses_millisecond_precision() {
+        // Marker with non-zero ms component must round-trip exactly.
+        let mut server = mockito::Server::new_async().await;
+        let since = chrono::DateTime::parse_from_rfc3339("2026-05-29T17:18:11.847Z")
+            .expect("static rfc3339 parses")
+            .with_timezone(&chrono::Utc);
+        let mock = server
+            .mock("GET", "/repos/owner/repo/issues/42/comments")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded(
+                    "since".into(),
+                    "2026-05-29T17:18:11.847Z".into(),
+                ),
+                mockito::Matcher::UrlEncoded("per_page".into(), "100".into()),
+            ]))
+            .with_status(200)
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+        list_issue_comments_since(
+            &server.url(),
+            "tok",
+            "owner",
+            "repo",
+            42,
+            since,
+        )
+        .await
+        .expect("call should succeed");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_issue_comments_since_keeps_trailing_zero_milliseconds() {
+        // Markers whose ms component is 0 must still be formatted with the
+        // ".000Z" suffix — the formatter must NOT collapse them back to
+        // second precision (which would re-introduce the GitHub fence-post
+        // bug Layer 1 is supposed to fix).
+        let mut server = mockito::Server::new_async().await;
+        let since = chrono::DateTime::parse_from_rfc3339("2026-05-29T17:18:11.000Z")
+            .expect("static rfc3339 parses")
+            .with_timezone(&chrono::Utc);
+        let mock = server
+            .mock("GET", "/repos/owner/repo/issues/42/comments")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded(
+                    "since".into(),
+                    "2026-05-29T17:18:11.000Z".into(),
+                ),
+                mockito::Matcher::UrlEncoded("per_page".into(), "100".into()),
+            ]))
+            .with_status(200)
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+        list_issue_comments_since(
+            &server.url(),
+            "tok",
+            "owner",
+            "repo",
+            42,
+            since,
+        )
+        .await
+        .expect("call should succeed");
+        mock.assert_async().await;
     }
 
     #[tokio::test]

@@ -533,6 +533,24 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             );
         }
     }
+    // Per-execution outcome store (a27a0). Always constructed regardless
+    // of whether canonical_rag is configured; the per-execution MCP
+    // child uses the same control socket for `record_outcome` AND the
+    // classifier drains via `consume_outcome` after subprocess exit.
+    // The control-socket env var is required for the MCP child to relay
+    // outcome tools, independent of canonical_rag. Set it unconditionally
+    // if not already set by the canonical_rag block above.
+    if std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET).is_err() {
+        let socket = crate::control_socket::socket_path();
+        // SAFETY: daemon startup is single-threaded at this point; we
+        // are the sole writer to the process env.
+        unsafe {
+            std::env::set_var(
+                crate::mcp_askuser_server::ENV_CONTROL_SOCKET,
+                socket.as_os_str(),
+            );
+        }
+    }
     let control_state = ControlState {
         github: github_holder.clone(),
         reviewer: reviewer_holder.clone(),
@@ -543,6 +561,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         repo_tasks_changed: task_map_changed.clone(),
         spawn_repo: spawn_repo.clone(),
         canonical_rag_registry: canonical_rag_registry.clone(),
+        outcome_store: crate::outcome_store::OutcomeStore::new(),
     };
     let listener_cancel = cancel.clone();
     let control_handle: JoinHandle<()> = tokio::spawn(async move {

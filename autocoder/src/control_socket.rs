@@ -319,6 +319,12 @@ pub struct ControlState {
     /// workspace by sanitized basename and dispatches against the
     /// store; an absent basename is fail-open (empty hits + hint).
     pub canonical_rag_registry: crate::rag::CanonicalRagRegistry,
+    /// Execution-scoped outcome store (a27a0). Populated by the
+    /// `record_outcome` action when the per-execution MCP child
+    /// relays an outcome tool call; drained by the `consume_outcome`
+    /// action when the executor's classifier runs after subprocess
+    /// exit. Keyed by `(workspace_basename, change)`.
+    pub outcome_store: crate::outcome_store::OutcomeStore,
 }
 
 /// Canonical control-socket path: `<runtime_dir>/control.sock`. The
@@ -478,6 +484,8 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "queue_clear_scout" => handle_queue_clear_scout(&parsed, state),
         "queue_sync_upstream_request" => handle_queue_sync_upstream_request(&parsed, state),
         "query_canonical_specs" => handle_query_canonical_specs(&parsed, state).await,
+        "record_outcome" => handle_record_outcome(&parsed, state),
+        "consume_outcome" => handle_consume_outcome(&parsed, state),
         other => json!({"ok": false, "error": format!("unknown action: {other}")}),
     }
 }
@@ -1969,6 +1977,90 @@ async fn handle_query_canonical_specs(parsed: &Value, state: &ControlState) -> V
     }
 }
 
+/// Handle the `record_outcome` action (a27a0). Trusts the relayed
+/// payload (the per-execution MCP child has already validated it) and
+/// writes it into the daemon's outcome store. Returns `{"ok":true}` on
+/// success; returns `{"ok":false,"error":...}` on a malformed payload
+/// shape (missing key fields, unknown variant tag, wrong types). The
+/// failure case exists to surface programmer error during new-client
+/// development, NOT to enforce business rules — schema validation is
+/// the MCP layer's responsibility.
+fn handle_record_outcome(parsed: &Value, state: &ControlState) -> Value {
+    let workspace_basename = match require_str(parsed, "workspace_basename") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let outcome_val = match parsed.get("outcome") {
+        Some(v) => v.clone(),
+        None => return json!({"ok": false, "error": "missing `outcome` field"}),
+    };
+    // Probe the variant tag for a clearer error than serde's default
+    // "unknown variant" message.
+    let variant_tag = outcome_val
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    match variant_tag.as_deref() {
+        Some("success") | Some("spec_needs_revision") => {}
+        Some(other) => {
+            return json!({
+                "ok": false,
+                "error": format!("unknown outcome variant tag `{other}`"),
+            });
+        }
+        None => {
+            return json!({
+                "ok": false,
+                "error": "outcome is missing required string `type` discriminator",
+            });
+        }
+    }
+    let recorded: crate::outcome_store::RecordedOutcome =
+        match serde_json::from_value(outcome_val) {
+            Ok(r) => r,
+            Err(e) => {
+                return json!({
+                    "ok": false,
+                    "error": format!("malformed outcome payload: {e}"),
+                });
+            }
+        };
+    tracing::info!(
+        workspace_basename = %workspace_basename,
+        change = %change,
+        variant = ?variant_tag,
+        "outcome recorded via outcome tool"
+    );
+    state
+        .outcome_store
+        .record(workspace_basename, change, recorded);
+    json!({"ok": true})
+}
+
+/// Handle the `consume_outcome` action (a27a0). Atomically reads AND
+/// removes the entry for `(workspace_basename, change)`. Returns
+/// `{"ok":true,"outcome":null}` when no entry exists.
+fn handle_consume_outcome(parsed: &Value, state: &ControlState) -> Value {
+    let workspace_basename = match require_str(parsed, "workspace_basename") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let outcome = state.outcome_store.consume(&workspace_basename, &change);
+    let outcome_value = match outcome {
+        Some(o) => serde_json::to_value(&o).unwrap_or(Value::Null),
+        None => Value::Null,
+    };
+    json!({"ok": true, "outcome": outcome_value})
+}
+
 /// Read the daemon's config path, parse + validate, diff against the
 /// last-applied snapshot, hot-apply safe sections, and return the result.
 pub async fn handle_reload(state: &ControlState) -> Value {
@@ -2359,6 +2451,7 @@ mod tests {
             repo_tasks_changed: task_map_changed,
             spawn_repo: spawn,
             canonical_rag_registry: crate::rag::CanonicalRagRegistry::new(),
+            outcome_store: crate::outcome_store::OutcomeStore::new(),
         }
     }
 
@@ -3796,5 +3889,129 @@ github:
         unsafe {
             std::env::remove_var(env_var);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // a27a0: record_outcome + consume_outcome control-socket actions
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_outcome_then_consume_outcome_round_trips_success() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let record_req = r#"{"action":"record_outcome","workspace_basename":"my-repo","change":"a30-foo","outcome":{"type":"success","final_answer":"done"}}"#;
+        let resp = send_request(&socket, record_req).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+
+        let consume_req = r#"{"action":"consume_outcome","workspace_basename":"my-repo","change":"a30-foo"}"#;
+        let resp = send_request(&socket, consume_req).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["outcome"]["type"], "success");
+        assert_eq!(resp["outcome"]["final_answer"], "done");
+
+        // Second consume drains: returns null.
+        let resp2 = send_request(&socket, consume_req).await;
+        assert_eq!(resp2["ok"], serde_json::Value::Bool(true), "resp: {resp2}");
+        assert!(resp2["outcome"].is_null());
+
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_outcome_round_trips_spec_needs_revision_payload() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let record_req = r#"{"action":"record_outcome","workspace_basename":"my-repo","change":"a30-foo","outcome":{"type":"spec_needs_revision","unimplementable_tasks":[{"task_id":"6.4","task_text":"Manual: SSH...","reason":"no SSH access"}],"revision_suggestion":"Replace 6.4 with a mocked unit test"}}"#;
+        let resp = send_request(&socket, record_req).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+
+        let consume_req = r#"{"action":"consume_outcome","workspace_basename":"my-repo","change":"a30-foo"}"#;
+        let resp = send_request(&socket, consume_req).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(resp["outcome"]["type"], "spec_needs_revision");
+        assert_eq!(
+            resp["outcome"]["revision_suggestion"],
+            "Replace 6.4 with a mocked unit test"
+        );
+        assert_eq!(resp["outcome"]["unimplementable_tasks"][0]["task_id"], "6.4");
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_outcome_replaces_prior_entry_for_same_key() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let first = r#"{"action":"record_outcome","workspace_basename":"my-repo","change":"a30-foo","outcome":{"type":"success","final_answer":"first"}}"#;
+        let _ = send_request(&socket, first).await;
+        let second = r#"{"action":"record_outcome","workspace_basename":"my-repo","change":"a30-foo","outcome":{"type":"spec_needs_revision","unimplementable_tasks":[{"task_id":"1","task_text":"t","reason":"r"}],"revision_suggestion":"s"}}"#;
+        let _ = send_request(&socket, second).await;
+        let consume_req = r#"{"action":"consume_outcome","workspace_basename":"my-repo","change":"a30-foo"}"#;
+        let resp = send_request(&socket, consume_req).await;
+        // Last-writer-wins: the second `record_outcome` wins.
+        assert_eq!(resp["outcome"]["type"], "spec_needs_revision");
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consume_outcome_unknown_key_returns_null() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let resp = send_request(
+            &socket,
+            r#"{"action":"consume_outcome","workspace_basename":"x","change":"y"}"#,
+        )
+        .await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert!(resp["outcome"].is_null());
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_outcome_with_unknown_variant_tag_returns_structured_error() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let resp = send_request(
+            &socket,
+            r#"{"action":"record_outcome","workspace_basename":"x","change":"y","outcome":{"type":"unknown_variant","data":{}}}"#,
+        )
+        .await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false));
+        let err = resp["error"].as_str().unwrap();
+        assert!(
+            err.contains("unknown_variant"),
+            "error should name the unknown tag: {err}"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_outcome_with_missing_outcome_field_returns_error() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let resp = send_request(
+            &socket,
+            r#"{"action":"record_outcome","workspace_basename":"x","change":"y"}"#,
+        )
+        .await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false));
+        let err = resp["error"].as_str().unwrap();
+        assert!(err.contains("outcome"), "err: {err}");
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outcome_store_keys_do_not_collide_across_repos() {
+        let (_dir, socket, _state, _cfg_path, cancel) = fixture_listener(BASE_YAML).await;
+        let a = r#"{"action":"record_outcome","workspace_basename":"repo-a","change":"a30-foo","outcome":{"type":"success","final_answer":"A"}}"#;
+        let b = r#"{"action":"record_outcome","workspace_basename":"repo-b","change":"a30-foo","outcome":{"type":"success","final_answer":"B"}}"#;
+        let _ = send_request(&socket, a).await;
+        let _ = send_request(&socket, b).await;
+        let ca = send_request(
+            &socket,
+            r#"{"action":"consume_outcome","workspace_basename":"repo-a","change":"a30-foo"}"#,
+        )
+        .await;
+        assert_eq!(ca["outcome"]["final_answer"], "A");
+        let cb = send_request(
+            &socket,
+            r#"{"action":"consume_outcome","workspace_basename":"repo-b","change":"a30-foo"}"#,
+        )
+        .await;
+        assert_eq!(cb["outcome"]["final_answer"], "B");
+        cancel.cancel();
     }
 }

@@ -510,6 +510,19 @@ async fn process_one_pr(
             }
             return Ok(());
         }
+        // Strict-since client-side guard. GitHub's `since` filter on
+        // `/issues/<num>/comments` is inclusive at the sub-second boundary
+        // (it compares against the comment's full-precision `updated_at`),
+        // so a marker truncated to seconds — OR a marker advanced exactly
+        // to a comment's creation time — can produce a re-fetch of an
+        // already-processed comment. Skip any comment at OR before the
+        // marker; the corresponding `advance_seen` is a no-op (the local
+        // `latest_seen` is only used to advance the persisted marker, and
+        // the value is already at or behind it).
+        if comment.created_at <= state.last_seen_comment_at {
+            advance_seen(&mut latest_seen, comment.created_at);
+            continue;
+        }
         // Bot-authored comments are filtered out before parsing — UNLESS
         // the body starts with the reviewer-revision HTML-comment marker,
         // which is the one sanctioned bypass. The reviewer pipeline posts
@@ -1937,6 +1950,500 @@ mod tests {
         // The dispatcher proceeded past the empty-list early-return
         // and fetched comments for the PR.
         comments.assert_async().await;
+
+        token_env_clear(env_var);
+    }
+
+    // -------- strict-since dispatcher filter (a2705) --------
+
+    fn operator_comment_body(comment_created_at: &str) -> String {
+        format!(
+            r#"[{{
+                "id": 1,
+                "body": "@my-bot revise tweak the helper",
+                "user": {{"login": "operator"}},
+                "created_at": "{comment_created_at}"
+            }}]"#,
+        )
+    }
+
+    fn pr_summary_body(pr_number: u64, pr_created_at: &str) -> String {
+        format!(
+            r#"[{{
+                "number": {pr_number},
+                "title": "PR",
+                "html_url": "https://example.invalid/pr/{pr_number}",
+                "state": "open",
+                "body": "Changes implemented in this pass:\n\n- my-change",
+                "created_at": "{pr_created_at}",
+                "head": {{"ref": "agent-q"}},
+                "base": {{"ref": "main"}}
+            }}]"#,
+        )
+    }
+
+    /// 2.2: a comment whose `created_at` exactly equals the marker is
+    /// skipped client-side — neither the bot-author filter nor the
+    /// trigger parser runs, AND `run_revision` is not invoked.
+    #[tokio::test]
+    async fn dispatcher_skips_comment_at_exact_marker_timestamp() {
+        let env_var = "REVISIONS_TOKEN_STRICT_SINCE_EQ";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(31, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        // GitHub returns the comment with created_at == marker (simulating
+        // the truncation-induced inclusive `since` behavior we are
+        // defending against).
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/31/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(operator_comment_body("2026-05-25T11:00:00Z"))
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        // Pre-seed state with `last_seen_comment_at` exactly equal to the
+        // comment's `created_at`.
+        write_state(
+            &ws,
+            &RevisionState {
+                pr_number: 31,
+                agent_branch: "agent-q".to_string(),
+                last_seen_comment_at: ts("2026-05-25T11:00:00Z"),
+                revisions_applied: 0,
+                revision_cap: 5,
+                cap_decline_posted: false,
+            },
+        )
+        .unwrap();
+
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(Vec::new());
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            0,
+            "comment at exact marker timestamp must not invoke run_revision",
+        );
+        let state = read_state(&ws, 31).unwrap().expect("state persisted");
+        assert_eq!(state.revisions_applied, 0);
+        assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
+
+        token_env_clear(env_var);
+    }
+
+    /// 2.3: a comment whose `created_at` is strictly less than the marker
+    /// (e.g. a replication-lag re-fetch of an older comment) is skipped.
+    #[tokio::test]
+    async fn dispatcher_skips_comment_before_marker_timestamp() {
+        let env_var = "REVISIONS_TOKEN_STRICT_SINCE_LT";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(33, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/33/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(operator_comment_body("2026-05-25T10:30:00Z"))
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        write_state(
+            &ws,
+            &RevisionState {
+                pr_number: 33,
+                agent_branch: "agent-q".to_string(),
+                // Marker is 30 minutes AFTER the comment's created_at.
+                last_seen_comment_at: ts("2026-05-25T11:00:00Z"),
+                revisions_applied: 1,
+                revision_cap: 5,
+                cap_decline_posted: false,
+            },
+        )
+        .unwrap();
+
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(Vec::new());
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            0,
+            "comment older than marker must not invoke run_revision",
+        );
+        let state = read_state(&ws, 33).unwrap().expect("state persisted");
+        assert_eq!(state.revisions_applied, 1);
+        assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
+
+        token_env_clear(env_var);
+    }
+
+    /// 2.4: a comment whose `created_at` is strictly greater than the
+    /// marker IS processed (the happy-path regression — the strict-since
+    /// filter must not drop legitimately-new comments).
+    #[tokio::test]
+    async fn dispatcher_processes_comment_after_marker_timestamp() {
+        let env_var = "REVISIONS_TOKEN_STRICT_SINCE_GT";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(35, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/35/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(operator_comment_body("2026-05-25T12:00:00Z"))
+            .create_async()
+            .await;
+        // The Completed path posts a "Revision applied" PR reply.
+        let post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/35/comments")
+            .match_body(mockito::Matcher::Regex("Revision applied".to_string()))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        write_state(
+            &ws,
+            &RevisionState {
+                pr_number: 35,
+                agent_branch: "agent-q".to_string(),
+                // Marker is one hour BEFORE the comment's created_at.
+                last_seen_comment_at: ts("2026-05-25T11:00:00Z"),
+                revisions_applied: 0,
+                revision_cap: 5,
+                cap_decline_posted: false,
+            },
+        )
+        .unwrap();
+
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor =
+            StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &ws, &repo, &gh, &executor, None, 5, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "comment newer than marker must invoke run_revision exactly once",
+        );
+        post_reply.assert_async().await;
+        let state = read_state(&ws, 35).unwrap().expect("state persisted");
+        assert_eq!(state.revisions_applied, 1);
+        assert_eq!(state.last_seen_comment_at, ts("2026-05-25T12:00:00Z"));
+
+        token_env_clear(env_var);
+    }
+
+    /// 3.1: end-to-end two-iteration regression. The first iteration
+    /// processes a comment AND advances the marker to its `created_at`.
+    /// The second iteration's GitHub mock returns the SAME comment again
+    /// (simulating GitHub's truncation-induced re-fetch). The strict-since
+    /// filter skips the duplicate AND `run_revision` is invoked exactly
+    /// once across both iterations.
+    #[tokio::test]
+    async fn dispatcher_same_comment_processed_at_most_once_across_iterations() {
+        let env_var = "REVISIONS_TOKEN_STRICT_SINCE_E2E";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        // Both iterations re-fetch the open-PRs list and the comments
+        // list; allow each mock to fire any number of times.
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(37, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        // The comment's created_at is T1 = 11:00:00Z. Both iterations get
+        // this same comment in the response (simulating the bug we're
+        // defending against).
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/37/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(operator_comment_body("2026-05-25T11:00:00Z"))
+            .create_async()
+            .await;
+        // Iter 1's Failed path posts a "Revision attempt failed" reply.
+        // Iter 2's strict-since filter skips the comment so no second
+        // reply is posted. Use `expect(1)` to assert the count.
+        let post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/37/comments")
+            .match_body(mockito::Matcher::Regex(
+                "Revision attempt failed".to_string(),
+            ))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        // Pre-seed iter-1 state: T0 = 09:00:00Z (before the comment).
+        write_state(
+            &ws,
+            &RevisionState {
+                pr_number: 37,
+                agent_branch: "agent-q".to_string(),
+                last_seen_comment_at: ts("2026-05-25T09:00:00Z"),
+                revisions_applied: 0,
+                revision_cap: 5,
+                cap_decline_posted: false,
+            },
+        )
+        .unwrap();
+
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        // Only iter 1 should call run_revision; script a single Failed
+        // outcome. (If iter 2 leaked a call through, the stub would fall
+        // back to its empty-script default of Completed, which we'd
+        // notice via state.revisions_applied incrementing.)
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Failed {
+            reason: "timeout".to_string(),
+        }]);
+
+        // Iteration 1.
+        process_revision_requests_at(
+            &ws,
+            &repo,
+            &gh,
+            &executor,
+            None,
+            5,
+            CancellationToken::new(),
+            &server.url(),
+        )
+        .await
+        .expect("iter 1 dispatcher should succeed");
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "iter 1: comment should be processed",
+        );
+        let state = read_state(&ws, 37).unwrap().expect("iter 1 state persisted");
+        assert_eq!(state.revisions_applied, 1);
+        assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
+
+        // Iteration 2: same comment is re-fetched, strict-since filter
+        // must skip it.
+        process_revision_requests_at(
+            &ws,
+            &repo,
+            &gh,
+            &executor,
+            None,
+            5,
+            CancellationToken::new(),
+            &server.url(),
+        )
+        .await
+        .expect("iter 2 dispatcher should succeed");
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "iter 2: strict-since filter must skip the duplicate",
+        );
+        post_reply.assert_async().await;
+        let state = read_state(&ws, 37).unwrap().expect("iter 2 state persisted");
+        assert_eq!(
+            state.revisions_applied, 1,
+            "counter must not be incremented twice",
+        );
+        assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
+
+        token_env_clear(env_var);
+    }
+
+    /// 3.2: AskUser regression. An AskUser outcome in iteration 1 leaves
+    /// the marker UNCHANGED (per the canonical AskUser-preserves-marker
+    /// requirement). Iteration 2 receives the SAME comment; because the
+    /// marker was held back, `comment.created_at > state.last_seen_comment_at`
+    /// holds AND the strict-since filter does NOT skip it. The comment IS
+    /// reprocessed in iter 2 — the strict-since filter does not regress
+    /// AskUser semantics.
+    #[tokio::test]
+    async fn dispatcher_askuser_marker_preservation_allows_reprocessing() {
+        let env_var = "REVISIONS_TOKEN_STRICT_SINCE_ASKUSER";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(pr_summary_body(39, "2026-05-25T10:00:00Z"))
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/39/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(operator_comment_body("2026-05-25T11:00:00Z"))
+            .create_async()
+            .await;
+        // Iter 2 (Completed) posts a "Revision applied" reply.
+        let post_reply = server
+            .mock("POST", "/repos/owner/repo/issues/39/comments")
+            .match_body(mockito::Matcher::Regex("Revision applied".to_string()))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        // T0 = 09:00:00Z; T1 = 11:00:00Z. Pre-seed iter-1 state.
+        write_state(
+            &ws,
+            &RevisionState {
+                pr_number: 39,
+                agent_branch: "agent-q".to_string(),
+                last_seen_comment_at: ts("2026-05-25T09:00:00Z"),
+                revisions_applied: 0,
+                revision_cap: 5,
+                cap_decline_posted: false,
+            },
+        )
+        .unwrap();
+
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(vec![
+            ExecutorOutcome::AskUser {
+                question: "clarify the helper signature?".to_string(),
+                resume_handle: ResumeHandle(serde_json::json!({"k": "v"})),
+            },
+            ExecutorOutcome::Completed { final_answer: None },
+        ]);
+        let chatops = std::sync::Arc::new(StubChatOps::new());
+        let ctx = ChatOpsCtx {
+            chatops: chatops.as_ref(),
+            channel: "C-test",
+        };
+
+        // Iteration 1: AskUser → marker held back, no PR reply.
+        process_revision_requests_at(
+            &ws,
+            &repo,
+            &gh,
+            &executor,
+            Some(ctx),
+            5,
+            CancellationToken::new(),
+            &server.url(),
+        )
+        .await
+        .expect("iter 1 dispatcher should succeed");
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "iter 1: AskUser-returning comment was processed",
+        );
+        let state = read_state(&ws, 39).unwrap().expect("iter 1 state persisted");
+        assert_eq!(state.revisions_applied, 0);
+        assert_eq!(
+            state.last_seen_comment_at,
+            ts("2026-05-25T09:00:00Z"),
+            "AskUser must NOT advance the marker past the comment",
+        );
+
+        // Iteration 2: same comment re-arrives, the strict-since filter
+        // does NOT skip it (because the marker is still at T0 < T1).
+        let chatops2 = std::sync::Arc::new(StubChatOps::new());
+        let ctx2 = ChatOpsCtx {
+            chatops: chatops2.as_ref(),
+            channel: "C-test",
+        };
+        process_revision_requests_at(
+            &ws,
+            &repo,
+            &gh,
+            &executor,
+            Some(ctx2),
+            5,
+            CancellationToken::new(),
+            &server.url(),
+        )
+        .await
+        .expect("iter 2 dispatcher should succeed");
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            2,
+            "iter 2: AskUser-preserved comment must be reprocessed",
+        );
+        post_reply.assert_async().await;
+        let state = read_state(&ws, 39).unwrap().expect("iter 2 state persisted");
+        assert_eq!(state.revisions_applied, 1);
+        assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
 
         token_env_clear(env_var);
     }

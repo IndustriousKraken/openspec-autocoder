@@ -132,6 +132,56 @@ fn handle_request<W: Write>(
                             },
                             "required": ["query"]
                         }
+                    },
+                    {
+                        "name": "outcome_success",
+                        "description": "Signal explicit successful completion of the implementation run. Call once at end-of-run on the success path; the optional `final_answer` carries the agent's end-of-run summary for log capture AND PR-comment rendering. Calling this tool IS the signal; no result inspection is required.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "final_answer": {
+                                    "type": "string",
+                                    "description": "Optional end-of-run summary text (the agent's `result`-event content). When omitted, an empty string is recorded."
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "name": "outcome_spec_needs_revision",
+                        "description": "Signal that tasks.md names one or more tasks the agent cannot complete in this sandbox. Use this INSTEAD OF emitting the legacy `=== AUTOCODER-OUTCOME ===` stdout block. Input is schema-validated at the MCP layer; placeholder-shaped strings (e.g. `<id-from-tasks-md>`) are rejected with a tool error that you can correct AND retry in the same session.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "unimplementable_tasks": {
+                                    "type": "array",
+                                    "description": "Non-empty list of tasks that cannot run in this sandbox.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "task_id": {
+                                                "type": "string",
+                                                "description": "Exact id from tasks.md, e.g. \"6.4\"."
+                                            },
+                                            "task_text": {
+                                                "type": "string",
+                                                "description": "Verbatim text of the unimplementable task."
+                                            },
+                                            "reason": {
+                                                "type": "string",
+                                                "description": "One-line explanation of why the task cannot run in this sandbox."
+                                            }
+                                        },
+                                        "required": ["task_id", "task_text", "reason"]
+                                    },
+                                    "minItems": 1
+                                },
+                                "revision_suggestion": {
+                                    "type": "string",
+                                    "description": "Concrete edit the operator can make to tasks.md to make the spec verifiable."
+                                }
+                            },
+                            "required": ["unimplementable_tasks", "revision_suggestion"]
+                        }
                     }
                 ]
             });
@@ -197,6 +247,81 @@ fn handle_request<W: Write>(
                     });
                     emit_result(writer, id, result)?;
                 }
+                "outcome_success" => {
+                    let final_answer = match call.arguments.get("final_answer") {
+                        Some(v) if v.is_string() => {
+                            Some(v.as_str().unwrap().to_string())
+                        }
+                        Some(v) if v.is_null() => None,
+                        None => None,
+                        Some(_) => {
+                            emit_error(
+                                writer,
+                                id,
+                                -32602,
+                                "outcome_success: `final_answer` must be a string when present",
+                            )?;
+                            return Ok(());
+                        }
+                    };
+                    let outcome_payload = serde_json::json!({
+                        "type": "success",
+                        "final_answer": final_answer,
+                    });
+                    match relay_record_outcome(&outcome_payload) {
+                        Ok(()) => {
+                            let text = "Outcome recorded: success.";
+                            let result = serde_json::json!({
+                                "content": [
+                                    { "type": "text", "text": text }
+                                ],
+                                "isError": false,
+                                "structuredContent": { "ok": true }
+                            });
+                            emit_result(writer, id, result)?;
+                        }
+                        Err(e) => {
+                            emit_error(
+                                writer,
+                                id,
+                                -32603,
+                                &format!(
+                                    "outcome_success: control-socket relay failed: {e}"
+                                ),
+                            )?;
+                        }
+                    }
+                }
+                "outcome_spec_needs_revision" => {
+                    match validate_spec_needs_revision_args(&call.arguments) {
+                        Ok(payload) => match relay_record_outcome(&payload) {
+                            Ok(()) => {
+                                let text = "Outcome recorded: spec_needs_revision.";
+                                let result = serde_json::json!({
+                                    "content": [
+                                        { "type": "text", "text": text }
+                                    ],
+                                    "isError": false,
+                                    "structuredContent": { "ok": true }
+                                });
+                                emit_result(writer, id, result)?;
+                            }
+                            Err(e) => {
+                                emit_error(
+                                    writer,
+                                    id,
+                                    -32603,
+                                    &format!(
+                                        "outcome_spec_needs_revision: control-socket relay failed: {e}"
+                                    ),
+                                )?;
+                            }
+                        },
+                        Err(msg) => {
+                            emit_error(writer, id, -32602, &msg)?;
+                        }
+                    }
+                }
                 other => {
                     emit_error(
                         writer,
@@ -259,6 +384,163 @@ fn handle_query_canonical_specs(
             "error_hint": format!("control socket unreachable: {e}"),
         }),
     }
+}
+
+/// Detect un-substituted `<placeholder>` text. Matches the daemon-side
+/// detector in `claude_cli.rs` (kept duplicate to keep the MCP server
+/// self-contained; both layers must agree on the rejection rule). The
+/// regex is intentionally narrow — leading lowercase letter, then
+/// `[a-z0-9 _-]` — so legitimate angle-bracket content like `<HTML>` or
+/// `<MyType>` does not false-positive.
+fn contains_placeholder_marker(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        if start >= bytes.len() {
+            return false;
+        }
+        let first = bytes[start];
+        if !first.is_ascii_lowercase() {
+            i += 1;
+            continue;
+        }
+        let mut j = start + 1;
+        let mut closed = false;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if b == b'>' {
+                closed = true;
+                break;
+            }
+            let ok = b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || b == b' '
+                || b == b'_'
+                || b == b'-';
+            if !ok {
+                break;
+            }
+            j += 1;
+        }
+        if closed {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Validate the `outcome_spec_needs_revision` tool arguments AT THE
+/// MCP LAYER. Per the spec deltas, returns `Err(<message>)` on any
+/// schema violation; the control socket is NOT contacted. On success,
+/// returns the variant-tagged outcome payload ready to ship to the
+/// daemon's `record_outcome` action.
+pub(crate) fn validate_spec_needs_revision_args(
+    args: &serde_json::Value,
+) -> std::result::Result<serde_json::Value, String> {
+    let tasks_val = args.get("unimplementable_tasks").ok_or_else(|| {
+        "outcome_spec_needs_revision: missing required field `unimplementable_tasks`"
+            .to_string()
+    })?;
+    let tasks_array = tasks_val.as_array().ok_or_else(|| {
+        "outcome_spec_needs_revision: `unimplementable_tasks` must be an array"
+            .to_string()
+    })?;
+    if tasks_array.is_empty() {
+        return Err("outcome_spec_needs_revision: `unimplementable_tasks` must be a non-empty array".to_string());
+    }
+    let mut validated_tasks: Vec<serde_json::Value> = Vec::with_capacity(tasks_array.len());
+    for (i, entry) in tasks_array.iter().enumerate() {
+        let obj = entry.as_object().ok_or_else(|| {
+            format!(
+                "outcome_spec_needs_revision: `unimplementable_tasks[{i}]` must be an object"
+            )
+        })?;
+        for field in ["task_id", "task_text", "reason"] {
+            let v = obj.get(field).ok_or_else(|| {
+                format!(
+                    "outcome_spec_needs_revision: `unimplementable_tasks[{i}].{field}` is missing"
+                )
+            })?;
+            let s = v.as_str().ok_or_else(|| {
+                format!(
+                    "outcome_spec_needs_revision: `unimplementable_tasks[{i}].{field}` must be a string"
+                )
+            })?;
+            if s.is_empty() {
+                return Err(format!(
+                    "outcome_spec_needs_revision: `unimplementable_tasks[{i}].{field}` must be a non-empty string"
+                ));
+            }
+            if contains_placeholder_marker(s) {
+                return Err(format!(
+                    "outcome_spec_needs_revision: `unimplementable_tasks[{i}].{field}` contains placeholder-shaped text (`<...>`). Substitute concrete values from tasks.md AND retry."
+                ));
+            }
+        }
+        validated_tasks.push(entry.clone());
+    }
+    let revision_val = args.get("revision_suggestion").ok_or_else(|| {
+        "outcome_spec_needs_revision: missing required field `revision_suggestion`".to_string()
+    })?;
+    let revision_str = revision_val.as_str().ok_or_else(|| {
+        "outcome_spec_needs_revision: `revision_suggestion` must be a string".to_string()
+    })?;
+    if revision_str.is_empty() {
+        return Err(
+            "outcome_spec_needs_revision: `revision_suggestion` must be a non-empty string".to_string(),
+        );
+    }
+    if contains_placeholder_marker(revision_str) {
+        return Err(
+            "outcome_spec_needs_revision: `revision_suggestion` contains placeholder-shaped text (`<...>`). Substitute a concrete edit AND retry."
+                .to_string(),
+        );
+    }
+    Ok(serde_json::json!({
+        "type": "spec_needs_revision",
+        "unimplementable_tasks": validated_tasks,
+        "revision_suggestion": revision_str,
+    }))
+}
+
+/// Relay a validated outcome payload to the daemon via the existing
+/// control-socket transport using a new `record_outcome` action. Reads
+/// the routing keys from env vars set by `ClaudeCliExecutor::write_mcp_config`.
+/// Returns `Err(<message>)` on socket-absent OR transport failure; the
+/// caller maps to JSON-RPC `-32603` (internal error).
+fn relay_record_outcome(outcome: &serde_json::Value) -> Result<()> {
+    let socket_path = std::env::var(ENV_CONTROL_SOCKET).map_err(|_| {
+        anyhow!(
+            "{ENV_CONTROL_SOCKET} not set; outcome tools require the daemon's control socket"
+        )
+    })?;
+    let workspace_basename = std::env::var(ENV_WORKSPACE_BASENAME).map_err(|_| {
+        anyhow!("{ENV_WORKSPACE_BASENAME} not set; cannot route outcome")
+    })?;
+    let change = std::env::var(ENV_CHANGE).map_err(|_| {
+        anyhow!("{ENV_CHANGE} not set; cannot route outcome")
+    })?;
+    let request = serde_json::json!({
+        "action": "record_outcome",
+        "workspace_basename": workspace_basename,
+        "change": change,
+        "outcome": outcome,
+    });
+    let resp = relay_to_control_socket(Path::new(&socket_path), &request)?;
+    if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let err = resp
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("daemon rejected record_outcome");
+        return Err(anyhow!("{err}"));
+    }
+    Ok(())
 }
 
 /// Open a connection to the daemon's control socket, send `request`
@@ -363,7 +645,7 @@ struct ToolCallParams {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     /// Env-var mutation is global; serialize the env-var-touching tests
@@ -549,6 +831,359 @@ mod tests {
             std::env::remove_var(ENV_WORKSPACE_BASENAME);
         }
     }
+
+    // ----- a27a0: outcome tools -----
+
+    #[test]
+    fn tools_list_advertises_outcome_tools_with_schemas() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":99,"method":"tools/list"}"#],
+        );
+        let tools = resps[0]["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> =
+            tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"outcome_success"), "names: {names:?}");
+        assert!(
+            names.contains(&"outcome_spec_needs_revision"),
+            "names: {names:?}"
+        );
+        let success_tool = tools
+            .iter()
+            .find(|t| t["name"] == "outcome_success")
+            .unwrap();
+        // outcome_success: no required fields, but `final_answer` is documented.
+        assert!(
+            success_tool["inputSchema"]["properties"]["final_answer"].is_object()
+        );
+
+        let revision_tool = tools
+            .iter()
+            .find(|t| t["name"] == "outcome_spec_needs_revision")
+            .unwrap();
+        let required: Vec<&str> = revision_tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"unimplementable_tasks"));
+        assert!(required.contains(&"revision_suggestion"));
+    }
+
+    #[test]
+    fn validate_spec_needs_revision_accepts_valid_input() {
+        let args = serde_json::json!({
+            "unimplementable_tasks": [
+                {"task_id": "6.4", "task_text": "Manual: SSH...", "reason": "no SSH"}
+            ],
+            "revision_suggestion": "Replace 6.4 with a mocked unit test"
+        });
+        let out = validate_spec_needs_revision_args(&args).unwrap();
+        assert_eq!(out["type"], "spec_needs_revision");
+        assert_eq!(out["revision_suggestion"], "Replace 6.4 with a mocked unit test");
+    }
+
+    #[test]
+    fn validate_spec_needs_revision_rejects_missing_revision_suggestion() {
+        let args = serde_json::json!({
+            "unimplementable_tasks": [
+                {"task_id": "6.4", "task_text": "t", "reason": "r"}
+            ]
+        });
+        let err = validate_spec_needs_revision_args(&args).unwrap_err();
+        assert!(
+            err.contains("revision_suggestion"),
+            "err should name field: {err}"
+        );
+        assert!(err.contains("missing"), "err should say missing: {err}");
+    }
+
+    #[test]
+    fn validate_spec_needs_revision_rejects_empty_task_array() {
+        let args = serde_json::json!({
+            "unimplementable_tasks": [],
+            "revision_suggestion": "r"
+        });
+        let err = validate_spec_needs_revision_args(&args).unwrap_err();
+        assert!(err.contains("non-empty"), "err: {err}");
+    }
+
+    #[test]
+    fn validate_spec_needs_revision_rejects_missing_required_subfield() {
+        let args = serde_json::json!({
+            "unimplementable_tasks": [
+                {"task_id": "6.4", "task_text": "t"}
+            ],
+            "revision_suggestion": "r"
+        });
+        let err = validate_spec_needs_revision_args(&args).unwrap_err();
+        assert!(err.contains("reason"), "err should name `reason`: {err}");
+    }
+
+    #[test]
+    fn validate_spec_needs_revision_rejects_wrong_type_field() {
+        let args = serde_json::json!({
+            "unimplementable_tasks": [
+                {"task_id": 6, "task_text": "t", "reason": "r"}
+            ],
+            "revision_suggestion": "r"
+        });
+        let err = validate_spec_needs_revision_args(&args).unwrap_err();
+        assert!(err.contains("task_id"), "err: {err}");
+        assert!(
+            err.contains("must be a string"),
+            "err should mention type: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_spec_needs_revision_rejects_empty_string_field() {
+        let args = serde_json::json!({
+            "unimplementable_tasks": [
+                {"task_id": "", "task_text": "t", "reason": "r"}
+            ],
+            "revision_suggestion": "r"
+        });
+        let err = validate_spec_needs_revision_args(&args).unwrap_err();
+        assert!(err.contains("non-empty"), "err: {err}");
+    }
+
+    #[test]
+    fn validate_spec_needs_revision_rejects_placeholder_in_task_id() {
+        let args = serde_json::json!({
+            "unimplementable_tasks": [
+                {"task_id": "<id-from-tasks-md>", "task_text": "t", "reason": "r"}
+            ],
+            "revision_suggestion": "r"
+        });
+        let err = validate_spec_needs_revision_args(&args).unwrap_err();
+        assert!(err.contains("placeholder"), "err: {err}");
+        assert!(err.contains("task_id"), "err: {err}");
+    }
+
+    #[test]
+    fn validate_spec_needs_revision_rejects_placeholder_in_revision_suggestion() {
+        let args = serde_json::json!({
+            "unimplementable_tasks": [
+                {"task_id": "6.4", "task_text": "t", "reason": "r"}
+            ],
+            "revision_suggestion": "<concrete edit>"
+        });
+        let err = validate_spec_needs_revision_args(&args).unwrap_err();
+        assert!(err.contains("placeholder"), "err: {err}");
+        assert!(err.contains("revision_suggestion"), "err: {err}");
+    }
+
+    #[test]
+    fn placeholder_marker_detector_accepts_legitimate_brackets() {
+        // Mirrors the daemon-side detector's positive/negative cases.
+        for s in &["<HTML>", "<MyType>", "<3>", "no brackets at all"] {
+            assert!(
+                !contains_placeholder_marker(s),
+                "did not expect `{s}` to match"
+            );
+        }
+        for s in &[
+            "<id-from-tasks-md>",
+            "<verbatim quote>",
+            "<one-line why>",
+        ] {
+            assert!(contains_placeholder_marker(s), "expected `{s}` to match");
+        }
+    }
+
+    #[test]
+    fn outcome_success_with_non_string_final_answer_returns_invalid_params() {
+        // Test by invoking tools/call directly through run_with;
+        // outcome_success accepts no final_answer or a string. A non-string
+        // (here a number) must produce JSON-RPC -32602.
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"outcome_success","arguments":{"final_answer":42}}}"#],
+        );
+        assert_eq!(resps[0]["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn outcome_success_socket_absent_returns_internal_error() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+            std::env::remove_var(ENV_CHANGE);
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"outcome_success","arguments":{"final_answer":"done"}}}"#],
+        );
+        // -32603 = internal error (relay failure).
+        assert_eq!(resps[0]["error"]["code"], -32603);
+    }
+
+    #[test]
+    fn outcome_success_relays_via_socket() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let socket_dir = TempDir::new().unwrap();
+        let socket_path = socket_dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let received: Arc<Mutex<Option<serde_json::Value>>> =
+            Arc::new(Mutex::new(None));
+        let received_clone = received.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = String::new();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            std::io::BufRead::read_line(&mut reader, &mut buf).unwrap();
+            let req: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+            *received_clone.lock().unwrap() = Some(req);
+            let response = serde_json::json!({"ok": true});
+            let mut s = serde_json::to_string(&response).unwrap();
+            s.push('\n');
+            stream.write_all(s.as_bytes()).unwrap();
+        });
+        unsafe {
+            std::env::set_var(
+                ENV_CONTROL_SOCKET,
+                socket_path.to_string_lossy().to_string(),
+            );
+            std::env::set_var(ENV_WORKSPACE_BASENAME, "test-ws");
+            std::env::set_var(ENV_CHANGE, "a30-foo");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"outcome_success","arguments":{"final_answer":"all done"}}}"#],
+        );
+        handle.join().unwrap();
+        assert_eq!(resps[0]["result"]["isError"], false);
+        let recv = received.lock().unwrap().take().unwrap();
+        assert_eq!(recv["action"], "record_outcome");
+        assert_eq!(recv["workspace_basename"], "test-ws");
+        assert_eq!(recv["change"], "a30-foo");
+        assert_eq!(recv["outcome"]["type"], "success");
+        assert_eq!(recv["outcome"]["final_answer"], "all done");
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+            std::env::remove_var(ENV_CHANGE);
+        }
+    }
+
+    #[test]
+    fn outcome_spec_needs_revision_relays_via_socket_on_valid_input() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let socket_dir = TempDir::new().unwrap();
+        let socket_path = socket_dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let received: Arc<Mutex<Option<serde_json::Value>>> =
+            Arc::new(Mutex::new(None));
+        let received_clone = received.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = String::new();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            std::io::BufRead::read_line(&mut reader, &mut buf).unwrap();
+            let req: serde_json::Value = serde_json::from_str(buf.trim()).unwrap();
+            *received_clone.lock().unwrap() = Some(req);
+            let response = serde_json::json!({"ok": true});
+            let mut s = serde_json::to_string(&response).unwrap();
+            s.push('\n');
+            stream.write_all(s.as_bytes()).unwrap();
+        });
+        unsafe {
+            std::env::set_var(
+                ENV_CONTROL_SOCKET,
+                socket_path.to_string_lossy().to_string(),
+            );
+            std::env::set_var(ENV_WORKSPACE_BASENAME, "test-ws");
+            std::env::set_var(ENV_CHANGE, "a30-foo");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"outcome_spec_needs_revision","arguments":{"unimplementable_tasks":[{"task_id":"6.4","task_text":"Manual: SSH...","reason":"no SSH"}],"revision_suggestion":"Mock systemctl status"}}}"#],
+        );
+        handle.join().unwrap();
+        assert_eq!(resps[0]["result"]["isError"], false);
+        let recv = received.lock().unwrap().take().unwrap();
+        assert_eq!(recv["action"], "record_outcome");
+        assert_eq!(recv["outcome"]["type"], "spec_needs_revision");
+        assert_eq!(
+            recv["outcome"]["unimplementable_tasks"][0]["task_id"],
+            "6.4"
+        );
+        assert_eq!(recv["outcome"]["revision_suggestion"], "Mock systemctl status");
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+            std::env::remove_var(ENV_CHANGE);
+        }
+    }
+
+    #[test]
+    fn outcome_spec_needs_revision_placeholder_returns_invalid_params_without_relay() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // Pointing the env at a nonexistent socket: if the validator
+        // FAILS to short-circuit, the relay will try to connect AND
+        // produce a -32603 error. We assert -32602 (validation), proving
+        // the control socket was NOT contacted.
+        unsafe {
+            std::env::set_var(ENV_CONTROL_SOCKET, "/nonexistent/control.sock");
+            std::env::set_var(ENV_WORKSPACE_BASENAME, "test-ws");
+            std::env::set_var(ENV_CHANGE, "a30-foo");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"outcome_spec_needs_revision","arguments":{"unimplementable_tasks":[{"task_id":"<id-from-tasks-md>","task_text":"<verbatim quote>","reason":"<one-line why>"}],"revision_suggestion":"<concrete edit>"}}}"#],
+        );
+        assert_eq!(resps[0]["error"]["code"], -32602);
+        let msg = resps[0]["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("placeholder"), "msg: {msg}");
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+            std::env::remove_var(ENV_CHANGE);
+        }
+    }
+
+    #[test]
+    fn outcome_spec_needs_revision_socket_unreachable_returns_internal_error() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_CONTROL_SOCKET, "/nonexistent/control.sock");
+            std::env::set_var(ENV_WORKSPACE_BASENAME, "test-ws");
+            std::env::set_var(ENV_CHANGE, "a30-foo");
+        }
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("x/.askuser-pending.json");
+        let resps = run_with(
+            &marker,
+            &[r#"{"jsonrpc":"2.0","id":105,"method":"tools/call","params":{"name":"outcome_spec_needs_revision","arguments":{"unimplementable_tasks":[{"task_id":"6.4","task_text":"t","reason":"r"}],"revision_suggestion":"s"}}}"#],
+        );
+        assert_eq!(resps[0]["error"]["code"], -32603);
+        unsafe {
+            std::env::remove_var(ENV_CONTROL_SOCKET);
+            std::env::remove_var(ENV_WORKSPACE_BASENAME);
+            std::env::remove_var(ENV_CHANGE);
+        }
+    }
+
+    // ----- end a27a0 -----
 
     #[test]
     fn query_canonical_specs_socket_unreachable_returns_hint() {

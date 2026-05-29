@@ -5635,3 +5635,138 @@ A CI scanner (an extension of the `a10` path-literals audit) SHALL fail the buil
 - **THEN** the scanner fails the build if it finds any reference to `paths::current`, `paths::install_global`, `paths::test_fallback`, OR `paths::get_global` in any `src/**/*.rs` file
 - **AND** the scanner's own constants are constructed at runtime from fragments so it does not match itself
 
+### Requirement: Revision dispatcher applies strict-since semantics to GitHub comment fetches
+
+The PR-comment revision dispatcher (`autocoder/src/revisions.rs::process_one_pr`) SHALL guarantee that no operator-triggering comment is processed more than once across polling iterations, even when GitHub's `since` filter on the `/issues/<num>/comments` endpoint returns the same comment multiple times due to timestamp-precision boundary effects.
+
+The guarantee is implemented in two complementary layers:
+
+**Layer 1: sub-second precision in the GitHub query.** The dispatcher's GitHub fetch helper (`github::list_issue_comments_since`) SHALL format the `since` query parameter using millisecond OR finer precision. Second-precision truncation (e.g. `"2026-05-29T17:18:11Z"`) is FORBIDDEN because GitHub's internal `updated_at` storage uses sub-second precision AND its `since` filter compares against the full-precision value: a marker truncated to seconds AND a comment whose actual `updated_at` falls within the same second produces `updated_at > since` = TRUE, causing the comment to be returned on every subsequent fetch.
+
+**Layer 2: client-side strict-since filter in the dispatcher loop.** Independent of how `since` is formatted in the GitHub query, the dispatcher SHALL apply a client-side `comment.created_at > state.last_seen_comment_at` strict-inequality check before processing each comment in the per-comment loop. Comments at OR before the marker SHALL be skipped without invoking the trigger parser, without calling `execute_revision`, AND without incrementing the per-PR revisions counter.
+
+The client-side filter uses `comment.created_at` (NOT `updated_at`) as the comparison key, matching the marker's semantics: the marker tracks the latest processed comment's creation time, AND editing a previously-processed comment SHALL NOT cause its revise text to be re-processed.
+
+The two layers are belt-and-suspenders. Layer 1 reduces wasted GitHub API roundtrips by not re-fetching the duplicate in the first place. Layer 2 ensures correctness even when Layer 1 fails (future GitHub API revisions, future helper modifications, GitHub-side replication lag returning the same comment in two different fetches, etc.).
+
+The existing canonical scenarios on the revision dispatcher (`Failed revision posts a failure comment`, `Revision cap per PR, with one-time decline`, `AskUser during revision escalates without committing`, `Per-PR state file persists revision count and last-seen timestamp`) are unaffected. Their behavior is preserved; this requirement layers above them to ensure their underlying assumption — "each comment is processed at most once" — actually holds.
+
+#### Scenario: GitHub query uses millisecond precision
+- **WHEN** the dispatcher calls `list_issue_comments_since(api_base, token, owner, repo, pr_number, since)` with `since = "2026-05-29T17:18:11.847Z"`
+- **THEN** the outgoing HTTP query string contains `since=2026-05-29T17:18:11.847Z` (millisecond precision preserved)
+- **AND** the query string does NOT contain `since=2026-05-29T17:18:11Z` (second-precision truncation)
+
+#### Scenario: Marker with zero milliseconds still uses millisecond-precision query
+- **WHEN** the dispatcher calls `list_issue_comments_since` with `since` constructed from a `DateTime<Utc>` whose millisecond component is 0 (e.g. `"2026-05-29T17:18:11.000Z"`)
+- **THEN** the outgoing HTTP query string contains `since=2026-05-29T17:18:11.000Z`
+- **AND** the formatter does NOT strip trailing zero milliseconds back to `since=2026-05-29T17:18:11Z`
+
+#### Scenario: Comment at exact marker timestamp is skipped client-side
+- **WHEN** the dispatcher's per-comment loop receives a comment whose `created_at` exactly equals `state.last_seen_comment_at`
+- **THEN** the strict-inequality filter skips the comment
+- **AND** the bot-author filter is NOT evaluated for this comment
+- **AND** the trigger parser is NOT invoked
+- **AND** `execute_revision` is NOT called
+- **AND** the revision counter is NOT incremented
+
+#### Scenario: Comment before marker timestamp is skipped client-side
+- **WHEN** the dispatcher's per-comment loop receives a comment whose `created_at` is strictly less than `state.last_seen_comment_at` (e.g. due to API caching, replication lag, OR a re-fetch that returns historical comments)
+- **THEN** the strict-inequality filter skips the comment
+- **AND** `execute_revision` is NOT called
+
+#### Scenario: Comment after marker timestamp is processed normally
+- **WHEN** the dispatcher's per-comment loop receives a comment whose `created_at` is strictly greater than `state.last_seen_comment_at`
+- **THEN** the strict-inequality filter does NOT skip the comment
+- **AND** the existing bot-author filter, trigger parser, AND outcome-dispatch path proceed as today
+
+#### Scenario: Same comment re-fetched across polling cycles is processed at most once
+- **WHEN** iteration N processes an operator comment at `created_at: T_comment` AND the post-iteration state has `last_seen_comment_at: T_comment`, `revisions_applied: 1`
+- **AND** iteration N+1 receives the SAME comment in its `list_issue_comments_since` response (due to GitHub's timestamp-precision behavior OR replication lag)
+- **THEN** the strict-inequality filter skips the comment in iteration N+1
+- **AND** iteration N+1's `execute_revision` call count is `0`
+- **AND** the state after iteration N+1 is unchanged from after iteration N (`revisions_applied: 1`, `last_seen_comment_at: T_comment`)
+
+#### Scenario: AskUser comment is preserved across iterations
+- **WHEN** iteration N processes an operator comment AND `execute_revision` returns `AskUser`
+- **AND** the marker is NOT advanced past the comment (per the canonical `AskUser during revision escalates without committing` requirement)
+- **AND** iteration N+1 receives the SAME comment in its `list_issue_comments_since` response
+- **THEN** the strict-inequality filter does NOT skip the comment (because `comment.created_at > state.last_seen_comment_at` — the marker was held back)
+- **AND** the comment IS reprocessed in iteration N+1
+- **AND** the existing AskUser-resume semantics are preserved
+
+### Requirement: Control socket exposes `record_outcome` AND `consume_outcome` actions for execution-scoped outcome storage
+
+The control socket SHALL accept two new actions that mediate outcome-signaling between the per-execution MCP child AND the executor's classifier:
+
+- **`record_outcome`** — writes a recorded outcome to the daemon's execution-scoped outcome store, keyed by `(workspace_basename, change)`. Request shape:
+
+  ```json
+  {
+    "action": "record_outcome",
+    "workspace_basename": "<sanitized basename of the workspace>",
+    "change": "<openspec change name>",
+    "outcome": { ... variant-tagged payload ... }
+  }
+  ```
+
+  The `outcome` field is variant-tagged with `"type"`:
+
+  - `"type": "success"` with optional `"final_answer": string` (defaults to empty string on absence).
+  - `"type": "spec_needs_revision"` with `"unimplementable_tasks": Array<{ task_id: string, task_text: string, reason: string }>` (non-empty) AND `"revision_suggestion": string` (non-empty).
+
+  Response shape on success: `{ "ok": true }`. Response shape on a malformed payload (missing fields, unknown variant tag, wrong types): `{ "ok": false, "error": "<message>" }`. The handler trusts the relayed payload (the MCP layer validated it before sending); the failure case exists to surface programmer error during development of new clients, NOT to enforce business rules.
+
+  Storage semantics: last-writer-wins. A second `record_outcome` for the same `(workspace_basename, change)` key replaces the prior entry. This handles the corner case where the agent calls an outcome tool twice in the same session (e.g. retry after an error). The classifier consumes whichever entry was last written.
+
+- **`consume_outcome`** — atomically reads AND removes the entry for a given key. Request shape:
+
+  ```json
+  {
+    "action": "consume_outcome",
+    "workspace_basename": "<sanitized basename>",
+    "change": "<openspec change name>"
+  }
+  ```
+
+  Response shape: `{ "ok": true, "outcome": <recorded outcome variant-tagged object OR null> }`. The `outcome` field is `null` when no entry exists for the key. A subsequent `consume_outcome` for the same key returns `null` (the read drained the store).
+
+The daemon-side outcome store SHALL be in-memory (not file-backed). The store's lifecycle matches the daemon's lifecycle; a daemon restart loses any in-flight outcomes. This is acceptable: outcome reporting is synchronous (the MCP tool call happens milliseconds before the wrapped CLI exits AND the classifier's `consume_outcome` runs microseconds after); restart-survives durability is not required AND would create cleanup AND staleness concerns the file marker for `ask_user` deliberately accepts BECAUSE `ask_user` IS asynchronous.
+
+The outcome store MAY periodically evict entries older than a coarse threshold (60 minutes is sufficient) to bound memory growth in the corner case where `consume_outcome` is never called for a recorded key (autocoder crashes between subprocess exit AND classifier drain). Implementation is OPTIONAL for this requirement; the implementer MAY defer it to a follow-on change if the immediate memory pressure is bounded.
+
+Authorization: the same authn / authz that the existing control-socket actions use (per the canonical "Control socket for runtime daemon interaction" requirement) applies unchanged. The MCP child runs in the daemon's trust domain by virtue of being launched by the daemon's executor; no additional auth surface is introduced.
+
+#### Scenario: `record_outcome` followed by `consume_outcome` round-trips a success outcome
+- **WHEN** a client sends `{"action":"record_outcome","workspace_basename":"my-repo","change":"a30-foo","outcome":{"type":"success","final_answer":"done"}}` to the control socket
+- **AND** receives `{"ok":true}` in response
+- **AND** subsequently sends `{"action":"consume_outcome","workspace_basename":"my-repo","change":"a30-foo"}`
+- **THEN** the response is `{"ok":true,"outcome":{"type":"success","final_answer":"done"}}`
+- **AND** a second `consume_outcome` for the same key returns `{"ok":true,"outcome":null}`
+
+#### Scenario: `record_outcome` round-trips a spec_needs_revision outcome with all fields
+- **WHEN** a client sends a `record_outcome` with `{"type":"spec_needs_revision","unimplementable_tasks":[{"task_id":"6.4","task_text":"Manual: SSH...","reason":"no SSH access"}],"revision_suggestion":"Replace 6.4 with a mocked unit test"}` as the outcome
+- **AND** subsequently sends `consume_outcome` for the same key
+- **THEN** the consumed outcome's `unimplementable_tasks` array AND `revision_suggestion` match the recorded values byte-for-byte
+- **AND** the store entry is cleared
+
+#### Scenario: `record_outcome` for an already-occupied key replaces the prior entry
+- **WHEN** a client sends a `record_outcome` for key `("my-repo", "a30-foo")` with a `success` variant
+- **AND** subsequently sends a second `record_outcome` for the same key with a `spec_needs_revision` variant
+- **THEN** a following `consume_outcome` for the key returns the `spec_needs_revision` variant
+- **AND** the prior `success` variant is NOT returned
+
+#### Scenario: `consume_outcome` for an unknown key returns null
+- **WHEN** a client sends `{"action":"consume_outcome","workspace_basename":"my-repo","change":"never-recorded"}` to a control socket whose outcome store has no matching entry
+- **THEN** the response is `{"ok":true,"outcome":null}`
+
+#### Scenario: `record_outcome` with an unknown variant tag returns a structured error
+- **WHEN** a client sends `{"action":"record_outcome","workspace_basename":"x","change":"y","outcome":{"type":"unknown_variant","data":{}}}` to the control socket
+- **THEN** the response is `{"ok":false,"error":"<message naming the unknown variant tag>"}`
+- **AND** the outcome store remains unchanged
+
+#### Scenario: Outcome-store keys are per `(workspace_basename, change)` AND do not collide across repos
+- **WHEN** a client sends `record_outcome` for `("repo-a", "a30-foo")` AND another `record_outcome` for `("repo-b", "a30-foo")`
+- **THEN** a `consume_outcome` for `("repo-a", "a30-foo")` returns the first entry
+- **AND** a `consume_outcome` for `("repo-b", "a30-foo")` returns the second entry
+- **AND** neither read drains the other key's entry
+

@@ -24,6 +24,7 @@ mod log_retention;
 mod mcp_askuser_server;
 mod migration;
 mod openspec_archive;
+mod outcome_store;
 mod paths;
 mod perma_stuck;
 mod polling;
