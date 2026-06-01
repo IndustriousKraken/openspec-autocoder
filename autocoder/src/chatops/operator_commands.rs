@@ -472,7 +472,12 @@ fn parse_command_outcome_in_thread(
         Some(v) => v,
         None => return ParseOutcome::None,
     };
-    let rest: Vec<&str> = tokens.collect();
+    // Strip a single pair of surrounding backticks from each post-verb token.
+    // Alert templates wrap change slugs and repo identifiers in single
+    // backticks for chat readability; operators routinely copy them verbatim.
+    // Embedded (mid-token) backticks are preserved and continue to fail the
+    // regex check below.
+    let rest: Vec<&str> = tokens.map(|t| t.trim_matches('`')).collect();
 
     match verb.to_ascii_lowercase().as_str() {
         "status" => match rest.len() {
@@ -2372,13 +2377,22 @@ impl OperatorCommandDispatcher {
                         .get("removed_ignore_for_queue")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    // a40: prefer the response's `change` field (the
+                    // canonical slug after partial-prefix resolution),
+                    // falling back to the operator's input when the
+                    // response did not echo a canonical slug.
+                    let reply_change = resp
+                        .get("change")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&change)
+                        .to_string();
                     if removed_ignore {
                         format!(
-                            "✓ Cleared .perma-stuck.json AND .ignore-for-queue.json for {change}."
+                            "✓ Cleared .perma-stuck.json AND .ignore-for-queue.json for {reply_change}."
                         )
                     } else {
                         format!(
-                            "✓ cleared .perma-stuck.json for {change} on {}",
+                            "✓ cleared .perma-stuck.json for {reply_change} on {}",
                             short_repo_label(&repo.url)
                         )
                     }
@@ -2409,8 +2423,13 @@ impl OperatorCommandDispatcher {
                     }))
                     .await;
                 if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    // a40: prefer the response's canonical `change`.
+                    let reply_change = resp
+                        .get("change")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&change);
                     format!(
-                        "✓ cleared .needs-spec-revision.json for {change} on {}",
+                        "✓ cleared .needs-spec-revision.json for {reply_change} on {}",
                         short_repo_label(&repo.url)
                     )
                 } else {
@@ -2445,9 +2464,14 @@ impl OperatorCommandDispatcher {
                     }))
                     .await;
                 if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    // a40: prefer the response's canonical `change`.
+                    let reply_change = resp
+                        .get("change")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&change);
                     format!(
-                        "✓ Marked {change} as ignored for queue. \
-                         Subsequent changes will process; {change} stays excluded \
+                        "✓ Marked {reply_change} as ignored for queue. \
+                         Subsequent changes will process; {reply_change} stays excluded \
                          until the underlying marker is cleared."
                     )
                 } else {
@@ -2481,8 +2505,13 @@ impl OperatorCommandDispatcher {
                         .get("underlying_marker")
                         .and_then(|v| v.as_str())
                         .unwrap_or("the underlying marker");
+                    // a40: prefer the response's canonical `change`.
+                    let reply_change = resp
+                        .get("change")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&change);
                     format!(
-                        "✓ Cleared ignore-for-queue on {change}. Queue resumes blocking on {underlying}."
+                        "✓ Cleared ignore-for-queue on {reply_change}. Queue resumes blocking on {underlying}."
                     )
                 } else {
                     let err = resp
@@ -4201,6 +4230,137 @@ mod tests {
     fn parse_ignore_and_continue_missing_args_returns_none() {
         assert!(parse_command(&format!("{BOT} ignore-and-continue myrepo"), BOT).is_none());
         assert!(parse_command(&format!("{BOT} ignore-and-continue"), BOT).is_none());
+    }
+
+    // -------------------------------------------------------------
+    // a40 backtick-stripping parser tests. Alert templates wrap
+    // change slugs and repo identifiers in single backticks; the
+    // parser strips a single surrounding pair before the regex check.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn parse_clear_revision_strips_backticks_on_change_slug() {
+        let cmd =
+            parse_command(&format!("{BOT} clear-revision myrepo `a37-foo`"), BOT)
+                .expect("backtick-wrapped slug must parse");
+        assert_eq!(
+            cmd,
+            OperatorCommand::ClearRevision {
+                repo_substring: "myrepo".into(),
+                change: "a37-foo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_clear_perma_stuck_strips_backticks_on_both_args() {
+        let cmd = parse_command(
+            &format!("{BOT} clear-perma-stuck `myrepo` `a37-foo`"),
+            BOT,
+        )
+        .expect("backticks must be stripped from both args");
+        assert_eq!(
+            cmd,
+            OperatorCommand::ClearPermaStuck {
+                repo_substring: "myrepo".into(),
+                change: "a37-foo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_clear_revision_strips_leading_only_backtick() {
+        let cmd =
+            parse_command(&format!("{BOT} clear-revision myrepo `a37-foo"), BOT)
+                .expect("asymmetric leading backtick must be stripped");
+        assert_eq!(
+            cmd,
+            OperatorCommand::ClearRevision {
+                repo_substring: "myrepo".into(),
+                change: "a37-foo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_clear_revision_strips_trailing_only_backtick() {
+        let cmd =
+            parse_command(&format!("{BOT} clear-revision myrepo a37-foo`"), BOT)
+                .expect("asymmetric trailing backtick must be stripped");
+        assert_eq!(
+            cmd,
+            OperatorCommand::ClearRevision {
+                repo_substring: "myrepo".into(),
+                change: "a37-foo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_clear_revision_embedded_backtick_rejected() {
+        // Mid-token backticks are NOT stripped (the strip only handles
+        // surrounding wrapper backticks). The regex check rejects.
+        let outcome =
+            parse_command_outcome(&format!("{BOT} clear-revision myrepo a37`foo"), BOT);
+        match outcome {
+            ParseOutcome::Invalid(Reply::Sync(text)) => {
+                assert!(text.starts_with("✗ invalid change name"), "{text}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_backtick_wrapped_shell_metachar_still_rejected() {
+        // Backtick-wrapped shell-metachar payload: strip yields
+        // `a;rm -rf /` which the regex rejects. Tokenizer splits at
+        // whitespace, so the first token is "`a;rm" — surrounding
+        // backticks on JUST that token are stripped (leading only),
+        // yielding "a;rm" which the regex rejects. No FS or socket I/O.
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} clear-perma-stuck myrepo `a;rm`"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("backtick-wrapped shell-metachar payload must be rejected");
+        match reply {
+            Reply::Sync(text) => {
+                assert!(text.starts_with("✗ invalid change name"), "{text}");
+            }
+            other => panic!("expected Sync sanitization reply, got {other:?}"),
+        }
+        assert!(submitter.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_backtick_wrapped_path_traversal_still_rejected() {
+        // Backtick-wrapped path-traversal: strip yields `../../etc/passwd`
+        // which the change-slug regex rejects (`.` and `/` not allowed).
+        let dispatcher = OperatorCommandDispatcher::new(&crate::testing::test_daemon_paths().1);
+        let submitter = FakeSubmitter::new();
+        let reply = dispatcher
+            .handle_message(
+                &format!("{BOT} clear-perma-stuck myrepo `../../etc/passwd`"),
+                "C1",
+                BOT,
+                &fixture_repos(),
+                &submitter,
+            )
+            .await
+            .expect("backtick-wrapped path-traversal must be rejected");
+        match reply {
+            Reply::Sync(text) => {
+                assert!(text.starts_with("✗ invalid change name"), "{text}");
+            }
+            other => panic!("expected Sync sanitization reply, got {other:?}"),
+        }
+        assert!(submitter.calls().is_empty());
     }
 
     #[test]

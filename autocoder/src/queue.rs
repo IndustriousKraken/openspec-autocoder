@@ -363,6 +363,150 @@ pub fn list_marker_excluded(workspace: &Path) -> Result<(Vec<String>, Vec<String
     Ok((perma, revision))
 }
 
+/// Per-action marker scope for [`resolve_change_prefix`]. Each marker-clearing
+/// control-socket action restricts prefix lookups to directories carrying its
+/// relevant marker file, so a stale or unrelated change cannot accidentally
+/// satisfy a prefix request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangePrefixMarkerScope {
+    /// `.needs-spec-revision.json` only. Used by `clear_revision_marker`.
+    NeedsRevision,
+    /// `.perma-stuck.json` only. Used by `clear_perma_stuck_marker`.
+    PermaStuck,
+    /// `.perma-stuck.json` OR `.needs-spec-revision.json`. Used by
+    /// `ignore_for_queue_marker` (either blocking marker qualifies).
+    EitherBlocking,
+    /// `.ignore-for-queue.json` only. Used by `clear_ignore_for_queue_marker`.
+    IgnoreForQueue,
+}
+
+/// Error returned by [`resolve_change_prefix`]. The variants encode why no
+/// canonical slug could be produced — either zero matching directories or
+/// multiple ambiguous candidates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvePrefixError {
+    /// No change directory carries the scope-required marker AND has a name
+    /// matching the supplied value (exact or prefix).
+    NoMatch { scope: ChangePrefixMarkerScope },
+    /// Two or more change directories carrying the scope-required marker
+    /// share the supplied value as a leading prefix. The operator must
+    /// re-issue with a longer prefix (or the full slug).
+    MultiMatch { candidates: Vec<String> },
+}
+
+impl ChangePrefixMarkerScope {
+    fn dir_has_scope_marker(&self, dir: &Path) -> bool {
+        match self {
+            ChangePrefixMarkerScope::NeedsRevision => {
+                dir.join(NEEDS_REVISION_FILE).exists()
+            }
+            ChangePrefixMarkerScope::PermaStuck => {
+                dir.join(PERMA_STUCK_FILE).exists()
+            }
+            ChangePrefixMarkerScope::EitherBlocking => {
+                dir.join(PERMA_STUCK_FILE).exists()
+                    || dir.join(NEEDS_REVISION_FILE).exists()
+            }
+            ChangePrefixMarkerScope::IgnoreForQueue => {
+                dir.join(IGNORE_FOR_QUEUE_FILE).exists()
+            }
+        }
+    }
+}
+
+impl ResolvePrefixError {
+    /// Format the error as a single operator-facing line. The prefix is the
+    /// value the operator supplied; the message names the marker scope so
+    /// the operator can act without consulting documentation.
+    pub fn to_operator_message(&self, prefix: &str) -> String {
+        match self {
+            ResolvePrefixError::NoMatch { scope } => match scope {
+                ChangePrefixMarkerScope::NeedsRevision => format!(
+                    "no change matching prefix '{prefix}' has a .needs-spec-revision.json marker"
+                ),
+                ChangePrefixMarkerScope::PermaStuck => format!(
+                    "no change matching prefix '{prefix}' has a .perma-stuck.json marker"
+                ),
+                ChangePrefixMarkerScope::EitherBlocking => format!(
+                    "no change matching prefix '{prefix}' has an operator-action marker (.perma-stuck.json OR .needs-spec-revision.json)"
+                ),
+                ChangePrefixMarkerScope::IgnoreForQueue => format!(
+                    "no change matching prefix '{prefix}' has a .ignore-for-queue.json marker"
+                ),
+            },
+            ResolvePrefixError::MultiMatch { candidates } => format!(
+                "multiple changes match prefix '{prefix}': {}. Retype with a longer prefix or the full slug.",
+                candidates.join(", ")
+            ),
+        }
+    }
+}
+
+/// Resolve `prefix` to a canonical change-directory name under
+/// `<workspace>/openspec/changes/`, scoped to directories carrying the
+/// marker file(s) named by `scope`.
+///
+/// Fast path: when `<workspace>/openspec/changes/<prefix>/` exists AND that
+/// directory carries the scope-required marker, the prefix is returned as-is
+/// (the operator pasted the full slug from an alert).
+///
+/// Slow path: enumerate the change-root directory (skipping `archive/` AND
+/// dotfile-named entries — matches `list_pending`'s skip rules), filter to
+/// directories carrying the scope-required marker, AND collect entries whose
+/// name `str::starts_with` the supplied value (case-sensitive). A unique
+/// candidate is returned; zero candidates yield `NoMatch`; two or more yield
+/// `MultiMatch` with the candidate list sorted ascending for determinism.
+pub fn resolve_change_prefix(
+    workspace: &Path,
+    prefix: &str,
+    scope: ChangePrefixMarkerScope,
+) -> Result<String, ResolvePrefixError> {
+    let root = changes_dir(workspace);
+    // Fast path: exact-name match + scope marker present.
+    let exact_dir = root.join(prefix);
+    if exact_dir.is_dir() && scope.dir_has_scope_marker(&exact_dir) {
+        return Ok(prefix.to_string());
+    }
+    // Slow path: enumerate change-root and collect prefix matches that
+    // carry the scope-required marker.
+    let read_dir = match std::fs::read_dir(&root) {
+        Ok(rd) => rd,
+        Err(_) => return Err(ResolvePrefixError::NoMatch { scope }),
+    };
+    let mut candidates: Vec<String> = Vec::new();
+    for entry in read_dir.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if name == ARCHIVE_DIR || name.starts_with('.') {
+            continue;
+        }
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        if !scope.dir_has_scope_marker(&entry.path()) {
+            continue;
+        }
+        candidates.push(name);
+    }
+    match candidates.len() {
+        0 => Err(ResolvePrefixError::NoMatch { scope }),
+        1 => Ok(candidates.into_iter().next().unwrap()),
+        _ => {
+            candidates.sort();
+            Err(ResolvePrefixError::MultiMatch { candidates })
+        }
+    }
+}
+
 pub fn lock(workspace: &Path, change: &str) -> Result<()> {
     let path = change_dir(workspace, change).join(LOCK_FILE);
     std::fs::File::create(&path)
@@ -1593,5 +1737,270 @@ mod tests {
             reason.contains("MODIFIED failed for header"),
             "reason must include the openspec-supplied cause line: {reason}"
         );
+    }
+
+    // -------------------------------------------------------------
+    // a40 resolve_change_prefix tests. The resolver maps partial
+    // (leading-prefix) change slugs to a canonical directory name,
+    // scoped to the marker file(s) named by the action.
+    // -------------------------------------------------------------
+
+    fn touch_marker(workspace: &Path, change: &str, marker: &str) {
+        let dir = workspace.join(CHANGES_SUBDIR).join(change);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(marker), "{}").unwrap();
+    }
+
+    #[test]
+    fn resolve_change_prefix_exact_match_with_marker_is_passthrough() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a37-foo");
+        touch_marker(ws, "a37-foo", NEEDS_REVISION_FILE);
+        let resolved = resolve_change_prefix(
+            ws,
+            "a37-foo",
+            ChangePrefixMarkerScope::NeedsRevision,
+        )
+        .unwrap();
+        assert_eq!(resolved, "a37-foo");
+    }
+
+    #[test]
+    fn resolve_change_prefix_exact_name_without_marker_is_no_match() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a37-foo");
+        // No NEEDS_REVISION marker on the exact-named directory.
+        let err = resolve_change_prefix(
+            ws,
+            "a37-foo",
+            ChangePrefixMarkerScope::NeedsRevision,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ResolvePrefixError::NoMatch {
+                scope: ChangePrefixMarkerScope::NeedsRevision
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_change_prefix_single_prefix_match_resolves() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a37-unify-llm-provider-config");
+        make_change(ws, "a38-bar");
+        touch_marker(ws, "a37-unify-llm-provider-config", NEEDS_REVISION_FILE);
+        // a38-bar has no marker, so prefix `a3` is unambiguous here.
+        let resolved = resolve_change_prefix(
+            ws,
+            "a3",
+            ChangePrefixMarkerScope::NeedsRevision,
+        )
+        .unwrap();
+        assert_eq!(resolved, "a37-unify-llm-provider-config");
+        // And prefix `a37` resolves identically.
+        let resolved2 = resolve_change_prefix(
+            ws,
+            "a37",
+            ChangePrefixMarkerScope::NeedsRevision,
+        )
+        .unwrap();
+        assert_eq!(resolved2, "a37-unify-llm-provider-config");
+    }
+
+    #[test]
+    fn resolve_change_prefix_two_prefix_matches_is_multi_match_sorted() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a38-bar");
+        make_change(ws, "a37-foo");
+        touch_marker(ws, "a37-foo", NEEDS_REVISION_FILE);
+        touch_marker(ws, "a38-bar", NEEDS_REVISION_FILE);
+        let err = resolve_change_prefix(
+            ws,
+            "a3",
+            ChangePrefixMarkerScope::NeedsRevision,
+        )
+        .unwrap_err();
+        match err {
+            ResolvePrefixError::MultiMatch { candidates } => {
+                assert_eq!(candidates, vec!["a37-foo", "a38-bar"]);
+            }
+            other => panic!("expected MultiMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_change_prefix_match_without_marker_is_no_match() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a37-foo");
+        // Marker absent on the only prefix-matching change.
+        let err = resolve_change_prefix(
+            ws,
+            "a37",
+            ChangePrefixMarkerScope::NeedsRevision,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ResolvePrefixError::NoMatch {
+                scope: ChangePrefixMarkerScope::NeedsRevision
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_change_prefix_either_blocking_accepts_either_marker() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a37-foo");
+        make_change(ws, "a38-bar");
+        make_change(ws, "a39-baz");
+        touch_marker(ws, "a37-foo", NEEDS_REVISION_FILE);
+        touch_marker(ws, "a38-bar", PERMA_STUCK_FILE);
+        touch_marker(ws, "a39-baz", NEEDS_REVISION_FILE);
+        touch_marker(ws, "a39-baz", PERMA_STUCK_FILE);
+        let r37 = resolve_change_prefix(
+            ws,
+            "a37",
+            ChangePrefixMarkerScope::EitherBlocking,
+        )
+        .unwrap();
+        assert_eq!(r37, "a37-foo");
+        let r38 = resolve_change_prefix(
+            ws,
+            "a38",
+            ChangePrefixMarkerScope::EitherBlocking,
+        )
+        .unwrap();
+        assert_eq!(r38, "a38-bar");
+        let r39 = resolve_change_prefix(
+            ws,
+            "a39",
+            ChangePrefixMarkerScope::EitherBlocking,
+        )
+        .unwrap();
+        assert_eq!(r39, "a39-baz");
+    }
+
+    #[test]
+    fn resolve_change_prefix_either_blocking_no_match_returns_either_scope() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a39-baz");
+        // No blocking markers on a39-baz.
+        let err = resolve_change_prefix(
+            ws,
+            "a39",
+            ChangePrefixMarkerScope::EitherBlocking,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ResolvePrefixError::NoMatch {
+                scope: ChangePrefixMarkerScope::EitherBlocking
+            }
+        );
+        // The operator-facing message names BOTH marker files.
+        let msg = err.to_operator_message("a39");
+        assert!(
+            msg.contains(".perma-stuck.json")
+                && msg.contains(".needs-spec-revision.json"),
+            "EitherBlocking no-match message must name both markers: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_change_prefix_archive_and_dotfiles_are_skipped() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        // Archive entries should NOT participate in prefix matching.
+        std::fs::create_dir_all(
+            ws.join(CHANGES_SUBDIR).join(ARCHIVE_DIR).join("a01-something"),
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join(CHANGES_SUBDIR)
+                .join(ARCHIVE_DIR)
+                .join("a01-something")
+                .join(NEEDS_REVISION_FILE),
+            "{}",
+        )
+        .unwrap();
+        // Dotfile dir should NOT participate either.
+        let dot_dir = ws.join(CHANGES_SUBDIR).join(".scratch");
+        std::fs::create_dir_all(&dot_dir).unwrap();
+        std::fs::write(dot_dir.join(NEEDS_REVISION_FILE), "{}").unwrap();
+        // Real candidate.
+        make_change(ws, "a37-foo");
+        touch_marker(ws, "a37-foo", NEEDS_REVISION_FILE);
+        // Prefix `a` matches a37-foo only (archive + dotfile are skipped).
+        let resolved = resolve_change_prefix(
+            ws,
+            "a",
+            ChangePrefixMarkerScope::NeedsRevision,
+        )
+        .unwrap();
+        assert_eq!(resolved, "a37-foo");
+    }
+
+    #[test]
+    fn resolve_change_prefix_ignore_for_queue_scope() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        make_change(ws, "a37-foo");
+        make_change(ws, "a38-bar");
+        touch_marker(ws, "a37-foo", IGNORE_FOR_QUEUE_FILE);
+        // a38-bar has perma-stuck but NOT the ignore-for-queue marker:
+        // it must NOT be a candidate.
+        touch_marker(ws, "a38-bar", PERMA_STUCK_FILE);
+        let resolved = resolve_change_prefix(
+            ws,
+            "a3",
+            ChangePrefixMarkerScope::IgnoreForQueue,
+        )
+        .unwrap();
+        assert_eq!(resolved, "a37-foo");
+    }
+
+    #[test]
+    fn resolve_prefix_error_no_match_messages_name_marker_files() {
+        let cases = [
+            (
+                ChangePrefixMarkerScope::NeedsRevision,
+                ".needs-spec-revision.json",
+            ),
+            (
+                ChangePrefixMarkerScope::PermaStuck,
+                ".perma-stuck.json",
+            ),
+            (
+                ChangePrefixMarkerScope::IgnoreForQueue,
+                ".ignore-for-queue.json",
+            ),
+        ];
+        for (scope, marker) in cases {
+            let msg = ResolvePrefixError::NoMatch { scope }.to_operator_message("a99");
+            assert!(
+                msg.contains("a99") && msg.contains(marker),
+                "no-match message must name prefix and marker: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_prefix_error_multi_match_message_lists_candidates() {
+        let err = ResolvePrefixError::MultiMatch {
+            candidates: vec!["a37-foo".into(), "a38-bar".into()],
+        };
+        let msg = err.to_operator_message("a3");
+        assert!(msg.contains("a37-foo"));
+        assert!(msg.contains("a38-bar"));
+        assert!(msg.contains("a3"));
+        assert!(msg.contains("longer prefix"));
     }
 }

@@ -964,6 +964,31 @@ fn handle_clear_perma_stuck(parsed: &Value, state: &ControlState) -> Value {
         Err(e) => return json!({"ok": false, "error": e}),
     };
     let workspace_path = workspace::resolve_path(&state.paths, &repo);
+    // a40: resolve a leading-prefix slug to its canonical change-directory
+    // name, scoped to the action's relevant marker file. Exact matches are
+    // a passthrough; the operator-supplied prefix is replaced with the
+    // canonical slug everywhere downstream (marker removal AND response
+    // JSON), so chatops scrollback names the change that was cleared.
+    let change = match queue::resolve_change_prefix(
+        &workspace_path,
+        &change,
+        queue::ChangePrefixMarkerScope::PermaStuck,
+    ) {
+        Ok(canonical) => {
+            if canonical != change {
+                tracing::info!(
+                    "control_socket: resolved partial change '{change}' → '{canonical}' for action clear_perma_stuck_marker"
+                );
+            }
+            canonical
+        }
+        Err(e) => {
+            tracing::info!(
+                "control_socket: clear_perma_stuck_marker prefix '{change}' did not resolve"
+            );
+            return json!({"ok": false, "error": e.to_operator_message(&change)});
+        }
+    };
     if let Err(e) = queue::remove_perma_stuck_marker(&workspace_path, &change) {
         return json!({"ok": false, "error": format!("{e:#}")});
     }
@@ -1002,6 +1027,27 @@ fn handle_clear_revision(parsed: &Value, state: &ControlState) -> Value {
         Err(e) => return json!({"ok": false, "error": e}),
     };
     let workspace_path = workspace::resolve_path(&state.paths, &repo);
+    // a40: leading-prefix → canonical slug, scoped to .needs-spec-revision.json.
+    let change = match queue::resolve_change_prefix(
+        &workspace_path,
+        &change,
+        queue::ChangePrefixMarkerScope::NeedsRevision,
+    ) {
+        Ok(canonical) => {
+            if canonical != change {
+                tracing::info!(
+                    "control_socket: resolved partial change '{change}' → '{canonical}' for action clear_revision_marker"
+                );
+            }
+            canonical
+        }
+        Err(e) => {
+            tracing::info!(
+                "control_socket: clear_revision_marker prefix '{change}' did not resolve"
+            );
+            return json!({"ok": false, "error": e.to_operator_message(&change)});
+        }
+    };
     match queue::remove_revision_marker(&workspace_path, &change) {
         Ok(()) => json!({"ok": true, "change": change, "url": url}),
         Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
@@ -1034,18 +1080,31 @@ fn handle_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value {
     };
     let workspace_path = workspace::resolve_path(&state.paths, &repo);
 
-    // Refuse if the change has no underlying blocking marker — stamping
-    // ignore on a change with no problem is a confusing no-op.
-    let has_perma_stuck = queue::is_perma_stuck(&workspace_path, &change);
-    let has_needs_revision = queue::is_needs_spec_revision_marked(&workspace_path, &change);
-    if !has_perma_stuck && !has_needs_revision {
-        return json!({
-            "ok": false,
-            "error": format!(
-                "{change} has no operator-action marker (perma-stuck OR needs-spec-revision). Ignore is a no-op; rejecting to prevent confusion."
-            ),
-        });
-    }
+    // a40: leading-prefix → canonical slug, scoped to the EitherBlocking
+    // pair (.perma-stuck.json OR .needs-spec-revision.json). The resolver
+    // guarantees a blocking marker exists on the resolved change, so the
+    // previous "no operator-action marker" refusal happens AT resolution
+    // time and is no longer duplicated here.
+    let change = match queue::resolve_change_prefix(
+        &workspace_path,
+        &change,
+        queue::ChangePrefixMarkerScope::EitherBlocking,
+    ) {
+        Ok(canonical) => {
+            if canonical != change {
+                tracing::info!(
+                    "control_socket: resolved partial change '{change}' → '{canonical}' for action ignore_for_queue_marker"
+                );
+            }
+            canonical
+        }
+        Err(e) => {
+            tracing::info!(
+                "control_socket: ignore_for_queue_marker prefix '{change}' did not resolve"
+            );
+            return json!({"ok": false, "error": e.to_operator_message(&change)});
+        }
+    };
     // Refuse if the marker is already present so the operator gets a
     // clear "no change" signal rather than a stealth no-op commit.
     let spec_root = crate::spec_root::SpecRoot::for_repo(&repo, &workspace_path);
@@ -1113,6 +1172,28 @@ fn handle_clear_ignore_for_queue(parsed: &Value, state: &ControlState) -> Value 
         Err(e) => return json!({"ok": false, "error": e}),
     };
     let workspace_path = workspace::resolve_path(&state.paths, &repo);
+
+    // a40: leading-prefix → canonical slug, scoped to .ignore-for-queue.json.
+    let change = match queue::resolve_change_prefix(
+        &workspace_path,
+        &change,
+        queue::ChangePrefixMarkerScope::IgnoreForQueue,
+    ) {
+        Ok(canonical) => {
+            if canonical != change {
+                tracing::info!(
+                    "control_socket: resolved partial change '{change}' → '{canonical}' for action clear_ignore_for_queue_marker"
+                );
+            }
+            canonical
+        }
+        Err(e) => {
+            tracing::info!(
+                "control_socket: clear_ignore_for_queue_marker prefix '{change}' did not resolve"
+            );
+            return json!({"ok": false, "error": e.to_operator_message(&change)});
+        }
+    };
 
     // Remove the marker — propagate the absent-marker error.
     if let Err(e) = queue::remove_ignore_for_queue_marker(&workspace_path, &change) {
@@ -3372,9 +3453,12 @@ github:
         let resp = send_request(&socket, &req.to_string()).await;
         assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
         let err = resp["error"].as_str().unwrap();
+        // a40: prefix resolution intercepts the absent-marker case at the
+        // resolver layer (the change dir exists but carries no scope marker
+        // → NoMatch). The error names the marker file explicitly.
         assert!(
-            err.contains("no perma-stuck marker"),
-            "error must name marker: {err}"
+            err.contains(".perma-stuck.json"),
+            "error must name marker file: {err}"
         );
         cancel.cancel();
     }
@@ -3422,6 +3506,248 @@ github:
         });
         let resp = send_request(&socket, &req.to_string()).await;
         assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        cancel.cancel();
+    }
+
+    // -------------------------------------------------------------
+    // a40 prefix-resolution tests for the marker-clearing handlers.
+    // The four actions accept either an exact change-directory name OR
+    // a leading prefix, scoped to the action's relevant marker file.
+    // -------------------------------------------------------------
+
+    fn write_marker_file(workspace: &Path, change: &str, marker: &str) {
+        let p = workspace
+            .join("openspec/changes")
+            .join(change)
+            .join(marker);
+        std::fs::write(p, "{}").unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_perma_stuck_resolves_prefix_to_canonical_slug() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a37-unify-llm-provider-config");
+        make_change(&workspace, "a38-bar");
+        write_marker_file(
+            &workspace,
+            "a37-unify-llm-provider-config",
+            ".perma-stuck.json",
+        );
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_perma_stuck_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "a37",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(
+            resp["change"].as_str().unwrap(),
+            "a37-unify-llm-provider-config",
+            "response must echo the canonical slug, not the prefix"
+        );
+        assert!(
+            !workspace
+                .join("openspec/changes/a37-unify-llm-provider-config/.perma-stuck.json")
+                .exists()
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_perma_stuck_no_match_returns_scope_named_error() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a37-foo");
+        // No perma-stuck marker on a37-foo.
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_perma_stuck_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "a99",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap();
+        assert!(
+            err.contains("a99") && err.contains(".perma-stuck.json"),
+            "no-match error must name prefix and marker: {err}"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_perma_stuck_multi_match_lists_candidates() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a37-foo");
+        make_change(&workspace, "a38-bar");
+        write_marker_file(&workspace, "a37-foo", ".perma-stuck.json");
+        write_marker_file(&workspace, "a38-bar", ".perma-stuck.json");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_perma_stuck_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "a3",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap();
+        assert!(err.contains("a37-foo") && err.contains("a38-bar"), "{err}");
+        assert!(err.contains("longer prefix"), "{err}");
+        // Neither marker should have been removed.
+        assert!(
+            workspace
+                .join("openspec/changes/a37-foo/.perma-stuck.json")
+                .exists()
+        );
+        assert!(
+            workspace
+                .join("openspec/changes/a38-bar/.perma-stuck.json")
+                .exists()
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_revision_resolves_prefix_to_canonical_slug() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a37-foo");
+        make_change(&workspace, "a38-bar");
+        write_marker_file(&workspace, "a37-foo", ".needs-spec-revision.json");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_revision_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "a37",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+        assert_eq!(
+            resp["change"].as_str().unwrap(),
+            "a37-foo",
+            "response must echo the canonical slug, not the prefix"
+        );
+        assert!(
+            !workspace
+                .join("openspec/changes/a37-foo/.needs-spec-revision.json")
+                .exists()
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_revision_no_match_returns_scope_named_error() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a37-foo");
+        // a37-foo has perma-stuck only, NOT needs-spec-revision.
+        write_marker_file(&workspace, "a37-foo", ".perma-stuck.json");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_revision_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "a37",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap();
+        assert!(
+            err.contains("a37") && err.contains(".needs-spec-revision.json"),
+            "no-match error must name prefix and the correct scope marker: {err}"
+        );
+        // Perma-stuck marker untouched.
+        assert!(
+            workspace
+                .join("openspec/changes/a37-foo/.perma-stuck.json")
+                .exists()
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_revision_multi_match_lists_candidates() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a37-foo");
+        make_change(&workspace, "a38-bar");
+        write_marker_file(&workspace, "a37-foo", ".needs-spec-revision.json");
+        write_marker_file(&workspace, "a38-bar", ".needs-spec-revision.json");
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_revision_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "a3",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap();
+        assert!(err.contains("a37-foo") && err.contains("a38-bar"), "{err}");
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ignore_for_queue_no_match_returns_either_blocking_scope_error() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a37-foo");
+        // No blocking markers on a37-foo, so any prefix is a no-match.
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "ignore_for_queue_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "a37",
+            "marked_by": "tester",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap();
+        assert!(
+            err.contains("a37")
+                && err.contains(".perma-stuck.json")
+                && err.contains(".needs-spec-revision.json"),
+            "EitherBlocking no-match error must name both markers: {err}"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_ignore_for_queue_no_match_returns_scope_named_error() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        make_change(&workspace, "a37-foo");
+        // No ignore-for-queue marker present.
+        let (_dir, socket, _state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let req = serde_json::json!({
+            "action": "clear_ignore_for_queue_marker",
+            "url": "git@github.com:owner/myrepo.git",
+            "change": "a37",
+        });
+        let resp = send_request(&socket, &req.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        let err = resp["error"].as_str().unwrap();
+        assert!(
+            err.contains("a37") && err.contains(".ignore-for-queue.json"),
+            "no-match error must name prefix and marker: {err}"
+        );
         cancel.cancel();
     }
 
@@ -3814,6 +4140,84 @@ github:
                 .join("openspec/changes/a06-foo/.perma-stuck.json")
                 .exists(),
             "marker must have been removed"
+        );
+        cancel.cancel();
+    }
+
+    /// a40: end-to-end backtick-wrapped + prefix-only chatops flow. The
+    /// operator types `clear-revision myrepo \`a37\`` (backtick-wrapped
+    /// prefix). The parser strips the backticks, the control-socket handler
+    /// resolves the prefix to the canonical slug `a37-foo`, and the marker
+    /// file is removed. The dispatcher's reply names the canonical slug.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_to_end_backtick_wrapped_prefix_resolves_and_clears_marker() {
+        use crate::chatops::operator_commands::{
+            ControlSocketSubmitter, OperatorCommandDispatcher, RepoIdentity, Reply,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        // Exactly one change with .needs-spec-revision.json — the prefix
+        // `a37` resolves unambiguously.
+        make_change(&workspace, "a37-foo");
+        std::fs::write(
+            workspace.join("openspec/changes/a37-foo/.needs-spec-revision.json"),
+            r#"{"change":"a37-foo","marked_at":"2026-01-01T00:00:00Z","unimplementable_tasks":[],"revision_suggestion":"x","operator_action":"x"}"#,
+        )
+        .unwrap();
+        // A second change that does NOT carry the marker — included to
+        // verify scope-filtering works: prefix `a` would otherwise match
+        // both directories.
+        make_change(&workspace, "a38-bar");
+
+        let (_dir, socket, state, _cfg_path, cancel) =
+            fixture_listener(&local_path_yaml(&workspace)).await;
+        let submitter = ControlSocketSubmitter::new(socket.clone());
+        let dispatcher = OperatorCommandDispatcher::new(&state.paths);
+        let repos: Vec<RepoIdentity> = state
+            .last_config
+            .load_full()
+            .repositories
+            .iter()
+            .map(|r| RepoIdentity {
+                url: r.url.clone(),
+                workspace_path: crate::workspace::resolve_path(&state.paths, r),
+            })
+            .collect();
+        let bot = "<@UBOT>";
+        let reply = dispatcher
+            .handle_message(
+                &format!("{bot} clear-revision myrepo `a37`"),
+                "C1",
+                bot,
+                &repos,
+                &submitter,
+            )
+            .await
+            .expect("dispatcher must produce a reply");
+        let reply_text = match reply {
+            Reply::Sync(s) => s,
+            other => panic!("expected Sync reply, got {other:?}"),
+        };
+        assert!(
+            reply_text.starts_with("✓"),
+            "expected success reply: {reply_text}"
+        );
+        // The dispatcher reply names the canonical slug (a37-foo), NOT
+        // the prefix (a37).
+        assert!(
+            reply_text.contains("a37-foo"),
+            "reply must echo canonical slug: {reply_text}"
+        );
+        // The marker file is gone — the resolver correctly mapped the
+        // prefix to a37-foo and the marker-removal call targeted the
+        // canonical directory.
+        assert!(
+            !workspace
+                .join("openspec/changes/a37-foo/.needs-spec-revision.json")
+                .exists(),
+            "marker file under canonical directory must be removed"
         );
         cancel.cancel();
     }

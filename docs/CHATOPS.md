@@ -427,6 +427,13 @@ A small set of admin verbs handles the SSH-and-edit recovery actions from chat i
 
 The verbs `pause`, `resume`, and `clear-alert-throttle` are intentionally not in this initial set. If your operator workflow needs them, file a follow-up issue describing the usage pattern.
 
+### Argument hygiene for recovery verbs
+
+Two relaxations apply uniformly to every recovery verb's arguments:
+
+- **Surrounding backticks are tolerated.** Alert templates wrap change slugs and repo identifiers in single backticks for chat readability (`` `a37-unify-llm-provider-config` ``); when an operator copies that wrapper verbatim, the parser strips a single pair of leading/trailing backticks before its regex check. Embedded backticks (mid-token) are preserved and still fail validation. Example: `@<bot> clear-revision myrepo \`a37-unify-llm-provider-config\`` parses identically to the unwrapped form.
+- **Leading prefix is sufficient when one change matches.** The four marker-clearing verbs (`clear-perma-stuck`, `clear-revision`, `ignore-and-continue`, `clear-ignore`) resolve a partial slug to the canonical change directory when exactly one change in the repo carries the verb's relevant marker file (`.perma-stuck.json` for `clear-perma-stuck`; `.needs-spec-revision.json` for `clear-revision`; either of the two for `ignore-and-continue`; `.ignore-for-queue.json` for `clear-ignore`). The dispatcher's success reply names the canonical slug it resolved to. When two or more changes carrying the marker share the prefix, the reply lists the candidates and asks for a longer prefix. Example: `@<bot> clear-revision myrepo a37` resolves to `a37-unify-llm-provider-config` when that is the only change in the repo carrying `.needs-spec-revision.json`.
+
 ### Bare `status` — the per-repo menu
 
 When you don't remember the exact substring of a configured repo, type `@<bot> status` with no arguments. The bot returns a one-line announcement followed by one two-line section per watched repository (URL on top, summary on the next line). The summary has three clauses joined by ` · `: a queue clause (`empty queue` when all three counts are zero, otherwise `<N> pending (<list>), <M> waiting (<list>), <K> excluded` with each list truncating after 5 entries), a busy clause matching the per-repo `currently:` line variants (`idle`, `working on <change> (started <age> ago)`, `running audit <type> (started <age> ago)`, `<stage> in progress (started <age> ago)`, `stale marker from pid <pid> (...)`, or the unclassified-fallback `busy (stage=<stage>, ...)` — see [`currently:` line variants](#currently-line-variants)), and a last-iteration clause (`last iteration <age> ago` or `no iteration yet`). Example:
