@@ -36,6 +36,32 @@ The `a21` install wizard offers "install Ollama via docker" as option 1 but stop
 
 Defer until the contradiction-pre-flight ships and we see false-positive rates.
 
+## Model attribution on reviewer / executor / audit comments
+
+Operator-facing comments (code review, executor implementation notes, audit findings, contradiction-check findings) don't currently identify which model produced them. With multiple LLM providers/models configurable across these surfaces — AND with operators experimenting across reviewer tiers — the lack of attribution makes it hard to associate a comment's quality with the model that produced it.
+
+The fix is small. A redaction-safe accessor on the resolved config (the same primitive that gives selective config access without leaking API keys) returns `(provider, model)` for each LLM-driven surface. Each comment composer prepends or appends a one-line attribution: `*Reviewer: openrouter/moonshotai/kimi-latest*` (or `*Executor: ...*`, `*Auditor: ...*`). Render points: `revisions.rs:~1250` (rerun reviews), the initial-review PR-body builder, the executor implementation-notes section, each audit's chatops + PR comment formatter.
+
+Scope considerations: identifier format should be stable across providers (e.g. `<provider>/<model>` rather than each provider's native naming). The accessor MUST refuse to return anything that could be an API key, base URL, or other secret-bearing field — explicit allowlist of safe fields, not a denylist.
+
+Worth doing soon — it cleanly closes the "which model produced this?" gap that operators (and Claude itself, helping operators debug) currently bridge by memory.
+
+## Auto-revise trigger trace + critical-evaluation prompt for the revising agent
+
+Two related concerns about the auto-revise pipeline that surfaced during the multi-reviewer PR #79 trial:
+
+**(1) Trigger-path trace.** Confirm which combination of `Verdict` (Approve | Block) + `should_request_revision: true` actually fires auto-revise, AND whether the operator-triggered rerun path (`@<bot> code-review`) participates or only the initial-review path does. Observed: owl-alpha's rerun review had two `should_request_revision: true` items (one impossible to action, one targeting a fabricated test name) — neither triggered an auto-revise commit. That's accidental safety; the underlying logic may or may not currently gate against this case correctly.
+
+**(2) Critical-evaluation prompt.** When auto-revise DOES fire, the prompt handed off to the revising agent should explicitly instruct it to evaluate the original reviewer's request critically — not assume the previous reviewer is correct about the need. Concrete reviewers tested (owl-alpha, MiMo) have both produced `should_request_revision: true` items that would actively damage the codebase if applied: removing a spec-traced test the reviewer mistakenly believed was redundant; churning working idiomatic code (`.tmp` extension → `NamedTempFile`) for protection that doesn't apply. The implementing agent should: (a) read the actual code at the cited location; (b) verify the reviewer's claim against current state; (c) reject the revision when the claim is wrong; (d) post a chatops comment naming what it rejected and why, so the operator sees the trail. Models with strong instruction-following (Claude, Opus) will do this naturally if asked; cheaper executors may need the rejection mechanic spelled out explicitly.
+
+Worth scoping together because (2)'s prompt is only load-bearing if (1) confirms the trigger fires on these inputs.
+
+## Reviewer `mode: per_change` not honored on rerun path
+
+When `reviewer.mode: per_change` is set in config, the expected output is one `## Code Review: <slug>` section per change. Observed on PR #79 reruns (owl-alpha, laguna-m.1): both produced a single bundled `## Code Review` block, suggesting the rerun path forces `ReviewerMode::Bundled` regardless of config — OR the config-to-reviewer mode threading uses the default rather than reading from `ReviewerConfig`. Infrastructure exists (`PerChangeSection`, `with_mode(ReviewerMode::PerChange)`, the `per_change_sections: Vec<...>` field in `ReviewReport`); investigation needs to trace the operator-trigger code path (`@<bot> code-review` → `review_pr_at_state` in `revisions.rs`) and confirm where the mode is or isn't propagated.
+
+Worth fixing because per-change review is materially more useful than bundled when a PR carries multiple unrelated changes — operators want to see "change a35 is approved; change a36 has concerns" not one combined verdict that hides per-change differences.
+
 ## On-demand audit re-run after operator merges a fix
 
 When an audit fires (drift, brightline, etc.) and the operator addresses the findings via `send it`, the audit's `last_run_sha` is unchanged — the audit only re-runs when HEAD changes. The next audit fire could be days later. An operator who fixes findings and wants to verify the fix worked has to wait for the next cadence OR explicitly re-trigger via `@<bot> audit <type> <repo>`.
