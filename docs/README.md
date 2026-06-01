@@ -28,3 +28,7 @@ This directory holds the long-form documentation for autocoder. The main [README
 
 - [foundation-smoke-test.md](foundation-smoke-test.md) — Optional manual end-to-end procedure against throwaway GitHub repos. The in-tree `cargo test` suite is the primary coverage; this is operator confidence-building before pointing the daemon at a repo you care about.
 - [test-reliability.md](test-reliability.md) — Living reference of known test-suite flakes, root causes, and dispositions. Updated by implementing agents under the `project-documentation` spec.
+
+## Contributing
+
+- [OpenSpec conventions](https://github.com/Fission-AI/OpenSpec/tree/main/docs) — Upstream spec-format reference. This project follows OpenSpec for change management. The `concepts.md` and `getting-started.md` pages cover scenario syntax (`GIVEN`/`WHEN`/`THEN`), delta blocks (`ADDED`/`MODIFIED`/`REMOVED`/`RENAMED`), and requirement-header rules. Consult these when drafting a new `openspec/changes/<slug>/` proposal.
