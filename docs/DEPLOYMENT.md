@@ -80,6 +80,12 @@ sudo -u autocoder openspec --version             # verify
 
 The Claude credentials now live at `/home/autocoder/.claude/`. The git config writes to `/home/autocoder/.gitconfig` and is required — autocoder's commit step fails without an author identity. Both survive restarts as long as the systemd unit runs as the same user.
 
+If Claude Code is installed system-wide rather than under the autocoder user, the daemon user can't auto-update it. Add a root cron entry to update it periodically:
+
+```
+0 4 * * 0 root claude update
+```
+
 (If `npm` isn't on the autocoder user's `$PATH`, install Node.js first via your distro's package manager or `nvm`. The exact openspec install command may vary; check the openspec project for the current recommendation.)
 
 After installing the openspec CLI, run `openspec config profile` once on this host and enable the `Sync specs` workflow:
