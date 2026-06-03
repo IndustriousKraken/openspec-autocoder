@@ -940,7 +940,7 @@ async fn process_one_pr(
         .await;
         let revise_duration = revise_started_at.elapsed();
         match outcome {
-            Ok(ExecutorOutcome::Completed { .. }) => {
+            Ok(ExecutorOutcome::Completed { final_answer }) => {
                 let commit_subject = build_commit_subject(&change_name, &revision_text);
                 if let Err(e) = apply_revision_commit(workspace, repo, push_remote, &commit_subject)
                 {
@@ -987,9 +987,11 @@ async fn process_one_pr(
                     &comment_id_str,
                 )
                 .await;
-                let reply = format!(
-                    "✅ Revision applied: {}. Revision count: {} of {}.",
-                    commit_subject, state.revisions_applied, state.revision_cap,
+                let reply = compose_revision_success_comment(
+                    &commit_subject,
+                    state.revisions_applied,
+                    state.revision_cap,
+                    final_answer.as_deref(),
                 );
                 if let Err(e) = github::post_issue_comment(
                     api_base, token, owner, repo_name, pr.number, &reply,
@@ -1189,6 +1191,41 @@ fn advance_seen(latest: &mut Option<DateTime<Utc>>, candidate: DateTime<Utc>) {
         Some(curr) if *curr >= candidate => {}
         _ => *latest = Some(candidate),
     }
+}
+
+/// GitHub comment-size budget (chars) for the revision success reply.
+/// Mirrors the implementer-summary budget enforced by
+/// `polling_loop::truncate_to_fit`.
+const REVISION_COMMENT_MAX: usize = 60_000;
+
+/// Compose the success reply comment body for a `Completed` revision.
+///
+/// The success line stays at the top so operators scanning for the ✓
+/// confirmation see it immediately. When `final_answer` carries text
+/// that is non-empty after trimming, the agent's summary follows after a
+/// blank line, verbatim — no transformation, no re-wrapping. When
+/// `final_answer` is `None` (legacy text mode OR no outcome tool was
+/// called) OR is empty after trimming, the body is the single-line
+/// success form (today's behavior; no trailing blank section). The
+/// composed body is passed through [`crate::polling_loop::truncate_to_fit`]
+/// so it stays under GitHub's comment-size limit, with a truncation
+/// marker appended (naming the per-change log file) when it would
+/// overflow.
+fn compose_revision_success_comment(
+    commit_subject: &str,
+    revisions_applied: u32,
+    revision_cap: u32,
+    final_answer: Option<&str>,
+) -> String {
+    let success_line = format!(
+        "✅ Revision applied: {}. Revision count: {} of {}.",
+        commit_subject, revisions_applied, revision_cap,
+    );
+    let body = match final_answer {
+        Some(text) if !text.trim().is_empty() => format!("{success_line}\n\n{text}"),
+        _ => success_line,
+    };
+    crate::polling_loop::truncate_to_fit(body, REVISION_COMMENT_MAX)
 }
 
 fn build_commit_subject(change: &str, revision_text: &str) -> String {
@@ -1973,6 +2010,74 @@ mod tests {
         let s = build_commit_subject("foo", "line1\nline2");
         assert!(!s.contains('\n'), "newlines should be removed: {s:?}");
         assert!(s.contains("line1"), "got: {s}");
+    }
+
+    // -------- revision success-comment composition (a45) --------
+
+    #[test]
+    fn revision_success_comment_includes_final_answer() {
+        let subject = "revise: a39-foo: please investigate";
+        let body = compose_revision_success_comment(
+            subject,
+            1,
+            5,
+            Some("Did X, declined Y because Z."),
+        );
+        let success_line = format!("✅ Revision applied: {subject}. Revision count: 1 of 5.");
+        // Success line at the top, summary after a single blank line.
+        assert!(body.starts_with(&success_line), "got: {body:?}");
+        assert!(body.contains("Did X, declined Y because Z."), "got: {body:?}");
+        assert_eq!(body, format!("{success_line}\n\nDid X, declined Y because Z."));
+    }
+
+    #[test]
+    fn revision_success_comment_none_is_single_line() {
+        let subject = "revise: a39-foo: please investigate";
+        let body = compose_revision_success_comment(subject, 2, 5, None);
+        assert_eq!(
+            body,
+            format!("✅ Revision applied: {subject}. Revision count: 2 of 5.")
+        );
+        // No trailing blank line / empty summary section.
+        assert!(!body.contains("\n\n"), "expected single-line form: {body:?}");
+    }
+
+    #[test]
+    fn revision_success_comment_whitespace_only_is_single_line() {
+        let subject = "revise: a39-foo: please investigate";
+        let body = compose_revision_success_comment(subject, 3, 5, Some("   "));
+        assert_eq!(
+            body,
+            format!("✅ Revision applied: {subject}. Revision count: 3 of 5.")
+        );
+        // Whitespace-only final_answer is treated as empty.
+        assert!(!body.contains("\n\n"), "expected single-line form: {body:?}");
+    }
+
+    #[test]
+    fn revision_success_comment_truncates_oversize_summary() {
+        let huge = "x".repeat(100_000);
+        let body = compose_revision_success_comment(
+            "revise: a39-foo: please investigate",
+            1,
+            5,
+            Some(&huge),
+        );
+        // Success line is still first.
+        assert!(body.starts_with("✅ Revision applied:"), "got: {body:?}");
+        // The generalized truncation marker (shared with the implementer
+        // summary path) is appended, naming the per-change log file.
+        assert!(
+            body.contains("_[summary truncated to fit GitHub comment limit;"),
+            "missing truncation marker"
+        );
+        assert!(body.ends_with("/<change>.log]_"), "marker tail missing");
+        // Bounded by the budget plus the (short) marker.
+        assert!(
+            body.len() <= REVISION_COMMENT_MAX + 200,
+            "unexpected length: {}",
+            body.len()
+        );
     }
 
     // -------- dispatcher integration (mockito + stub executor) --------

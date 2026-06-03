@@ -27,6 +27,8 @@ body, the reviewer feedback is in the revision request below.
    for scope reasons, re-evaluate the work yourself.
 4. Read the PR body for the code-review section AND any other
    rendered context the human reviewer saw.
+5. On the success path, call `outcome_success` with a `final_answer`
+   per the **Outcome signal** guidance below.
 
 Make targeted edits to the existing PR diff. Do NOT re-implement the
 original change from scratch; leave the parts the reviewer did not
@@ -41,6 +43,38 @@ your diff on success.
 If you cannot start the work because of a concrete blocker (a tool is
 missing, a file referenced does not exist, a spec is irreducibly
 ambiguous), use `ask_user` to escalate.
+
+## Outcome signal
+
+At end-of-run, call `outcome_success` with a brief `final_answer` (5-10
+lines) summarizing the revision. This text becomes the body of the
+success comment posted under the operator's revision request, so the
+operator sees what you did without opening the diff. Cover:
+
+- What the reviewer asked for (one line restating the request).
+- What you changed in response — name the files / functions touched.
+- Whether you agreed with the reviewer's claim. If you concluded the
+  request was wrong (mistaken about the code, asks for something that
+  would break tests, references a symbol that doesn't exist), say so AND
+  explain why you declined OR partially honored it. Declining is a valid
+  outcome; report it explicitly — it is NOT a failure.
+- Test counts: new tests added (if any), AND pass/fail from the final
+  run.
+- `cargo clippy --all-targets -- -D warnings` AND
+  `openspec validate <change> --strict` results when applicable.
+
+Worked example:
+
+> Reviewer asked for case-insensitive prefix matching on the new
+> resolver in `queue.rs::resolve_change_prefix`. Investigated the
+> slug-naming convention AND confirmed all in-repo slugs are lowercase
+> by convention. Declined the request: case-insensitive matching would
+> let `archive` partial-match `a`, broadening the resolver beyond its
+> intent. No code changed.
+>
+> Tests: 0 added (declined revision).
+> `cargo clippy --all-targets -- -D warnings`: clean.
+> `openspec validate a40-chatops-tolerant-change-args --strict`: pass.
 
 --- BEGIN CHANGES IN THIS PR ---
 

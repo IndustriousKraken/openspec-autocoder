@@ -5428,7 +5428,14 @@ fn extract_stdout_section(raw: &str) -> &str {
 /// Truncate `body` to fit within GitHub's comment size limit. If `body`
 /// is short enough, returned as-is. Otherwise truncated at the largest
 /// char boundary `<= max` and a marker noting the truncation is appended.
-fn truncate_to_fit(body: String, max: usize) -> String {
+///
+/// `pub(crate)` so the revision success-comment composer
+/// (`revisions::compose_revision_success_comment`) can reuse the same
+/// limit-and-marker behavior. The marker text is generalized (it does
+/// not say "implementer") because it now serves both the implementer
+/// summary AND the revision summary; both recover the full output from
+/// the same per-change run-log path.
+pub(crate) fn truncate_to_fit(body: String, max: usize) -> String {
     if body.len() <= max {
         return body;
     }
@@ -5438,7 +5445,7 @@ fn truncate_to_fit(body: String, max: usize) -> String {
     }
     let mut truncated = body[..cut].to_string();
     truncated.push_str(
-        "\n\n_[implementer summary truncated to fit GitHub comment limit; full output at <logs_dir>/runs/<workspace-basename>/<change>.log]_",
+        "\n\n_[summary truncated to fit GitHub comment limit; full output at <logs_dir>/runs/<workspace-basename>/<change>.log]_",
     );
     truncated
 }
@@ -11062,7 +11069,7 @@ mod tests {
     fn truncate_to_fit_appends_marker_when_exceeded() {
         let body = "x".repeat(100_000);
         let out = truncate_to_fit(body, 60_000);
-        let marker = "_[implementer summary truncated to fit GitHub comment limit;";
+        let marker = "_[summary truncated to fit GitHub comment limit;";
         assert!(out.ends_with("/<change>.log]_"));
         assert!(out.contains(marker), "missing truncation marker");
         // Total length is bounded by max + marker length.
