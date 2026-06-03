@@ -6576,10 +6576,28 @@ fn extract_porcelain_path(line: &str) -> Option<&str> {
 }
 
 /// a43: discard every working-tree change OUTSIDE the OpenSpec change
-/// root (`openspec/changes/`). Tracked modifications (and deletions) are
-/// reverted with `git restore`; untracked additions are removed from
-/// disk. Returns the sorted, de-duplicated list of discarded paths so the
-/// caller can log them AND surface them to chatops.
+/// root (`openspec/changes/`), reverting each non-spec path to its
+/// committed (HEAD) state so the spec-PR commit is genuinely spec-only.
+/// Returns the sorted, de-duplicated list of discarded paths so the caller
+/// can log them AND surface them to chatops.
+///
+/// Revert strategy per non-spec path, chosen by where the path lives:
+///   - **Untracked addition** (`??`): removed from disk — it has no HEAD
+///     blob to restore.
+///   - **Tracked path present in HEAD** (a modification, deletion,
+///     type-change, OR the SOURCE side of a rename): reverted with `git
+///     checkout HEAD -- <path>`, which rewrites BOTH the index AND the
+///     worktree to the committed content — so a code edit the executor
+///     staged with `git add` cannot survive into the spec commit.
+///   - **Tracked path absent from HEAD** (a brand-new file the executor
+///     created AND `git add`ed — porcelain `A ` — OR the DESTINATION of a
+///     rename): unstaged with `git reset HEAD -- <path>` (which demotes it
+///     to untracked) AND then removed from disk. This case is handled
+///     WITHOUT `git checkout HEAD -- <path>` / `git restore --source=HEAD`
+///     on purpose: those reject a pathspec absent from HEAD with a
+///     "pathspec did not match any file(s) known to git" error on some git
+///     versions, which would abort the whole triage flow exactly when the
+///     executor `git add`ed a new code file — the common case.
 ///
 /// Triage executor runs are spec-only under a43: any code-path write the
 /// agent made despite the prompt restriction is dropped here BEFORE the
@@ -6602,89 +6620,143 @@ pub fn discard_non_spec_writes(workspace: &Path, spec_slug: &str) -> Result<Vec<
             continue;
         }
         if is_untracked {
-            // Untracked addition: the file does not exist at HEAD, so
-            // remove it from disk rather than `git restore` (which would
-            // fail with "pathspec did not match").
-            let abs = workspace.join(&path);
-            // Decide dir-vs-file from the path's OWN metadata (lstat), not
-            // `is_dir()` which follows symlinks. git reports an untracked
-            // symlink as a single entry; following it into `remove_dir_all`
-            // could delete the link TARGET's contents. `symlink_metadata`
-            // reports a symlink as a non-dir, so it is unlinked via
-            // `remove_file` (dropping just the link). A real untracked
-            // directory still routes to `remove_dir_all`.
-            let is_real_dir = abs
-                .symlink_metadata()
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
-            let removal = if is_real_dir {
-                std::fs::remove_dir_all(&abs)
-            } else {
-                std::fs::remove_file(&abs)
-            };
-            // A surviving untracked file would be swept into the
-            // spec-only commit by the caller's subsequent `git add -A`,
-            // silently violating the spec-only invariant. An already-gone
-            // path is fine (goal achieved); any other failure — a
-            // read-only file, a write-protected parent directory — is
-            // fatal: fail loudly rather than let the write leak.
-            if let Err(e) = removal
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(
-                    spec_slug = %spec_slug,
-                    path = %path,
-                    "discard_non_spec_writes: failed to remove untracked non-spec write: {e:#}"
-                );
-                return Err(anyhow!(
-                    "discard_non_spec_writes: failed to remove untracked non-spec write `{path}`: {e}; \
-                     refusing to proceed so it does not leak into the spec-only PR"
-                ));
-            }
+            // Untracked addition: no HEAD blob to restore, so remove it
+            // from disk.
+            remove_non_spec_path_from_disk(workspace, &path, spec_slug)?;
+        } else if path_exists_in_head(workspace, &path)? {
+            // Tracked change to a path that EXISTS in HEAD (modification,
+            // deletion, type-change, OR a rename source). `git checkout
+            // HEAD -- <path>` rewrites BOTH the index AND the worktree to
+            // the committed content — so a code edit the executor staged
+            // with `git add` cannot survive into the spec commit.
+            run_git_revert(
+                workspace,
+                &["checkout", "-q", "HEAD", "--", path.as_str()],
+                &path,
+                spec_slug,
+            )?;
         } else {
-            // Tracked modification/deletion: revert BOTH the index AND the
-            // worktree to the committed (base) state. `--source=HEAD
-            // --staged --worktree` is deliberate: if the executor staged a
-            // code edit with `git add`, a plain `git restore -- <path>`
-            // would only rewrite the worktree from the index, leaving the
-            // staged modification in the index where the caller's `git add
-            // -A` + commit would sweep it into the spec PR. Resetting both
-            // refs to HEAD unstages and reverts the path regardless.
-            let restore = std::process::Command::new("git")
-                .args(["restore", "--source=HEAD", "--staged", "--worktree", "--", &path])
-                .current_dir(workspace)
-                .output()
-                .with_context(|| {
-                    format!("discard_non_spec_writes: spawning git restore for `{path}`")
-                })?;
-            if !restore.status.success() {
-                // Capture git's own diagnostic via `output()` rather than
-                // letting `status()` spill it to the daemon's inherited
-                // stderr, AND surface it in the error so a failed revert is
-                // debuggable (mirrors the `git::run_git` contract).
-                let stderr = String::from_utf8_lossy(&restore.stderr).trim().to_string();
-                let stdout = String::from_utf8_lossy(&restore.stdout).trim().to_string();
-                let diag = match (stderr.is_empty(), stdout.is_empty()) {
-                    (false, _) => stderr,
-                    (true, false) => stdout,
-                    (true, true) => format!("(no output; exit {:?})", restore.status.code()),
-                };
-                tracing::warn!(
-                    spec_slug = %spec_slug,
-                    path = %path,
-                    "discard_non_spec_writes: git restore exited non-zero reverting tracked non-spec write: {diag}"
-                );
-                return Err(anyhow!(
-                    "discard_non_spec_writes: `git restore --source=HEAD --staged --worktree -- {path}` \
-                     exited non-zero ({diag}); refusing to proceed so the non-spec write does not leak into the spec-only PR"
-                ));
-            }
+            // Tracked change to a path ABSENT from HEAD: a brand-new file
+            // the executor `git add`ed (porcelain `A `) OR a rename
+            // destination. `git checkout HEAD -- <path>` / `git restore
+            // --source=HEAD` reject a not-in-HEAD pathspec on some git
+            // versions, so unstage it (`git reset HEAD -- <path>` demotes
+            // it to untracked) AND remove it from disk.
+            run_git_revert(
+                workspace,
+                &["reset", "-q", "HEAD", "--", path.as_str()],
+                &path,
+                spec_slug,
+            )?;
+            remove_non_spec_path_from_disk(workspace, &path, spec_slug)?;
         }
         discarded.push(path);
     }
     discarded.sort();
     discarded.dedup();
     Ok(discarded)
+}
+
+/// Remove a non-spec working-tree path from disk (symlink-safe), treating
+/// an already-absent path as success. Shared by the untracked-addition
+/// branch AND the not-in-HEAD tracked branch (a staged add OR rename
+/// destination that `git reset` has just demoted to untracked) of
+/// `discard_non_spec_writes`. Any failure other than "already gone" is
+/// fatal: a surviving file would be swept into the spec-only commit by the
+/// caller's subsequent `git add -A`, silently violating the spec-only
+/// invariant, so we fail loudly rather than let the write leak.
+fn remove_non_spec_path_from_disk(workspace: &Path, path: &str, spec_slug: &str) -> Result<()> {
+    let abs = workspace.join(path);
+    // Decide dir-vs-file from the path's OWN metadata (lstat), not
+    // `is_dir()` which follows symlinks: git reports an untracked symlink
+    // as a single entry, AND following it into `remove_dir_all` could
+    // delete the link TARGET's contents. `symlink_metadata` reports a
+    // symlink as a non-dir, so it is unlinked via `remove_file` (dropping
+    // just the link). A real untracked directory still routes to
+    // `remove_dir_all`.
+    let is_real_dir = abs
+        .symlink_metadata()
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    let removal = if is_real_dir {
+        std::fs::remove_dir_all(&abs)
+    } else {
+        std::fs::remove_file(&abs)
+    };
+    if let Err(e) = removal
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            spec_slug = %spec_slug,
+            path = %path,
+            "discard_non_spec_writes: failed to remove non-spec write: {e:#}"
+        );
+        return Err(anyhow!(
+            "discard_non_spec_writes: failed to remove non-spec write `{path}`: {e}; \
+             refusing to proceed so it does not leak into the spec-only PR"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `path` exists as a blob in HEAD — i.e. `git cat-file -e
+/// HEAD:<path>` succeeds. Picks the revert strategy for a tracked non-spec
+/// change in `discard_non_spec_writes`: a path IN HEAD is reverted with
+/// `git checkout HEAD -- <path>`; a path NOT in HEAD (a staged add OR a
+/// rename destination) is unstaged AND deleted instead. A failure to spawn
+/// git propagates; a clean non-zero exit (the blob is absent, with git's
+/// diagnostic captured rather than spilled to stderr) is reported as
+/// `false`.
+fn path_exists_in_head(workspace: &Path, path: &str) -> Result<bool> {
+    let out = std::process::Command::new("git")
+        .args(["cat-file", "-e", &format!("HEAD:{path}")])
+        .current_dir(workspace)
+        .output()
+        .with_context(|| {
+            format!("discard_non_spec_writes: spawning git cat-file for `{path}`")
+        })?;
+    Ok(out.status.success())
+}
+
+/// Run a git working-tree revert subprocess (`checkout`/`reset`) for
+/// `discard_non_spec_writes`, capturing diagnostics via `output()` (rather
+/// than letting `status()` spill git's stderr to the daemon's inherited
+/// stderr) AND surfacing them in the error so a failed revert is
+/// debuggable (mirrors the `git::run_git` contract). A non-zero exit is
+/// fatal: we refuse to proceed so the non-spec write cannot leak into the
+/// spec-only PR.
+fn run_git_revert(workspace: &Path, args: &[&str], path: &str, spec_slug: &str) -> Result<()> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .output()
+        .with_context(|| {
+            format!(
+                "discard_non_spec_writes: spawning `git {}` for `{path}`",
+                args.join(" ")
+            )
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let diag = match (stderr.is_empty(), stdout.is_empty()) {
+            (false, _) => stderr,
+            (true, false) => stdout,
+            (true, true) => format!("(no output; exit {:?})", out.status.code()),
+        };
+        tracing::warn!(
+            spec_slug = %spec_slug,
+            path = %path,
+            "discard_non_spec_writes: `git {}` exited non-zero reverting non-spec write: {diag}",
+            args.join(" ")
+        );
+        return Err(anyhow!(
+            "discard_non_spec_writes: `git {}` exited non-zero ({diag}); \
+             refusing to proceed so the non-spec write does not leak into the spec-only PR",
+            args.join(" ")
+        ));
+    }
+    Ok(())
 }
 
 /// Robustly enumerate the working tree's changed paths via `git status
@@ -7555,8 +7627,9 @@ mod tests {
     /// must be fully reverted — index AND worktree. A plain
     /// `git restore -- <path>` only rewrites the worktree from the index,
     /// so the staged modification would survive in the index and leak
-    /// into the supposedly spec-only commit. The `--source=HEAD --staged
-    /// --worktree` revert unstages and reverts regardless.
+    /// into the supposedly spec-only commit. Because the path exists in
+    /// HEAD, the handler reverts it with `git checkout HEAD -- <path>`,
+    /// which unstages AND reverts regardless of the staged state.
     #[test]
     fn discard_non_spec_writes_reverts_staged_code_modification() {
         let (_d, ws) = dnsw_repo();
@@ -7579,6 +7652,49 @@ mod tests {
             crate::git::status_porcelain(&ws).unwrap(),
             "",
             "a staged code modification must be fully unstaged and reverted"
+        );
+    }
+
+    /// a43 revision: a brand-new code file the executor created AND staged
+    /// with `git add` (porcelain `A `, NOT present in HEAD) must be cleanly
+    /// discarded — unstaged AND removed from disk — NOT aborted with a
+    /// pathspec error. `git checkout HEAD -- <path>` / `git restore
+    /// --source=HEAD` reject a path absent from HEAD on some git versions;
+    /// the handler routes not-in-HEAD tracked paths through `git reset` +
+    /// disk removal so the common "LLM `git add`ed a new file" case does
+    /// not crash the triage flow.
+    #[test]
+    fn discard_non_spec_writes_discards_staged_new_file() {
+        let (_d, ws) = dnsw_repo();
+        std::fs::write(ws.join("newcode.rs"), "junk\n").unwrap();
+        // Stage the brand-new file the way an LLM bash tool might.
+        let st = std::process::Command::new("git")
+            .args(["add", "newcode.rs"])
+            .current_dir(&ws)
+            .status()
+            .unwrap();
+        assert!(st.success(), "staging newcode.rs failed");
+        // Sanity: it is a STAGED ADD (`A `), not untracked (`??`) — so it
+        // takes the tracked, not-in-HEAD branch, the one the old `git
+        // restore --source=HEAD` would have choked on.
+        let porc = crate::git::status_porcelain(&ws).unwrap();
+        assert!(
+            porc.starts_with("A "),
+            "expected a staged addition (A ), got {porc:?}"
+        );
+
+        let dropped = discard_non_spec_writes(&ws, "foo").unwrap();
+
+        assert_eq!(dropped, vec!["newcode.rs".to_string()]);
+        assert!(
+            !ws.join("newcode.rs").exists(),
+            "the staged new file must be removed from disk"
+        );
+        assert_eq!(
+            crate::git::status_porcelain(&ws).unwrap(),
+            "",
+            "a staged new file must be fully unstaged AND removed — nothing \
+             left for the caller's `git add -A` to sweep into the spec PR"
         );
     }
 
