@@ -91,11 +91,13 @@ reviewer:
 
 The mode is hot-applicable via `autocoder reload`; flipping it between iterations causes the next PR to use the new mode.
 
-## Reviewer-initiated revisions on `Block` verdicts
+## Reviewer-initiated revisions on actionable concerns
 
-When `reviewer.auto_revise_on_block: true` is set, every `Block` verdict additionally forwards the actionable concerns to the same revision dispatcher that handles operator `@<bot> revise ...` comments. The flow:
+When `reviewer.auto_revise: true` is set, autocoder forwards the actionable concerns to the same revision dispatcher that handles operator `@<bot> revise ...` comments. The trigger is the per-concern actionability signal, **not** the verdict: it fires on actionable concerns regardless of whether the review's verdict is `Pass`, `Concerns`, or `Block`. (`Block` retains its separate effect of marking the PR draft; it just no longer gates auto-revise.)
 
-1. Reviewer returns a `Block` verdict with one or more per-concern records marked `should_request_revision: true`.
+The legacy config key `auto_revise_on_block` is still accepted as a silent alias, so existing config files load unchanged. The flow:
+
+1. Reviewer returns any verdict with one or more per-concern records marked `should_request_revision: true` and a non-empty `actionable_request`.
 2. Autocoder posts one PR issue comment per such concern, with body:
 
    ```

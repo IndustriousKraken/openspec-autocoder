@@ -219,13 +219,14 @@ PR-comment revision channel entirely.
 
 The same revision dispatcher described above also processes
 `<!-- reviewer-revision -->`-marked comments posted by the code-quality
-reviewer when `reviewer.auto_revise_on_block: true`. Both flows share the
+reviewer when `reviewer.auto_revise: true` (fired on actionable concerns
+regardless of verdict). Both flows share the
 per-PR `executor.max_revisions_per_pr` cap and the same per-PR state file
 (`<workspace>/.autocoder/revisions/<pr-number>.json`); a reviewer-initiated
 revision applied in iteration N counts against the same budget a
 subsequent human `@<bot> revise ...` would consume.
 
-See [Reviewer-initiated revisions on Block verdicts](CODE-REVIEW.md#reviewer-initiated-revisions-on-block-verdicts)
+See [Reviewer-initiated revisions on actionable concerns](CODE-REVIEW.md#reviewer-initiated-revisions-on-actionable-concerns)
 for the full reviewer-side flow, the per-concern decision the reviewer
 makes, and the operator-template migration steps for sites that have
 overridden the default reviewer prompt.

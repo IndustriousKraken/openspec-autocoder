@@ -409,7 +409,7 @@ The ack's `ts` becomes the changelog-request's lifecycle thread. Status updates 
 
 When the bot opens a PR (from a normal queue iteration, from a `send it` triage, or from a `propose` directive), an operator comment of the form `@<bot> revise <free-form text>` on that PR triggers an in-place revision: the next polling iteration re-runs the executor with the original change material, the current PR diff, and the operator's text, then force-pushes the updated diff and posts a `✅ Revision applied:` or `✗ Revision attempt failed:` reply comment.
 
-Per-PR cap (default 5; configurable up to 20 via `executor.max_revisions_per_pr`). Reviewer-initiated revisions (when `reviewer.auto_revise_on_block: true`) share the same cap. Full spec in [OPERATIONS.md → Revising an open PR via comment](OPERATIONS.md#revising-an-open-pr-via-comment).
+Per-PR cap (default 5; configurable up to 20 via `executor.max_revisions_per_pr`). Reviewer-initiated revisions (when `reviewer.auto_revise: true`) share the same cap. Full spec in [OPERATIONS.md → Revising an open PR via comment](OPERATIONS.md#revising-an-open-pr-via-comment).
 
 ---
 

@@ -141,7 +141,7 @@ pub struct PerChangeReview {
 pub struct CodeReviewer {
     client: Box<dyn LlmClient>,
     template: String,
-    auto_revise_on_block: bool,
+    auto_revise: bool,
     prompt_budget: usize,
     mode: crate::config::ReviewerMode,
     max_code_reviews_per_pr: u32,
@@ -157,7 +157,7 @@ impl CodeReviewer {
         Self {
             client,
             template,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget: DEFAULT_PROMPT_BUDGET,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: crate::config::default_max_code_reviews_per_pr(),
@@ -226,23 +226,25 @@ impl CodeReviewer {
     }
 
     /// Builder-style setter mirroring the config flag of the same name.
-    /// The flag controls whether `Block`-verdict concerns get forwarded
-    /// to the revision dispatcher as `<!-- reviewer-revision -->` PR
-    /// comments. Default `false` (no behavioural change). Used by
-    /// `from_config` to propagate `ReviewerConfig::auto_revise_on_block`
-    /// onto the constructed reviewer; tests use it directly when they
-    /// need the flag flipped without round-tripping a full config.
-    pub fn with_auto_revise_on_block(mut self, enabled: bool) -> Self {
-        self.auto_revise_on_block = enabled;
+    /// The flag controls whether concerns marked `should_request_revision`
+    /// (with a non-empty `actionable_request`) get forwarded to the
+    /// revision dispatcher as `<!-- reviewer-revision -->` PR comments,
+    /// regardless of the review's verdict. Default `false` (no behavioural
+    /// change). Used by `from_config` to propagate
+    /// `ReviewerConfig::auto_revise` onto the constructed reviewer; tests
+    /// use it directly when they need the flag flipped without
+    /// round-tripping a full config.
+    pub fn with_auto_revise(mut self, enabled: bool) -> Self {
+        self.auto_revise = enabled;
         self
     }
 
     /// Whether reviewer-initiated revisions are enabled for this
     /// reviewer instance. Read by the polling-loop posting step that
-    /// turns `Block`-verdict concerns into `<!-- reviewer-revision -->`
-    /// PR comments.
-    pub fn auto_revise_on_block(&self) -> bool {
-        self.auto_revise_on_block
+    /// turns actionable concerns into `<!-- reviewer-revision -->` PR
+    /// comments (regardless of verdict).
+    pub fn auto_revise(&self) -> bool {
+        self.auto_revise
     }
 
     /// Wire a reviewer from config: build the LLM client, load the
@@ -260,7 +262,7 @@ impl CodeReviewer {
             None,
         );
         Ok(Self::new(client, template)
-            .with_auto_revise_on_block(cfg.auto_revise_on_block)
+            .with_auto_revise(cfg.auto_revise)
             .with_prompt_budget(cfg.prompt_budget_chars)
             .with_mode(cfg.mode)
             .with_max_code_reviews_per_pr(cfg.max_code_reviews_per_pr)
@@ -1081,7 +1083,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
@@ -1107,7 +1109,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
@@ -1177,7 +1179,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
@@ -1213,7 +1215,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: Some(template_path),
             code_review: None,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
@@ -1252,7 +1254,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: Some(bogus.clone()),
             code_review: None,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
@@ -1296,7 +1298,7 @@ this is not yaml: at all: ::: {{{ broken
             code_review: Some(PromptOverrideBlock {
                 prompt_path: Some(nested),
             }),
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
@@ -1323,7 +1325,7 @@ this is not yaml: at all: ::: {{{ broken
             api_base_url: None,
             prompt_template_path: None,
             code_review: None,
-            auto_revise_on_block: false,
+            auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
             max_code_reviews_per_pr: 5,
@@ -1342,7 +1344,7 @@ this is not yaml: at all: ::: {{{ broken
 
     #[test]
     fn default_template_describes_revision_requests_block() {
-        // Operators who flip `reviewer.auto_revise_on_block` rely on the
+        // Operators who flip `reviewer.auto_revise` rely on the
         // default template producing the structured `revision-requests`
         // block. The template must instruct the LLM on it.
         assert!(

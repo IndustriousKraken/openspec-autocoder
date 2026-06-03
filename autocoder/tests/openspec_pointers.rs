@@ -169,3 +169,98 @@ fn check_passes_when_both_present() {
         "GIVEN a scenario, see https://github.com/Fission-AI/OpenSpec/tree/main/docs";
     assert!(check_contents("docs/README.md", contents).is_empty());
 }
+
+// -------- a45-revision-summary-surfaces-in-pr-comment --------
+//
+// CI-enforced rule: `prompts/implementer-revision.md` must carry the
+// outcome-signal section that directs the revision agent to call
+// `outcome_success` with a content-shaped `final_answer`. Without it the
+// PR-comment composer (orchestrator-cli "Revision execution ... posts a
+// reply comment") has no substantive summary to surface. The markers
+// below are the load-bearing contract; the surrounding prose is free to
+// be reworded. See openspec/specs/project-documentation/spec.md.
+
+/// The relative path to the revision prompt the a45 check covers.
+const REVISION_PROMPT: &str = "prompts/implementer-revision.md";
+
+/// Required substrings for the revision prompt's outcome-signal section.
+const REVISION_OUTCOME_MARKERS: &[&str] =
+    &["outcome_success", "final_answer", "declined", "Test counts"];
+
+/// Pure detection helper: one violation line per missing marker, each
+/// naming the file AND the missing substring (matching the a41
+/// diagnostic shape). Pure so the failure path is unit-testable without
+/// filesystem I/O. Collects ALL misses (NOT first-failure-only).
+fn check_revision_outcome_markers(rel: &str, contents: &str) -> Vec<String> {
+    REVISION_OUTCOME_MARKERS
+        .iter()
+        .filter(|needle| !contents.contains(**needle))
+        .map(|needle| format!("{rel}: missing required substring '{needle}'"))
+        .collect()
+}
+
+/// Main a45 regression test: the revision prompt must contain every
+/// required outcome-signal marker. Misses are reported in one combined
+/// listing so a contributor dropping several at once sees them all.
+#[test]
+fn revision_prompt_carries_outcome_signal_markers() {
+    let path = repo_root().join(REVISION_PROMPT);
+    let contents = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => panic!(
+            "{REVISION_PROMPT}: could not read file at {} ({e})",
+            path.display()
+        ),
+    };
+
+    let violations = check_revision_outcome_markers(REVISION_PROMPT, &contents);
+    assert!(
+        violations.is_empty(),
+        "revision-prompt outcome-signal marker check failed for {} item(s):\n\n{}\n\n\
+         The `## Outcome signal` section of {REVISION_PROMPT} must direct the revision \
+         agent to call `outcome_success` with a content-shaped `final_answer` (covering \
+         that `declined` is a valid outcome AND `Test counts`) so the PR-comment composer \
+         has substantive text to surface — see \
+         openspec/specs/project-documentation/spec.md. Restore the missing marker(s).",
+        violations.len(),
+        violations.join("\n"),
+    );
+}
+
+/// Self-test: dropping one marker yields exactly the spec's named
+/// diagnostic (the `declined`-missing failure scenario).
+#[test]
+fn revision_markers_flag_single_missing() {
+    let contents = "call outcome_success with final_answer; cover Test counts.";
+    let got = check_revision_outcome_markers(REVISION_PROMPT, contents);
+    assert_eq!(
+        got,
+        vec![
+            "prompts/implementer-revision.md: missing required substring 'declined'".to_string()
+        ]
+    );
+}
+
+/// Self-test: dropping two markers reports BOTH in one combined listing
+/// (the spec's multiple-missing scenario).
+#[test]
+fn revision_markers_report_multiple_missing() {
+    let contents = "call outcome_success with final_answer.";
+    let got = check_revision_outcome_markers(REVISION_PROMPT, contents);
+    assert_eq!(
+        got,
+        vec![
+            "prompts/implementer-revision.md: missing required substring 'declined'".to_string(),
+            "prompts/implementer-revision.md: missing required substring 'Test counts'"
+                .to_string(),
+        ]
+    );
+}
+
+/// Self-test: when every marker is present, no violation is produced
+/// (the rewording-within-contract scenario).
+#[test]
+fn revision_markers_pass_when_all_present() {
+    let contents = "outcome_success / final_answer / declined / Test counts";
+    assert!(check_revision_outcome_markers(REVISION_PROMPT, contents).is_empty());
+}

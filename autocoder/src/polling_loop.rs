@@ -1059,13 +1059,13 @@ pub async fn execute_one_pass(
     // the push + PR. A failed reviewer is non-fatal: PR still ships with a
     // "(reviewer failed)" note in the body.
     //
-    // When `reviewer.auto_revise_on_block` is enabled AND the verdict is
-    // Block, the per-concern `should_request_revision` records drive the
-    // reviewer-initiated revision pipeline. Concerns are partitioned
-    // against the per-PR cap budget here; the taken set is queued to be
-    // posted as `<!-- reviewer-revision -->` PR comments after the PR is
-    // created, and the dropped set is annotated into the `## Code Review`
-    // PR-body section so the human sees what was skipped.
+    // When `reviewer.auto_revise` is enabled, the per-concern
+    // `should_request_revision` records drive the reviewer-initiated
+    // revision pipeline regardless of the verdict. Concerns are
+    // partitioned against the per-PR cap budget here; the taken set is
+    // queued to be posted as `<!-- reviewer-revision -->` PR comments
+    // after the PR is created, and the dropped set is annotated into the
+    // `## Code Review` PR-body section so the human sees what was skipped.
     // a34 §6: when `reviewer.skip_spec_only_prs: true` AND the PR's
     // diff lives entirely under `openspec/`, skip the reviewer call
     // (cost-optimization knob). The detection mirrors the iteration's
@@ -1127,7 +1127,7 @@ pub async fn execute_one_pass(
                 match outcome {
                     Ok(mut report) => {
                         let draft = matches!(report.verdict, ReviewVerdict::Block);
-                        let taken = if r.auto_revise_on_block() {
+                        let taken = if r.auto_revise() {
                             partition_and_annotate_reviewer_revisions(&mut report, revision_cap)
                         } else {
                             Vec::new()
@@ -5163,31 +5163,29 @@ async fn post_reviewer_revision_comments(
 /// Decide which concerns from `report.concerns` get posted as
 /// `<!-- reviewer-revision -->` PR comments and which are dropped due to
 /// the per-PR revision-cap budget. Pre-conditions assume the caller has
-/// already gated on `reviewer.auto_revise_on_block == true`.
+/// already gated on `reviewer.auto_revise == true`.
 ///
 /// Selection rules:
-/// - The verdict gates the entire mechanism: only `Block` produces
-///   reviewer-revision posts. `Pass` and `Concerns` return an empty vec
-///   without scanning the concerns list.
-/// - Within a `Block`-verdict report, a concern is "revisable" when
+/// - The verdict is NOT consulted. The actionability signal lives at the
+///   per-concern granularity: a concern is "revisable" when
 ///   `should_request_revision == true` AND `actionable_request` is
-///   non-empty (whitespace-trimmed). Concerns failing either condition
+///   non-empty (whitespace-trimmed). This fires under any verdict
+///   (`Pass`, `Concerns`, OR `Block`). Concerns failing either condition
 ///   stay as commentary in the `## Code Review` section and do not post.
+///   (`Block` retains its separate effect of marking the PR draft; that
+///   is handled by the caller and no longer gates this function.)
 /// - When the revisable set exceeds `budget`, the first `budget`
 ///   concerns (in reviewer output order — the template instructs
 ///   most-critical-first) are taken; the remainder are annotated into
 ///   `report.markdown` with `(not auto-revised; cap budget exhausted)`
 ///   so the human reader of the PR body sees what was skipped.
-/// - When the revisable set is empty AND the verdict is `Block`, a WARN
-///   is logged surfacing the "you flipped the flag but your template
-///   produced no actionable concerns" misconfiguration.
+/// - When the revisable set is empty, a WARN is logged surfacing the
+///   "you flipped the flag but your template produced no actionable
+///   concerns" misconfiguration.
 fn partition_and_annotate_reviewer_revisions(
     report: &mut ReviewReport,
     budget: u32,
 ) -> Vec<ReviewConcern> {
-    if report.verdict != ReviewVerdict::Block {
-        return Vec::new();
-    }
     let revisable: Vec<ReviewConcern> = report
         .concerns
         .iter()
@@ -5428,7 +5426,14 @@ fn extract_stdout_section(raw: &str) -> &str {
 /// Truncate `body` to fit within GitHub's comment size limit. If `body`
 /// is short enough, returned as-is. Otherwise truncated at the largest
 /// char boundary `<= max` and a marker noting the truncation is appended.
-fn truncate_to_fit(body: String, max: usize) -> String {
+///
+/// `pub(crate)` so the revision success-comment composer
+/// (`revisions::compose_revision_success_comment`) can reuse the same
+/// limit-and-marker behavior. The marker text is generalized (it does
+/// not say "implementer") because it now serves both the implementer
+/// summary AND the revision summary; both recover the full output from
+/// the same per-change run-log path.
+pub(crate) fn truncate_to_fit(body: String, max: usize) -> String {
     if body.len() <= max {
         return body;
     }
@@ -5438,7 +5443,7 @@ fn truncate_to_fit(body: String, max: usize) -> String {
     }
     let mut truncated = body[..cut].to_string();
     truncated.push_str(
-        "\n\n_[implementer summary truncated to fit GitHub comment limit; full output at <logs_dir>/runs/<workspace-basename>/<change>.log]_",
+        "\n\n_[summary truncated to fit GitHub comment limit; full output at <logs_dir>/runs/<workspace-basename>/<change>.log]_",
     );
     truncated
 }
@@ -11062,7 +11067,7 @@ mod tests {
     fn truncate_to_fit_appends_marker_when_exceeded() {
         let body = "x".repeat(100_000);
         let out = truncate_to_fit(body, 60_000);
-        let marker = "_[implementer summary truncated to fit GitHub comment limit;";
+        let marker = "_[summary truncated to fit GitHub comment limit;";
         assert!(out.ends_with("/<change>.log]_"));
         assert!(out.contains(marker), "missing truncation marker");
         // Total length is bounded by max + marker length.
@@ -15881,7 +15886,7 @@ mod tests {
     }
 
     // ============================================================
-    // partition_and_annotate_reviewer_revisions (cap-budget + verdict gating)
+    // partition_and_annotate_reviewer_revisions (cap-budget; verdict-agnostic)
     // ============================================================
 
     fn make_report(verdict: ReviewVerdict, concerns: Vec<ReviewConcern>) -> ReviewReport {
@@ -15986,28 +15991,34 @@ mod tests {
         assert_eq!(synth.concerns[1].change_slug.as_deref(), Some("beta"));
     }
 
+    // a46 task 3.3: the verdict is fully decoupled from auto-revise. A
+    // `Pass` verdict carrying one actionable concern returns that concern.
     #[test]
-    fn partition_returns_empty_on_pass_verdict() {
+    fn partition_pass_verdict_with_actionable_concern_returns_it() {
         let mut r = make_report(
             ReviewVerdict::Pass,
             vec![revisable_concern("a", "fix a")],
         );
         let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
-        assert!(taken.is_empty(), "Pass must never post revision comments");
+        assert_eq!(taken.len(), 1, "Pass + actionable concern must post");
+        assert_eq!(taken[0].summary, "a");
         assert!(
             !r.markdown.contains("cap budget exhausted"),
-            "no dropped-concern annotation on Pass"
+            "nothing dropped: no annotation"
         );
     }
 
+    // a46 task 3.1: inverted from the old "Concerns posts nothing" test. A
+    // `Concerns` verdict with one actionable concern now returns it.
     #[test]
-    fn partition_returns_empty_on_concerns_verdict() {
+    fn partition_concerns_verdict_with_actionable_concern_returns_it() {
         let mut r = make_report(
             ReviewVerdict::Concerns,
             vec![revisable_concern("a", "fix a")],
         );
         let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
-        assert!(taken.is_empty(), "Concerns must never post revision comments");
+        assert_eq!(taken.len(), 1, "Concerns + actionable concern must post");
+        assert_eq!(taken[0].summary, "a");
         assert!(!r.markdown.contains("cap budget exhausted"));
     }
 
@@ -16181,6 +16192,40 @@ mod tests {
         let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
         assert_eq!(taken.len(), 1);
         assert_eq!(taken[0].summary, "ok");
+    }
+
+    // a46 task 3.2: the Block path is preserved, not regressed — a `Block`
+    // verdict with actionable concerns still returns them.
+    #[test]
+    fn partition_block_verdict_with_actionable_concerns_still_returns_them() {
+        let mut r = make_report(
+            ReviewVerdict::Block,
+            vec![
+                revisable_concern("a", "fix a"),
+                revisable_concern("b", "fix b"),
+            ],
+        );
+        let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
+        assert_eq!(taken.len(), 2, "Block + actionable concerns must post");
+        assert_eq!(taken[0].summary, "a");
+        assert_eq!(taken[1].summary, "b");
+    }
+
+    // a46 task 3.4: any verdict + zero actionable concerns returns empty.
+    // Complements `partition_block_with_no_revisable_concerns_returns_empty`
+    // (the Block case) by exercising a non-Block verdict — proving the
+    // "no actionable concerns" gate is itself verdict-agnostic. The WARN is
+    // logged inside the function on this path (not asserted here, matching
+    // the existing no-revisable test's pattern).
+    #[test]
+    fn partition_concerns_verdict_with_no_actionable_concerns_returns_empty() {
+        let mut r = make_report(
+            ReviewVerdict::Concerns,
+            vec![commentary_concern("style nit"), commentary_concern("preference")],
+        );
+        let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
+        assert!(taken.is_empty(), "no actionable concerns => no posts under Concerns");
+        assert!(!r.markdown.contains("cap budget exhausted"));
     }
 
     // ============================================================

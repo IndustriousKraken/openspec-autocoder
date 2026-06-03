@@ -1275,13 +1275,16 @@ pub struct ReviewerConfig {
     /// Modernized form of `prompt_template_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_review: Option<PromptOverrideBlock>,
-    /// Opt-in flag: when `true`, a reviewer `Block` verdict triggers
-    /// reviewer-authored revision-request PR comments for each concern
-    /// the reviewer marked `should_request_revision: true`. The dispatcher
-    /// from the PR-comment revision loop picks these up on the next
-    /// polling iteration. Default `false` (no behavioural change).
-    #[serde(default)]
-    pub auto_revise_on_block: bool,
+    /// Opt-in flag: when `true`, reviewer-authored revision-request PR
+    /// comments are posted for each concern the reviewer marked
+    /// `should_request_revision: true` with a non-empty `actionable_request`,
+    /// REGARDLESS of the review's verdict (`Pass`, `Concerns`, OR `Block`).
+    /// The dispatcher from the PR-comment revision loop picks these up on
+    /// the next polling iteration. Default `false` (no behavioural change).
+    /// The legacy key `auto_revise_on_block` is accepted as a silent alias
+    /// so existing config files load unchanged.
+    #[serde(default, alias = "auto_revise_on_block")]
+    pub auto_revise: bool,
     /// Maximum size (in chars) of the rendered reviewer prompt body —
     /// change context + changed files + diff combined. Default
     /// `2_000_000` preserves the historical hard-coded value. No clamping:
@@ -3003,7 +3006,7 @@ github:
             "api_key_env",
             "api_key",
             "api_base_url",
-            "auto_revise_on_block",
+            "auto_revise",
             "prompt_budget_chars",
             "mode",
             "max_code_reviews_per_pr",
@@ -3190,11 +3193,13 @@ reviewer:
         assert_eq!(rv.api_base_url.as_deref(), Some("https://api.anthropic.com"));
         assert!(rv.prompt_template_path.is_none());
         // Default (field omitted) → false.
-        assert!(!rv.auto_revise_on_block);
+        assert!(!rv.auto_revise);
     }
 
     #[test]
-    fn reviewer_auto_revise_on_block_explicit_true() {
+    fn reviewer_auto_revise_legacy_alias_explicit_true() {
+        // The legacy key `auto_revise_on_block` is still accepted via the
+        // serde alias and deserializes to `auto_revise == true`.
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -3212,9 +3217,35 @@ reviewer:
   auto_revise_on_block: true
 "#;
         let (_dir, path) = write_config(yaml);
-        let cfg = Config::load_from(&path).expect("config with auto_revise_on_block should parse");
+        let cfg =
+            Config::load_from(&path).expect("config with legacy auto_revise_on_block should parse");
         let rv = cfg.reviewer.expect("reviewer block should be present");
-        assert!(rv.auto_revise_on_block);
+        assert!(rv.auto_revise);
+    }
+
+    #[test]
+    fn reviewer_auto_revise_explicit_true() {
+        // The canonical key `auto_revise` deserializes identically.
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  auto_revise: true
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config with auto_revise should parse");
+        let rv = cfg.reviewer.expect("reviewer block should be present");
+        assert!(rv.auto_revise);
     }
 
     #[test]

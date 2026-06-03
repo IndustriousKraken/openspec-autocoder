@@ -940,7 +940,7 @@ async fn process_one_pr(
         .await;
         let revise_duration = revise_started_at.elapsed();
         match outcome {
-            Ok(ExecutorOutcome::Completed { .. }) => {
+            Ok(ExecutorOutcome::Completed { final_answer }) => {
                 let commit_subject = build_commit_subject(&change_name, &revision_text);
                 if let Err(e) = apply_revision_commit(workspace, repo, push_remote, &commit_subject)
                 {
@@ -987,9 +987,11 @@ async fn process_one_pr(
                     &comment_id_str,
                 )
                 .await;
-                let reply = format!(
-                    "✅ Revision applied: {}. Revision count: {} of {}.",
-                    commit_subject, state.revisions_applied, state.revision_cap,
+                let reply = compose_revision_success_comment(
+                    &commit_subject,
+                    state.revisions_applied,
+                    state.revision_cap,
+                    final_answer.as_deref(),
                 );
                 if let Err(e) = github::post_issue_comment(
                     api_base, token, owner, repo_name, pr.number, &reply,
@@ -1191,6 +1193,41 @@ fn advance_seen(latest: &mut Option<DateTime<Utc>>, candidate: DateTime<Utc>) {
     }
 }
 
+/// GitHub comment-size budget (chars) for the revision success reply.
+/// Mirrors the implementer-summary budget enforced by
+/// `polling_loop::truncate_to_fit`.
+const REVISION_COMMENT_MAX: usize = 60_000;
+
+/// Compose the success reply comment body for a `Completed` revision.
+///
+/// The success line stays at the top so operators scanning for the ✓
+/// confirmation see it immediately. When `final_answer` carries text
+/// that is non-empty after trimming, the agent's summary follows after a
+/// blank line, verbatim — no transformation, no re-wrapping. When
+/// `final_answer` is `None` (legacy text mode OR no outcome tool was
+/// called) OR is empty after trimming, the body is the single-line
+/// success form (today's behavior; no trailing blank section). The
+/// composed body is passed through [`crate::polling_loop::truncate_to_fit`]
+/// so it stays under GitHub's comment-size limit, with a truncation
+/// marker appended (naming the per-change log file) when it would
+/// overflow.
+fn compose_revision_success_comment(
+    commit_subject: &str,
+    revisions_applied: u32,
+    revision_cap: u32,
+    final_answer: Option<&str>,
+) -> String {
+    let success_line = format!(
+        "✅ Revision applied: {}. Revision count: {} of {}.",
+        commit_subject, revisions_applied, revision_cap,
+    );
+    let body = match final_answer {
+        Some(text) if !text.trim().is_empty() => format!("{success_line}\n\n{text}"),
+        _ => success_line,
+    };
+    crate::polling_loop::truncate_to_fit(body, REVISION_COMMENT_MAX)
+}
+
 fn build_commit_subject(change: &str, revision_text: &str) -> String {
     let mut excerpt: String = revision_text
         .chars()
@@ -1229,9 +1266,10 @@ pub enum CodeReviewOutcome {
 /// [`execute_revision`]. Fetches the PR's current state, invokes
 /// [`crate::code_reviewer::review_pr_at_state_with`], AND posts the
 /// reviewer's output as a fresh PR comment with the canonical
-/// `## Code Review (rerun N of M)` heading. On `Block` + the reviewer's
-/// `auto_revise_on_block` flag, also posts per-concern
-/// `<!-- reviewer-revision -->`-marked comments.
+/// `## Code Review (rerun N of M)` heading. When the reviewer's
+/// `auto_revise` flag is set, also posts per-concern
+/// `<!-- reviewer-revision -->`-marked comments for every actionable
+/// concern, regardless of the verdict.
 #[allow(clippy::too_many_arguments)]
 async fn execute_code_review(
     workspace: &Path,
@@ -1295,19 +1333,20 @@ async fn execute_code_review(
             reason: format!("PR comment post failed: {e}"),
         });
     }
-    // On Block + auto_revise_on_block, post one
-    // `<!-- reviewer-revision -->`-marked PR comment per actionable concern.
-    if matches!(result.verdict, crate::code_reviewer::Verdict::Block)
-        && reviewer.auto_revise_on_block()
-    {
+    // When `reviewer.auto_revise` is enabled, post one
+    // `<!-- reviewer-revision -->`-marked PR comment per actionable
+    // concern — REGARDLESS of the verdict, mirroring the initial-review
+    // partition logic. A concern is actionable when it carries
+    // `should_request_revision: true` AND a non-empty `actionable_request`.
+    if reviewer.auto_revise() {
         for concern in &result.concerns {
             if !concern.should_request_revision {
                 continue;
             }
-            let request = concern
-                .actionable_request
-                .as_deref()
-                .unwrap_or(concern.summary.as_str());
+            let request = match concern.actionable_request.as_deref() {
+                Some(s) if !s.trim().is_empty() => s.trim(),
+                _ => continue,
+            };
             let comment_body = format!(
                 "{REVIEWER_REVISION_MARKER}\n@{bot_label} revise {request}",
                 bot_label = "<bot>", // dispatcher rewrites mention upstream
@@ -1973,6 +2012,74 @@ mod tests {
         let s = build_commit_subject("foo", "line1\nline2");
         assert!(!s.contains('\n'), "newlines should be removed: {s:?}");
         assert!(s.contains("line1"), "got: {s}");
+    }
+
+    // -------- revision success-comment composition (a45) --------
+
+    #[test]
+    fn revision_success_comment_includes_final_answer() {
+        let subject = "revise: a39-foo: please investigate";
+        let body = compose_revision_success_comment(
+            subject,
+            1,
+            5,
+            Some("Did X, declined Y because Z."),
+        );
+        let success_line = format!("✅ Revision applied: {subject}. Revision count: 1 of 5.");
+        // Success line at the top, summary after a single blank line.
+        assert!(body.starts_with(&success_line), "got: {body:?}");
+        assert!(body.contains("Did X, declined Y because Z."), "got: {body:?}");
+        assert_eq!(body, format!("{success_line}\n\nDid X, declined Y because Z."));
+    }
+
+    #[test]
+    fn revision_success_comment_none_is_single_line() {
+        let subject = "revise: a39-foo: please investigate";
+        let body = compose_revision_success_comment(subject, 2, 5, None);
+        assert_eq!(
+            body,
+            format!("✅ Revision applied: {subject}. Revision count: 2 of 5.")
+        );
+        // No trailing blank line / empty summary section.
+        assert!(!body.contains("\n\n"), "expected single-line form: {body:?}");
+    }
+
+    #[test]
+    fn revision_success_comment_whitespace_only_is_single_line() {
+        let subject = "revise: a39-foo: please investigate";
+        let body = compose_revision_success_comment(subject, 3, 5, Some("   "));
+        assert_eq!(
+            body,
+            format!("✅ Revision applied: {subject}. Revision count: 3 of 5.")
+        );
+        // Whitespace-only final_answer is treated as empty.
+        assert!(!body.contains("\n\n"), "expected single-line form: {body:?}");
+    }
+
+    #[test]
+    fn revision_success_comment_truncates_oversize_summary() {
+        let huge = "x".repeat(100_000);
+        let body = compose_revision_success_comment(
+            "revise: a39-foo: please investigate",
+            1,
+            5,
+            Some(&huge),
+        );
+        // Success line is still first.
+        assert!(body.starts_with("✅ Revision applied:"), "got: {body:?}");
+        // The generalized truncation marker (shared with the implementer
+        // summary path) is appended, naming the per-change log file.
+        assert!(
+            body.contains("_[summary truncated to fit GitHub comment limit;"),
+            "missing truncation marker"
+        );
+        assert!(body.ends_with("/<change>.log]_"), "marker tail missing");
+        // Bounded by the budget plus the (short) marker.
+        assert!(
+            body.len() <= REVISION_COMMENT_MAX + 200,
+            "unexpected length: {}",
+            body.len()
+        );
     }
 
     // -------- dispatcher integration (mockito + stub executor) --------
@@ -4131,5 +4238,124 @@ mod tests {
         let calls = stub.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "C-team-alpha");
+    }
+
+    /// a46 task 3.6: the re-review (rerun) path has its own reviewer-revision
+    /// posting logic. Verify it fires on a `Concerns` verdict (not just
+    /// `Block`) when `reviewer.auto_revise` is enabled: a re-review that
+    /// returns `Concerns` with one actionable concern posts BOTH the rerun
+    /// `## Code Review (rerun N of M)` comment AND exactly one
+    /// `<!-- reviewer-revision -->`-marked comment carrying the actionable
+    /// request.
+    #[tokio::test]
+    async fn rerun_concerns_verdict_with_actionable_concern_posts_reviewer_revision() {
+        // Stub LLM client returning a Concerns review with one actionable
+        // concern. The reviewer ignores the (empty) diff context.
+        struct ReviewStub {
+            response: String,
+        }
+        #[async_trait]
+        impl crate::llm::LlmClient for ReviewStub {
+            async fn complete(&self, _prompt: &str) -> anyhow::Result<String> {
+                Ok(self.response.clone())
+            }
+        }
+        let response = r#"VERDICT: Concerns
+
+## Possible bugs
+- do_thing drops the error context.
+
+```revision-requests
+- summary: "do_thing drops the error context"
+  actionable_request: "propagate the error from do_thing via anyhow::Context"
+  should_request_revision: true
+```
+"#;
+        let reviewer = CodeReviewer::new(
+            Box::new(ReviewStub {
+                response: response.to_string(),
+            }),
+            "review the code".to_string(),
+        )
+        .with_auto_revise(true);
+
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+
+        let mut server = mockito::Server::new_async().await;
+        // The rerun `## Code Review` heading comment.
+        let rerun_mock = server
+            .mock("POST", "/repos/owner/repo/issues/77/comments")
+            .match_body(mockito::Matcher::Regex(
+                r"Code Review \(rerun 1 of 5\)".to_string(),
+            ))
+            .with_status(201)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        // Exactly one reviewer-revision-marked comment for the actionable
+        // concern — fired under a Concerns verdict (the decoupling).
+        let revision_mock = server
+            .mock("POST", "/repos/owner/repo/issues/77/comments")
+            .match_body(mockito::Matcher::Regex(
+                "reviewer-revision.*propagate the error from do_thing".to_string(),
+            ))
+            .with_status(201)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let pr = github::PrSummary {
+            number: 77,
+            title: "t".to_string(),
+            url: "https://github.com/owner/repo/pull/77".to_string(),
+            state: "open".to_string(),
+            body: None,
+            created_at: ts("2026-05-25T10:00:00Z"),
+            head: github::PrRefSummary {
+                ref_: "agent-q".to_string(),
+            },
+            base: github::PrRefSummary {
+                ref_: "main".to_string(),
+            },
+        };
+        let mut state = sample_state(77);
+
+        let outcome = execute_code_review(
+            &ws,
+            &repo,
+            Some(&reviewer),
+            &pr,
+            &[],
+            &mut state,
+            &server.url(),
+            "test-token",
+            "owner",
+            "repo",
+        )
+        .await
+        .expect("execute_code_review succeeds");
+
+        // A `Concerns` `ReviewVerdict` collapses to the coarse
+        // `Verdict::Approve` (only `Block` maps to `Verdict::Block`). The
+        // old rerun gate `matches!(result.verdict, Verdict::Block)` was
+        // therefore false here — proving the decoupling: the
+        // reviewer-revision comment must still post under a non-Block
+        // outcome, which `revision_mock.assert_async()` confirms.
+        assert!(
+            matches!(
+                outcome,
+                CodeReviewOutcome::Completed {
+                    verdict: crate::code_reviewer::Verdict::Approve
+                }
+            ),
+            "expected a completed non-Block review, got {outcome:?}"
+        );
+        rerun_mock.assert_async().await;
+        revision_mock.assert_async().await;
+        assert_eq!(state.code_reviews_applied, 1);
     }
 }

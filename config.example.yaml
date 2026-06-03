@@ -348,14 +348,17 @@ github:
 #   #   prompt_budget_chars: 300000
 #   #   mode: per_change
 #   #
-#   # Reviewer-initiated revisions on `Block` verdicts. When `true`, every
-#   # concern the reviewer marked `should_request_revision: true` posts a
+#   # Reviewer-initiated revisions on actionable concerns. When `true`,
+#   # every concern the reviewer marked `should_request_revision: true`
+#   # (with a non-empty `actionable_request`) posts a
 #   # `<!-- reviewer-revision -->` PR comment that the revision dispatcher
-#   # picks up on the next polling iteration. Defaults to `false`. Requires
+#   # picks up on the next polling iteration — REGARDLESS of the verdict
+#   # (`Pass`, `Concerns`, OR `Block`). Defaults to `false`. Requires
 #   # `executor.max_revisions_per_pr > 0` (the dispatcher); operator-
 #   # customized reviewer templates must be updated to emit the new
 #   # per-concern fields. See README's "Reviewer-initiated revisions" section.
-#   # auto_revise_on_block: false
+#   # The legacy key `auto_revise_on_block` is still accepted as an alias.
+#   # auto_revise: false
 #   #
 #   # Maximum size (in chars) of the rendered reviewer prompt body —
 #   # change context + changed files + diff combined. Default 2000000

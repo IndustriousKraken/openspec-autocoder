@@ -80,7 +80,7 @@ Concrete example of the block you should produce when there are two concerns to 
   should_request_revision: false
 ```
 
-The example above is what should appear in your output verbatim (fence open with ```` ```revision-requests ````, YAML content, fence close with ```` ``` ````). The daemon uses it to drive the reviewer-initiated revision pipeline (when enabled via `reviewer.auto_revise_on_block`).
+The example above is what should appear in your output verbatim (fence open with ```` ```revision-requests ````, YAML content, fence close with ```` ``` ````). The daemon uses it to drive the reviewer-initiated revision pipeline (when enabled via `reviewer.auto_revise`).
 
 # Change context
 
