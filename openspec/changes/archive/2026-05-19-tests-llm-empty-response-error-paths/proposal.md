@@ -1,3 +1,7 @@
+---
+changelog: skip
+---
+
 ## Why
 
 `autocoder/src/llm.rs` defines two LLM clients used by the code-reviewer. Each

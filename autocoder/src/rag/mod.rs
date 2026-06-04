@@ -447,7 +447,7 @@ mod tests {
     fn config_for_tests() -> CanonicalRagConfig {
         CanonicalRagConfig {
             enabled: true,
-            provider: RagProvider::Ollama,
+            provider: Some(RagProvider::Ollama),
             model: "nomic-embed-text".into(),
             api_base_url: "http://localhost:11434".into(),
             api_key_env: None,

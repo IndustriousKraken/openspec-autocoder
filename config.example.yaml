@@ -348,6 +348,41 @@ github:
 # Optional capabilities — disabled by default. Uncomment to enable.
 # -------------------------------------------------------------------------
 
+# Optional top-level model registry. Define a model ONCE under a nickname,
+# then reference it by name from any LLM-consuming block (`reviewer:`,
+# `canonical_rag:`, `executor.change_internal_contradiction_check_llm:`).
+# A block that OMITS `provider` has its `model:` interpreted as a nickname
+# and resolved to the registry entry's full (provider, model, api_base_url,
+# api_key) tuple. A block that SETS `provider` inline is the legacy form and
+# is NOT consulted against the registry — inline blocks remain valid forever.
+# Each entry's `provider` also fixes the default agentic CLI: `anthropic` →
+# the `claude` CLI; `openai_compatible` / `ollama` → the `opencode` CLI; the
+# optional per-entry `cli:` overrides that default.
+#
+# models:
+#   beefy_security:
+#     provider: openai_compatible
+#     model: moonshotai/kimi-k2
+#     api_base_url: https://openrouter.ai/api/v1
+#     api_key_env: OPENROUTER_KEY
+#     # cli: opencode                     # optional; default for openai_compatible
+#   fast_local:
+#     provider: ollama
+#     model: qwen2.5-coder:32b
+#     api_base_url: http://localhost:11434
+#     # no api_key — Ollama does not authenticate
+#
+# With the registry above, a role can reference a nickname (no `provider:`)…
+# reviewer:
+#   enabled: true
+#   model: beefy_security                 # no `provider:` → registry nickname
+# …while another role stays legacy inline (`provider:` present, registry
+# not consulted):
+# change_internal_contradiction_check_llm:
+#   provider: anthropic
+#   model: claude-opus-4-8
+#   api_key_env: ANTHROPIC_API_KEY
+
 # AI code-quality review of each PR. See README's "Code Review" section
 # for scope (code quality, NOT spec compliance), supported providers, and
 # branch-protection recommendations to enforce Block verdicts.

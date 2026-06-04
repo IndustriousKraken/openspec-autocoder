@@ -9,8 +9,8 @@ use crate::audits::scheduler::run_due_audits;
 use crate::busy_marker;
 use crate::chatops::{self, AnswerPayload, ChatOpsBackend, QuestionPayload};
 use crate::code_reviewer::{
-    CodeReviewer, PerChangeContext, PerChangeReview, PerChangeSection, ReviewConcern,
-    ReviewReport, ReviewVerdict, build_cross_change_preamble,
+    CodeReviewer, PerChangeContext, ReviewConcern, ReviewReport, ReviewVerdict,
+    build_cross_change_preamble,
 };
 use crate::config::{AuditSettings, AuditsConfig, GithubConfig, RepositoryConfig};
 use crate::control_socket::{ChatOpsHolder, ChatOpsSlot, GithubHolder, ReviewerHolder};
@@ -1126,7 +1126,7 @@ pub async fn execute_one_pass(
                         let contexts =
                             build_per_change_contexts(workspace, repo, &processed)?;
                         r.review_per_change(&contexts).await.map(|per_change| {
-                            synthesize_per_change_report(per_change)
+                            crate::code_reviewer::synthesize_per_change_report(per_change)
                         })
                     }
                 };
@@ -1419,64 +1419,6 @@ fn build_per_change_contexts(
         });
     }
     Ok(contexts)
-}
-
-/// Aggregate a `Vec<PerChangeReview>` into one `ReviewReport` whose
-/// `per_change_sections` drives the PR-body composer to emit one
-/// `## Code Review: <slug>` section per element. The aggregate
-/// `verdict` is the worst across sections (`Block` > `Concerns` >
-/// `Pass`). The flat `concerns` vec is the union of each per-change
-/// report's concerns, used by the auto-revise pipeline.
-fn synthesize_per_change_report(per_change: Vec<PerChangeReview>) -> ReviewReport {
-    let mut verdict = ReviewVerdict::Pass;
-    let mut concerns: Vec<ReviewConcern> = Vec::new();
-    let mut sections: Vec<PerChangeSection> = Vec::with_capacity(per_change.len());
-    // Every per-change report comes from the same reviewer, so they share
-    // one attribution (a49); carry it onto the synthesized report so the
-    // PR-body composer can attribute each `## Code Review: <slug>` section.
-    let attribution = per_change
-        .first()
-        .and_then(|pcr| pcr.report.attribution.clone());
-    for pcr in per_change {
-        verdict = worst_verdict(verdict, pcr.report.verdict);
-        for concern in &pcr.report.concerns {
-            let mut tagged = concern.clone();
-            tagged.change_slug = Some(pcr.change_slug.clone());
-            concerns.push(tagged);
-        }
-        let section_body =
-            format!("VERDICT: {}\n\n{}", verdict_label(pcr.report.verdict), pcr.report.markdown);
-        sections.push(PerChangeSection {
-            change_slug: pcr.change_slug,
-            markdown: section_body,
-        });
-    }
-    ReviewReport {
-        verdict,
-        markdown: String::new(),
-        concerns,
-        per_change_sections: sections,
-        attribution,
-    }
-}
-
-fn verdict_label(v: ReviewVerdict) -> &'static str {
-    match v {
-        ReviewVerdict::Pass => "Pass",
-        ReviewVerdict::Concerns => "Concerns",
-        ReviewVerdict::Block => "Block",
-    }
-}
-
-fn worst_verdict(a: ReviewVerdict, b: ReviewVerdict) -> ReviewVerdict {
-    fn rank(v: ReviewVerdict) -> u8 {
-        match v {
-            ReviewVerdict::Pass => 0,
-            ReviewVerdict::Concerns => 1,
-            ReviewVerdict::Block => 2,
-        }
-    }
-    if rank(a) >= rank(b) { a } else { b }
 }
 
 /// Find the date-prefixed archive directory matching the given change name
@@ -16059,7 +16001,7 @@ mod tests {
                 },
             },
         ];
-        let synth = synthesize_per_change_report(per_change);
+        let synth = crate::code_reviewer::synthesize_per_change_report(per_change);
         // Worst verdict wins (Block > Concerns > Pass).
         assert_eq!(synth.verdict, ReviewVerdict::Block);
         // Each section preserves the per-change verdict in its body.
@@ -16098,7 +16040,7 @@ mod tests {
                 },
             },
         ];
-        let synth = synthesize_per_change_report(per_change);
+        let synth = crate::code_reviewer::synthesize_per_change_report(per_change);
         assert_eq!(synth.concerns.len(), 2);
         assert_eq!(synth.concerns[0].change_slug.as_deref(), Some("alpha"));
         assert_eq!(synth.concerns[1].change_slug.as_deref(), Some("beta"));

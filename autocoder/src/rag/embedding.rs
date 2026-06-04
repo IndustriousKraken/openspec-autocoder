@@ -38,7 +38,10 @@ pub trait EmbedClient: Send + Sync {
 /// API keys per the documented `inline > env_var` precedence with WARN
 /// when both are set (the `resolve_api_key` impl logs).
 pub fn build_client(config: &CanonicalRagConfig) -> Result<Arc<dyn EmbedClient>> {
-    match config.provider {
+    match config
+        .provider
+        .expect("canonical_rag.provider resolved at config-load")
+    {
         RagProvider::Ollama => {
             let api_key = config.resolve_api_key().ok().flatten();
             Ok(Arc::new(ollama::OllamaEmbedClient::new(
@@ -79,7 +82,7 @@ mod tests {
     fn rag_with_provider(provider: LlmProvider) -> CanonicalRagConfig {
         CanonicalRagConfig {
             enabled: true,
-            provider,
+            provider: Some(provider),
             model: "any-model".into(),
             api_base_url: "http://localhost:11434".into(),
             api_key_env: None,

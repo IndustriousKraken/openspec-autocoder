@@ -1,3 +1,7 @@
+---
+changelog: skip
+---
+
 ## Why
 
 `autocoder/src/control_socket.rs::dispatch_request` (lines 207-224) has

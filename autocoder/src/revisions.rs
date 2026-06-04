@@ -1605,6 +1605,15 @@ pub enum CodeReviewOutcome {
 }
 
 /// Compose the `## Code Review (rerun N of M)` re-review comment body.
+///
+/// In bundled mode (`per_change_sections` empty) the body is the single
+/// `VERDICT: …` block followed by `markdown`, exactly as before a53. In
+/// per_change mode (`per_change_sections` non-empty) the body instead
+/// carries one `## Code Review: <slug>` subsection per change beneath the
+/// rerun heading — mirroring the initial-review per-change PR-body layout
+/// (each section's markdown already begins with its own `VERDICT: …`
+/// line). `verdict_label`/`markdown` are ignored in that case.
+///
 /// When `attribution` is `Some`, a one-line
 /// `*Reviewer: <provider>/<model>*` model attribution (a49) is appended;
 /// `None` (reviewer carried no daemon-known model) emits no such line.
@@ -1612,10 +1621,21 @@ fn compose_rerun_review_comment(
     rerun_label: &str,
     verdict_label: &str,
     markdown: &str,
+    per_change_sections: &[crate::code_reviewer::PerChangeSection],
     attribution: Option<&str>,
 ) -> String {
-    let mut body =
-        format!("## Code Review ({rerun_label})\n\nVERDICT: {verdict_label}\n\n{markdown}");
+    let mut body = if per_change_sections.is_empty() {
+        format!("## Code Review ({rerun_label})\n\nVERDICT: {verdict_label}\n\n{markdown}")
+    } else {
+        let mut b = format!("## Code Review ({rerun_label})");
+        for section in per_change_sections {
+            b.push_str(&format!(
+                "\n\n## Code Review: {}\n\n{}",
+                section.change_slug, section.markdown
+            ));
+        }
+        b
+    };
     if let Some(attr) = attribution {
         body.push_str("\n\n");
         body.push_str(&crate::attribution::attribution_line("Reviewer", attr));
@@ -1688,6 +1708,7 @@ async fn execute_code_review(
         &rerun_label,
         result.verdict.label(),
         &result.markdown,
+        &result.per_change_sections,
         result.attribution.as_deref(),
     );
     if let Err(e) =
@@ -1899,6 +1920,7 @@ mod tests {
             "rerun 2 of 5",
             "Approve",
             "VERDICT: Pass\n\nlooks good",
+            &[],
             Some("anthropic/claude-opus-4-8"),
         );
         assert!(body.contains("## Code Review (rerun 2 of 5)"));
@@ -1913,10 +1935,73 @@ mod tests {
     #[test]
     fn rerun_comment_without_model_has_no_attribution() {
         let body =
-            compose_rerun_review_comment("rerun 1", "Block", "VERDICT: Block\n\nbug", None);
+            compose_rerun_review_comment("rerun 1", "Block", "VERDICT: Block\n\nbug", &[], None);
         assert!(
             !body.contains("*Reviewer:"),
             "no attribution line without a configured model; got: {body:?}"
+        );
+    }
+
+    /// a53 task 3.3: with a non-empty `per_change_sections`, the rerun
+    /// composer renders one `## Code Review: <slug>` subsection per change
+    /// beneath the `## Code Review (rerun N of M)` heading, NOT a single
+    /// bundled block. Asserts on output structure (heading count / slugs),
+    /// not reviewer prose.
+    #[test]
+    fn rerun_comment_renders_per_change_sections() {
+        use crate::code_reviewer::PerChangeSection;
+        let sections = vec![
+            PerChangeSection {
+                change_slug: "alpha".into(),
+                markdown: "VERDICT: Pass\n\nok".into(),
+            },
+            PerChangeSection {
+                change_slug: "beta".into(),
+                markdown: "VERDICT: Block\n\nbug".into(),
+            },
+            PerChangeSection {
+                change_slug: "gamma".into(),
+                markdown: "VERDICT: Concerns\n\nnit".into(),
+            },
+        ];
+        // `verdict_label`/`markdown` are ignored in per-change mode.
+        let body =
+            compose_rerun_review_comment("rerun 2 of 5", "Block", "BUNDLED_IGNORED", &sections, None);
+        assert!(body.contains("## Code Review (rerun 2 of 5)"));
+        assert!(body.contains("## Code Review: alpha"));
+        assert!(body.contains("## Code Review: beta"));
+        assert!(body.contains("## Code Review: gamma"));
+        assert_eq!(
+            body.matches("## Code Review: ").count(),
+            3,
+            "exactly one per-change subsection per change"
+        );
+        assert!(
+            !body.contains("BUNDLED_IGNORED"),
+            "the bundled markdown arg is unused in per-change mode"
+        );
+        // Each section's own verdict line is carried through verbatim.
+        assert!(body.contains("VERDICT: Block\n\nbug"));
+    }
+
+    /// a53 task 3.3 (cont.): an empty `per_change_sections` renders the
+    /// single bundled block exactly as before this change — no per-change
+    /// subsection headings.
+    #[test]
+    fn rerun_comment_empty_sections_renders_bundled_block() {
+        let body = compose_rerun_review_comment(
+            "rerun 1",
+            "Approve",
+            "VERDICT: Pass\n\nall good",
+            &[],
+            None,
+        );
+        assert!(body.contains("## Code Review (rerun 1)"));
+        assert!(body.contains("VERDICT: Pass\n\nall good"));
+        assert_eq!(
+            body.matches("## Code Review: ").count(),
+            0,
+            "bundled mode emits no per-change subsection headings"
         );
     }
 

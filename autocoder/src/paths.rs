@@ -481,6 +481,7 @@ mod tests {
             paths,
             features: crate::config::FeaturesConfig::default(),
             canonical_rag: None,
+            models: None,
         }
     }
 

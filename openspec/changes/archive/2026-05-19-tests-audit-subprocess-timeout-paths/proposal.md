@@ -1,3 +1,7 @@
+---
+changelog: skip
+---
+
 ## Why
 
 Three audit modules each have a `run_subprocess` helper with the same

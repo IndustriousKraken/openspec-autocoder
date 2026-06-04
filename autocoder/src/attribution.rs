@@ -47,6 +47,7 @@ pub trait AttributionSurface {
 impl AttributionSurface for ReviewerConfig {
     fn attribution_provider(&self) -> LlmProvider {
         self.provider
+            .expect("reviewer.provider resolved at config-load")
     }
     fn attribution_model(&self) -> &str {
         &self.model
@@ -56,6 +57,7 @@ impl AttributionSurface for ReviewerConfig {
 impl AttributionSurface for ContradictionCheckLlmConfig {
     fn attribution_provider(&self) -> LlmProvider {
         self.provider
+            .expect("change_internal_contradiction_check_llm.provider resolved at config-load")
     }
     fn attribution_model(&self) -> &str {
         &self.model
@@ -89,7 +91,7 @@ mod tests {
     fn reviewer_with_secrets() -> ReviewerConfig {
         ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::OpenAiCompatible,
+            provider: Some(ReviewerProvider::OpenAiCompatible),
             model: "moonshotai/kimi-latest".to_string(),
             api_key_env: None,
             api_key: Some(SecretSource::Inline {
@@ -142,7 +144,7 @@ mod tests {
     #[test]
     fn contradiction_check_surface_attributes() {
         let cfg = ContradictionCheckLlmConfig {
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "claude-opus-4-8".to_string(),
             api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
             api_key: None,

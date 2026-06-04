@@ -1,3 +1,7 @@
+---
+changelog: skip
+---
+
 ## Why
 
 Intermittent test failures have been reported in production runs — at least one named "weekly_creates_about_52_occurrences." Local searches under `autocoder/src/` cannot locate that exact test name (it may have been renamed, removed, or the name is approximate). Three sequential local runs of the current 509-test suite pass cleanly, which means the flakes are either deeply intermittent (rare race) or environment-sensitive (host load on the runtime server, CPU contention under parallel test execution).

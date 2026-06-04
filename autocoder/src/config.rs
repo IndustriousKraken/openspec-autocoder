@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// A secret value sourced from EITHER an environment variable name (bare
@@ -87,6 +87,93 @@ pub struct Config {
     /// documentation purposes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_rag: Option<CanonicalRagConfig>,
+    /// Optional top-level model registry (a55). Maps a nickname to a model
+    /// definition carrying the same four LLM fields the per-subsystem
+    /// blocks use (`provider`, `model`, `api_base_url`, `api_key`/
+    /// `api_key_env`) plus an optional `cli` override. Any LLM-consuming
+    /// block that OMITS its inline `provider` has its `model` field
+    /// resolved against this registry at config-load. A `BTreeMap` (not
+    /// `HashMap`) so iteration order is deterministic for diagnostics.
+    /// Absent → no registry; every block must be inline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<BTreeMap<String, ModelEntry>>,
+}
+
+/// A single entry in the top-level `models:` registry (a55). Carries the
+/// same `(provider, model, api_base_url, api_key/api_key_env)` tuple every
+/// LLM-consuming block uses, plus an optional `cli` override that selects
+/// the agentic CLI for this model (see [`ModelEntry::resolved_cli`]).
+///
+/// Unlike the per-subsystem blocks, `provider` is REQUIRED here — a
+/// registry entry always declares its provider; the nickname-reference
+/// shorthand lives on the referencing block, not on the entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelEntry {
+    pub provider: LlmProvider,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli: Option<CliKind>,
+}
+
+impl ModelEntry {
+    /// The agentic CLI that drives this model: the explicit `cli` override
+    /// when set, else the provider's default ([`default_cli_for`]).
+    ///
+    /// Consumed by the agentic-run primitive (a later change); no
+    /// production call site exists in this change.
+    #[allow(dead_code)]
+    pub fn resolved_cli(&self) -> CliKind {
+        self.cli.unwrap_or_else(|| default_cli_for(self.provider))
+    }
+}
+
+/// The agentic CLI a model is driven through (a55). The CLI strategies
+/// themselves land with the agentic-run primitive (a later change); this
+/// enum and [`default_cli_for`] define the `provider → CLI` rule so model
+/// selection and CLI selection are specified in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CliKind {
+    /// Anthropic's `claude` CLI.
+    Claude,
+    /// The provider-agnostic `opencode` CLI.
+    Opencode,
+}
+
+impl CliKind {
+    /// Operator-facing YAML string. Matches the `#[serde]` rename rules.
+    /// Consumed by the agentic-run primitive (a later change) for
+    /// diagnostics; no production call site exists in this change.
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Opencode => "opencode",
+        }
+    }
+}
+
+/// The default agentic CLI for a provider (a55): `anthropic` is driven by
+/// the `claude` CLI; `openai_compatible` AND `ollama` are driven by the
+/// provider-agnostic `opencode` CLI. A registry entry's optional `cli`
+/// field overrides this default (see [`ModelEntry::resolved_cli`]).
+///
+/// Defined here, consumed later: the CLI strategies that read this rule
+/// land with the agentic-run primitive (a later change in the stream), so
+/// no production call site exists yet.
+#[allow(dead_code)]
+pub fn default_cli_for(provider: LlmProvider) -> CliKind {
+    match provider {
+        LlmProvider::Anthropic => CliKind::Claude,
+        LlmProvider::OpenAiCompatible | LlmProvider::Ollama => CliKind::Opencode,
+    }
 }
 
 /// Canonical-spec RAG configuration (a21).
@@ -101,8 +188,20 @@ pub struct Config {
 pub struct CanonicalRagConfig {
     #[serde(default)]
     pub enabled: bool,
-    pub provider: RagProvider,
+    /// LLM provider. OPTIONAL (a55): when omitted, `model` is interpreted
+    /// as a top-level `models:` nickname and the provider (plus the rest
+    /// of the tuple) is resolved from the registry at config-load. When
+    /// present, the block is the legacy inline form and the registry is
+    /// not consulted. Always `Some` after [`Config::load_from`] resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<RagProvider>,
     pub model: String,
+    /// API root. Defaulted (a55) so a nickname-reference block — which
+    /// carries only `model` — deserializes; the real value is populated
+    /// from the registry entry at config-load. An inline block that omits
+    /// it deserializes to empty AND fails per-provider validation (which
+    /// requires a base URL for both valid RAG providers).
+    #[serde(default)]
     pub api_base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
@@ -279,6 +378,53 @@ pub fn validate_provider_for_subsystem(
         provider.as_str(),
         list
     ))
+}
+
+/// The `(provider, model, api_base_url, api_key/api_key_env)` tuple a
+/// nickname-reference LLM block inherits from its `models:` registry entry
+/// (a55). Returned by [`resolve_model_reference`] for the caller to write
+/// back into the block's fields.
+struct ResolvedModelFields {
+    provider: LlmProvider,
+    model: String,
+    api_base_url: Option<String>,
+    api_key: Option<SecretSource>,
+    api_key_env: Option<String>,
+}
+
+/// Resolve a possibly-nickname LLM block against the top-level `models:`
+/// registry (a55). The block's `inline_provider` discriminates the two
+/// forms:
+///
+/// - `Some(_)` — the legacy inline form. The registry is NOT consulted;
+///   returns `Ok(None)` so the caller leaves the block's fields untouched.
+/// - `None` — `model` is interpreted as a `models:` nickname AND resolved
+///   to the entry's full tuple, returned as `Ok(Some(_))`. A nickname that
+///   names no registry entry fails config-load with an error naming both
+///   the missing nickname AND the referencing block.
+fn resolve_model_reference(
+    inline_provider: Option<LlmProvider>,
+    model: &str,
+    models: Option<&BTreeMap<String, ModelEntry>>,
+    block_label: &str,
+) -> Result<Option<ResolvedModelFields>> {
+    if inline_provider.is_some() {
+        return Ok(None);
+    }
+    let entry = models.and_then(|m| m.get(model)).ok_or_else(|| {
+        anyhow!(
+            "{block_label}: `model: {model}` omits `provider` and names no entry in the \
+             top-level `models:` registry (define `models.{model}`, or set \
+             `{block_label}.provider` inline)"
+        )
+    })?;
+    Ok(Some(ResolvedModelFields {
+        provider: entry.provider,
+        model: entry.model.clone(),
+        api_base_url: entry.api_base_url.clone(),
+        api_key: entry.api_key.clone(),
+        api_key_env: entry.api_key_env.clone(),
+    }))
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -894,7 +1040,12 @@ pub enum ContradictionCheckMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContradictionCheckLlmConfig {
-    pub provider: ReviewerProvider,
+    /// LLM provider. OPTIONAL (a55): when omitted, `model` names a
+    /// top-level `models:` nickname resolved at config-load; when present,
+    /// the block is the legacy inline form. Always `Some` after
+    /// [`Config::load_from`] resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ReviewerProvider>,
     pub model: String,
     #[serde(default)]
     pub api_key_env: Option<String>,
@@ -1377,7 +1528,12 @@ impl CommandAuthorizationConfig {
 pub struct ReviewerConfig {
     #[serde(default)]
     pub enabled: bool,
-    pub provider: ReviewerProvider,
+    /// LLM provider. OPTIONAL (a55): when omitted, `model` names a
+    /// top-level `models:` nickname resolved at config-load; when present,
+    /// the block is the legacy inline form and the registry is not
+    /// consulted. Always `Some` after [`Config::load_from`] resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ReviewerProvider>,
     pub model: String,
     #[serde(default)]
     pub api_key_env: Option<String>,
@@ -2136,23 +2292,69 @@ impl Config {
             let (ttl, _) = clamp_dedup_cache_ttl_secs(slack.dedup_cache_ttl_secs);
             slack.dedup_cache_ttl_secs = ttl;
         }
+        // a55: validate every `models:` registry entry's own per-provider
+        // auth config up front, regardless of whether any block references
+        // it (e.g. `ollama` with an `api_key` fails here). The registry is
+        // cloned so the per-block resolution below can read it while each
+        // block is borrowed mutably; config-load is one-time so the clone
+        // is immaterial.
+        let models = cfg.models.clone();
+        if let Some(registry) = models.as_ref() {
+            for (nick, entry) in registry {
+                let key_present = entry.api_key.is_some() || entry.api_key_env.is_some();
+                validate_llm_provider_config(
+                    entry.provider,
+                    key_present,
+                    entry.api_base_url.as_deref(),
+                    &format!("models.{nick}"),
+                )?;
+            }
+        }
         if let Some(rag) = cfg.canonical_rag.as_mut() {
+            // a55: a block omitting inline `provider` resolves its `model`
+            // nickname against `models:`; an inline block is untouched.
+            if let Some(resolved) =
+                resolve_model_reference(rag.provider, &rag.model, models.as_ref(), "canonical_rag")?
+            {
+                rag.provider = Some(resolved.provider);
+                rag.model = resolved.model;
+                if let Some(base) = resolved.api_base_url {
+                    rag.api_base_url = base;
+                }
+                rag.api_key = resolved.api_key;
+                rag.api_key_env = resolved.api_key_env;
+            }
             let (top_k, _) = clamp_rag_top_k(rag.top_k);
             rag.top_k = top_k;
             // a37: per-subsystem AND per-provider validity. The check
             // fires regardless of `enabled` so an operator with a
             // partially-filled-out block sees the error at startup
-            // rather than at the first `enabled: true` flip.
-            validate_provider_for_subsystem(rag.provider, SubsystemKind::CanonicalRag)?;
+            // rather than at the first `enabled: true` flip. After a55
+            // resolution the provider is always `Some`.
+            let provider = rag
+                .provider
+                .expect("canonical_rag.provider resolved at config-load");
+            validate_provider_for_subsystem(provider, SubsystemKind::CanonicalRag)?;
             let key_present = rag.api_key.is_some() || rag.api_key_env.is_some();
             validate_llm_provider_config(
-                rag.provider,
+                provider,
                 key_present,
                 Some(&rag.api_base_url),
                 "canonical_rag",
             )?;
         }
         if let Some(rev) = cfg.reviewer.as_mut() {
+            // a55: resolve a nickname reference (no inline `provider`)
+            // against the registry; an inline block is untouched.
+            if let Some(resolved) =
+                resolve_model_reference(rev.provider, &rev.model, models.as_ref(), "reviewer")?
+            {
+                rev.provider = Some(resolved.provider);
+                rev.model = resolved.model;
+                rev.api_base_url = resolved.api_base_url;
+                rev.api_key = resolved.api_key;
+                rev.api_key_env = resolved.api_key_env;
+            }
             // The re-review cap is an opt-in ceiling: clamp only when the
             // operator set a value. `None` means unlimited and stays so.
             if let Some(cap) = rev.max_code_reviews_per_pr {
@@ -2168,11 +2370,13 @@ impl Config {
             }
             // a37: per-subsystem AND per-provider validity, enforced
             // regardless of `enabled` so an unused-but-misconfigured
-            // block surfaces at startup.
-            validate_provider_for_subsystem(rev.provider, SubsystemKind::Reviewer)?;
+            // block surfaces at startup. After a55 resolution the provider
+            // is always `Some`.
+            let provider = rev.provider.expect("reviewer.provider resolved at config-load");
+            validate_provider_for_subsystem(provider, SubsystemKind::Reviewer)?;
             let key_present = rev.api_key.is_some() || rev.api_key_env.is_some();
             validate_llm_provider_config(
-                rev.provider,
+                provider,
                 key_present,
                 rev.api_base_url.as_deref(),
                 "reviewer",
@@ -2181,12 +2385,29 @@ impl Config {
         if let Some(llm) = cfg
             .executor
             .change_internal_contradiction_check_llm
-            .as_ref()
+            .as_mut()
         {
-            validate_provider_for_subsystem(llm.provider, SubsystemKind::ContradictionCheck)?;
+            // a55: resolve a nickname reference (no inline `provider`)
+            // against the registry; an inline block is untouched.
+            if let Some(resolved) = resolve_model_reference(
+                llm.provider,
+                &llm.model,
+                models.as_ref(),
+                "change_internal_contradiction_check_llm",
+            )? {
+                llm.provider = Some(resolved.provider);
+                llm.model = resolved.model;
+                llm.api_base_url = resolved.api_base_url;
+                llm.api_key = resolved.api_key;
+                llm.api_key_env = resolved.api_key_env;
+            }
+            let provider = llm
+                .provider
+                .expect("change_internal_contradiction_check_llm.provider resolved at config-load");
+            validate_provider_for_subsystem(provider, SubsystemKind::ContradictionCheck)?;
             let key_present = llm.api_key.is_some() || llm.api_key_env.is_some();
             validate_llm_provider_config(
-                llm.provider,
+                provider,
                 key_present,
                 llm.api_base_url.as_deref(),
                 "change_internal_contradiction_check_llm",
@@ -3323,7 +3544,7 @@ reviewer:
         let cfg = Config::load_from(&path).expect("config with reviewer should parse");
         let rv = cfg.reviewer.expect("reviewer block should be present");
         assert!(rv.enabled);
-        assert_eq!(rv.provider, ReviewerProvider::Anthropic);
+        assert_eq!(rv.provider, Some(ReviewerProvider::Anthropic));
         assert_eq!(rv.model, "claude-sonnet-4-6");
         assert_eq!(rv.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert_eq!(rv.api_base_url.as_deref(), Some("https://api.anthropic.com"));
@@ -3580,7 +3801,7 @@ github:
             .change_internal_contradiction_check_llm
             .as_ref()
             .expect("llm block present");
-        assert_eq!(llm.provider, ReviewerProvider::Anthropic);
+        assert_eq!(llm.provider, Some(ReviewerProvider::Anthropic));
         assert_eq!(llm.model, "claude-haiku-4-5-20251001");
     }
 
@@ -3604,7 +3825,7 @@ reviewer:
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
         let rv = cfg.reviewer.unwrap();
-        assert_eq!(rv.provider, ReviewerProvider::OpenAiCompatible);
+        assert_eq!(rv.provider, Some(ReviewerProvider::OpenAiCompatible));
         assert!(!rv.enabled); // default false when omitted
     }
 
@@ -7026,7 +7247,7 @@ canonical_rag:
         let cfg = Config::load_from(&path).unwrap();
         let rag = cfg.canonical_rag.expect("block should parse");
         assert!(rag.enabled);
-        assert_eq!(rag.provider, RagProvider::Ollama);
+        assert_eq!(rag.provider, Some(RagProvider::Ollama));
         assert_eq!(rag.model, "qwen3-embedding:4b");
         assert_eq!(rag.api_base_url, "http://gpu-host:11434");
         assert_eq!(rag.top_k, 15);
@@ -7784,7 +8005,7 @@ reviewer:
         let cfg = Config::load_from(&path)
             .expect("reviewer ollama with bare base + no api_key must load");
         let rv = cfg.reviewer.expect("reviewer block present");
-        assert_eq!(rv.provider, LlmProvider::Ollama);
+        assert_eq!(rv.provider, Some(LlmProvider::Ollama));
         assert_eq!(rv.api_base_url.as_deref(), Some("http://localhost:11434"));
         assert!(rv.api_key.is_none());
         assert!(rv.api_key_env.is_none());
@@ -7844,7 +8065,284 @@ github:
             .change_internal_contradiction_check_llm
             .as_ref()
             .unwrap();
-        assert_eq!(llm.provider, LlmProvider::Ollama);
+        assert_eq!(llm.provider, Some(LlmProvider::Ollama));
+    }
+
+    // ---- a55: top-level model registry + nickname references ----
+
+    /// 4.1: a `reviewer` block omitting `provider` resolves its `model`
+    /// nickname to the registry entry's FULL tuple — provider, model,
+    /// api_base_url AND api_key_env.
+    #[test]
+    fn registry_reviewer_nickname_resolves_full_tuple() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+models:
+  beefy_security:
+    provider: openai_compatible
+    model: moonshotai/kimi-k2
+    api_base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_KEY
+reviewer:
+  enabled: true
+  model: beefy_security
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("nickname-referencing reviewer must load");
+        let rv = cfg.reviewer.expect("reviewer block present");
+        assert_eq!(rv.provider, Some(LlmProvider::OpenAiCompatible));
+        assert_eq!(rv.model, "moonshotai/kimi-k2");
+        assert_eq!(rv.api_base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
+        assert_eq!(rv.api_key_env.as_deref(), Some("OPENROUTER_KEY"));
+    }
+
+    /// 2.3: a nickname entry carrying an INLINE `api_key` resolves into
+    /// the block, reusing the existing `SecretSource` precedence logic.
+    #[test]
+    fn registry_nickname_resolves_inline_api_key() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+models:
+  hosted_anthropic:
+    provider: anthropic
+    model: claude-opus-4-8
+    api_key:
+      value: sk-ant-from-registry
+reviewer:
+  enabled: true
+  model: hosted_anthropic
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("inline-key nickname must load");
+        let rv = cfg.reviewer.expect("reviewer block present");
+        assert_eq!(rv.provider, Some(LlmProvider::Anthropic));
+        assert_eq!(rv.model, "claude-opus-4-8");
+        let key = rv
+            .api_key
+            .as_ref()
+            .expect("inline api_key resolved from registry")
+            .resolve("reviewer.api_key")
+            .expect("inline value resolves");
+        assert_eq!(key, "sk-ant-from-registry");
+    }
+
+    /// 4.2: an INLINE block (provider present) is unchanged by the
+    /// registry — even when its `model` collides with a nickname, the
+    /// inline provider wins AND the model string is NOT resolved.
+    #[test]
+    fn registry_not_consulted_for_inline_block() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+models:
+  beefy_security:
+    provider: openai_compatible
+    model: moonshotai/kimi-k2
+    api_base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_KEY
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: beefy_security
+  api_key_env: ANTHROPIC_API_KEY
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("inline reviewer must load");
+        let rv = cfg.reviewer.expect("reviewer block present");
+        // Inline provider wins; the model is the literal string, NOT the
+        // registry entry's `moonshotai/kimi-k2`.
+        assert_eq!(rv.provider, Some(LlmProvider::Anthropic));
+        assert_eq!(rv.model, "beefy_security");
+        assert_eq!(rv.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert!(rv.api_base_url.is_none());
+    }
+
+    /// 4.3 / 2.1: a block omitting `provider` whose `model` names no
+    /// registry entry fails config-load, naming BOTH the missing nickname
+    /// AND the referencing block.
+    #[test]
+    fn registry_missing_nickname_fails_with_diagnostic() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+models:
+  fast_local:
+    provider: ollama
+    model: qwen2.5-coder:32b
+    api_base_url: http://localhost:11434
+reviewer:
+  enabled: true
+  model: typo_nickname
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path).expect_err("unknown nickname must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("typo_nickname"), "must name the nickname: {msg}");
+        assert!(msg.contains("reviewer"), "must name the block: {msg}");
+    }
+
+    /// 4.4 / 2.2: a `canonical_rag` block resolving (via the registry) to
+    /// `anthropic` fails the subsystem-validity gate exactly as an inline
+    /// `provider: anthropic` would.
+    #[test]
+    fn registry_rag_resolving_to_anthropic_fails_subsystem_gate() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+models:
+  embed_anthropic:
+    provider: anthropic
+    model: claude-embed
+    api_key_env: ANTHROPIC_API_KEY
+canonical_rag:
+  enabled: true
+  model: embed_anthropic
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path)
+            .expect_err("RAG resolving to anthropic must fail the subsystem gate");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("canonical_rag does not support provider 'anthropic'"),
+            "{msg}"
+        );
+    }
+
+    /// 2.4: a `models:` entry that is itself invalid (ollama with an
+    /// `api_key`) fails config-load via the per-provider auth validation,
+    /// even when NO block references it.
+    #[test]
+    fn registry_unreferenced_invalid_entry_fails_load() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+models:
+  bad_local:
+    provider: ollama
+    model: qwen2.5-coder:32b
+    api_base_url: http://localhost:11434
+    api_key:
+      value: should-not-be-here
+"#;
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path).expect_err("ollama entry with api_key must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("models.bad_local: ollama does not authenticate"),
+            "must name the entry AND the rule: {msg}"
+        );
+    }
+
+    /// 4.5: provider → default-CLI rule and the per-entry `cli` override.
+    #[test]
+    fn default_cli_for_provider_rule() {
+        assert_eq!(default_cli_for(LlmProvider::Anthropic), CliKind::Claude);
+        assert_eq!(default_cli_for(LlmProvider::Ollama), CliKind::Opencode);
+        assert_eq!(
+            default_cli_for(LlmProvider::OpenAiCompatible),
+            CliKind::Opencode
+        );
+    }
+
+    /// 4.5: an entry's explicit `cli` override wins over the provider
+    /// default; absent it, the provider default applies.
+    #[test]
+    fn model_entry_resolved_cli_honors_override() {
+        let overridden = ModelEntry {
+            provider: LlmProvider::OpenAiCompatible,
+            model: "x".into(),
+            api_base_url: Some("https://example/v1".into()),
+            api_key: None,
+            api_key_env: Some("KEY".into()),
+            cli: Some(CliKind::Claude),
+        };
+        assert_eq!(overridden.resolved_cli(), CliKind::Claude);
+
+        let defaulted = ModelEntry {
+            cli: None,
+            ..overridden.clone()
+        };
+        assert_eq!(defaulted.resolved_cli(), CliKind::Opencode);
+    }
+
+    /// 4.5: the `cli:` override parses from YAML and resolves through the
+    /// registry entry.
+    #[test]
+    fn registry_cli_override_parses_and_resolves() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+models:
+  hosted_via_claude:
+    provider: openai_compatible
+    model: some/model
+    api_base_url: https://example/v1
+    api_key_env: SOME_KEY
+    cli: claude
+  plain_local:
+    provider: ollama
+    model: qwen2.5-coder:32b
+    api_base_url: http://localhost:11434
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("registry with cli override must load");
+        let registry = cfg.models.expect("models registry present");
+        assert_eq!(
+            registry["hosted_via_claude"].resolved_cli(),
+            CliKind::Claude
+        );
+        assert_eq!(registry["plain_local"].resolved_cli(), CliKind::Opencode);
     }
 
     #[test]

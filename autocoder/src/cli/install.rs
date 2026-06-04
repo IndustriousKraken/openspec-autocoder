@@ -1452,7 +1452,7 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
             let is_ollama = answers.reviewer_provider == ReviewerProviderArg::Ollama;
             Some(ReviewerConfig {
                 enabled: true,
-                provider,
+                provider: Some(provider),
                 model: answers
                     .reviewer_model
                     .clone()
@@ -1499,13 +1499,13 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
     cfg.canonical_rag = answers.canonical_rag.as_ref().map(|r| {
         crate::config::CanonicalRagConfig {
             enabled: true,
-            provider: match r.provider {
+            provider: Some(match r.provider {
                 RagProviderArg::Ollama => crate::config::RagProvider::Ollama,
                 RagProviderArg::OpenaiCompatible => {
                     crate::config::RagProvider::OpenAiCompatible
                 }
                 RagProviderArg::None => crate::config::RagProvider::Ollama, // unreachable
-            },
+            }),
             model: r.model.clone(),
             api_base_url: r.base_url.clone(),
             api_key_env: r.api_key_env.clone(),
@@ -2171,7 +2171,7 @@ pub(crate) async fn reconfigure_reviewer(
     existing: &Config,
     io: &mut dyn WizardIo,
 ) -> Result<Config> {
-    let current_provider_arg = match existing.reviewer.as_ref().map(|r| r.provider) {
+    let current_provider_arg = match existing.reviewer.as_ref().and_then(|r| r.provider) {
         Some(ReviewerProvider::Anthropic) => ReviewerProviderArg::Anthropic,
         Some(ReviewerProvider::OpenAiCompatible) => ReviewerProviderArg::OpenAiCompatible,
         Some(ReviewerProvider::Ollama) => ReviewerProviderArg::Ollama,
@@ -2247,7 +2247,7 @@ pub(crate) async fn reconfigure_reviewer(
             // reconfigured here.
             let mut reviewer = existing.reviewer.clone().unwrap_or_else(|| ReviewerConfig {
                 enabled: true,
-                provider,
+                provider: Some(provider),
                 model: model.clone(),
                 api_key_env: api_key_env.clone(),
                 api_key: None,
@@ -2261,7 +2261,7 @@ pub(crate) async fn reconfigure_reviewer(
                 suggest_rereview_threshold: None,
                 skip_spec_only_prs: false,
             });
-            reviewer.provider = provider;
+            reviewer.provider = Some(provider);
             reviewer.model = model;
             reviewer.api_key_env = api_key_env;
             // For ollama, clear any pre-existing inline `api_key` (the
@@ -3608,7 +3608,7 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
         ]);
         let new_cfg = reconfigure_reviewer(&existing, &mut io).await.unwrap();
         let r = new_cfg.reviewer.expect("reviewer block present");
-        assert_eq!(r.provider, ReviewerProvider::OpenAiCompatible);
+        assert_eq!(r.provider, Some(ReviewerProvider::OpenAiCompatible));
         assert_eq!(r.model, "grok-3");
         assert_eq!(r.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
     }
@@ -4010,7 +4010,7 @@ ExecStart={ argv[]=/usr/local/bin/autocoder run --config --verbose ; ignore_erro
 
         let cfg = assemble_config(&ans).unwrap();
         let rv = cfg.reviewer.expect("reviewer block present");
-        assert_eq!(rv.provider, ReviewerProvider::Ollama);
+        assert_eq!(rv.provider, Some(ReviewerProvider::Ollama));
         assert_eq!(rv.model, "qwen2.5-coder:32b");
         assert_eq!(
             rv.api_base_url.as_deref(),

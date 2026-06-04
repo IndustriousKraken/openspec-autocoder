@@ -1,3 +1,7 @@
+---
+changelog: skip
+---
+
 ## Why
 
 `autocoder/src/perma_stuck.rs::write_marker` (lines 40-65) has an

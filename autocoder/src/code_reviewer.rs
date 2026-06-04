@@ -442,13 +442,15 @@ pub struct ReviewResult {
 ///
 /// The function:
 /// - Builds a [`CodeReviewer`] from `cfg`.
-/// - Dispatches via [`CodeReviewer::review`] (bundled mode).
+/// - Performs the per-mode dispatch identically to the polling-loop's
+///   initial-review path: one LLM call per change in `per_change` mode
+///   (populating `ReviewResult.per_change_sections`), one call per PR in
+///   `bundled` mode (leaving `per_change_sections` empty).
 /// - Wraps the resulting report in a [`ReviewResult`].
 ///
-/// Per-change mode requires the caller to pre-build per-change
-/// [`PerChangeContext`] objects AND invoke [`CodeReviewer::review_per_change`]
-/// directly. The single-`ReviewContext` entry point always dispatches
-/// `bundled`-style.
+/// Both callers therefore observe the configured `reviewer.mode`
+/// identically; the function never routes through a bundled-only path
+/// that ignores the mode (a53).
 #[allow(dead_code)]
 pub async fn review_pr_at_state(
     cfg: &ReviewerConfig,
@@ -462,11 +464,27 @@ pub async fn review_pr_at_state(
 /// [`CodeReviewer`] so unit tests can stub the LLM client. The polling-
 /// loop AND operator-trigger callers use [`review_pr_at_state`] which
 /// builds the reviewer from config.
+///
+/// Dispatch honors `reviewer.mode()` (a53): in `Bundled` mode the single
+/// `ReviewContext` is reviewed in one call (`per_change_sections` empty);
+/// in `PerChange` mode the context is split into one per-change context
+/// per `archived_changes` entry, each reviewed independently, and the
+/// results are synthesized into a report carrying one
+/// `per_change_sections` entry per change. The function decides nothing
+/// about output disposition — the caller renders the returned
+/// `ReviewResult`.
 pub async fn review_pr_at_state_with(
     reviewer: &CodeReviewer,
     ctx: &ReviewContext,
 ) -> Result<ReviewResult> {
-    let report = reviewer.review(ctx).await?;
+    let report = match reviewer.mode() {
+        crate::config::ReviewerMode::Bundled => reviewer.review(ctx).await?,
+        crate::config::ReviewerMode::PerChange => {
+            let contexts = split_per_change_contexts(ctx);
+            let per_change = reviewer.review_per_change(&contexts).await?;
+            synthesize_per_change_report(per_change)
+        }
+    };
     Ok(ReviewResult {
         verdict: Verdict::from(report.verdict),
         per_concern: report.concerns.iter().map(ConcernEntry::from).collect(),
@@ -476,6 +494,89 @@ pub async fn review_pr_at_state_with(
         attribution: report.attribution.clone(),
         concerns: report.concerns,
     })
+}
+
+/// Split a bundled [`ReviewContext`] into one [`PerChangeContext`] per
+/// archived change, for the per-change reviewer dispatch on the reusable
+/// entry point. Each per-change context carries that change's brief alone
+/// plus a cross-change preamble naming the others; the changed-files AND
+/// diff are shared across the per-change contexts. The single-
+/// `ReviewContext` entry point has no per-change git scoping (unlike the
+/// polling-loop path, which scopes each change's diff via commit-subject
+/// prefixes), so the preamble is what confines each reviewer call's
+/// verdict to its named change.
+fn split_per_change_contexts(ctx: &ReviewContext) -> Vec<PerChangeContext> {
+    ctx.archived_changes
+        .iter()
+        .map(|brief| PerChangeContext {
+            change_slug: brief.name.clone(),
+            context: ReviewContext {
+                archived_changes: vec![brief.clone()],
+                changed_files: ctx.changed_files.clone(),
+                diff: ctx.diff.clone(),
+            },
+            cross_change_preamble: build_cross_change_preamble(&brief.name, &ctx.archived_changes),
+        })
+        .collect()
+}
+
+/// Aggregate a `Vec<PerChangeReview>` into one [`ReviewReport`] whose
+/// `per_change_sections` drives the composer (PR-body or rerun comment)
+/// to emit one `## Code Review: <slug>` section per element. The
+/// aggregate `verdict` is the worst across sections (`Block` >
+/// `Concerns` > `Pass`). The flat `concerns` vec is the union of each
+/// per-change report's concerns (tagged with their `change_slug`), used
+/// by the auto-revise pipeline.
+pub(crate) fn synthesize_per_change_report(per_change: Vec<PerChangeReview>) -> ReviewReport {
+    let mut verdict = ReviewVerdict::Pass;
+    let mut concerns: Vec<ReviewConcern> = Vec::new();
+    let mut sections: Vec<PerChangeSection> = Vec::with_capacity(per_change.len());
+    // Every per-change report comes from the same reviewer, so they share
+    // one attribution (a49); carry it onto the synthesized report so the
+    // composer can attribute each `## Code Review: <slug>` section.
+    let attribution = per_change
+        .first()
+        .and_then(|pcr| pcr.report.attribution.clone());
+    for pcr in per_change {
+        verdict = worst_verdict(verdict, pcr.report.verdict);
+        for concern in &pcr.report.concerns {
+            let mut tagged = concern.clone();
+            tagged.change_slug = Some(pcr.change_slug.clone());
+            concerns.push(tagged);
+        }
+        let section_body =
+            format!("VERDICT: {}\n\n{}", verdict_label(pcr.report.verdict), pcr.report.markdown);
+        sections.push(PerChangeSection {
+            change_slug: pcr.change_slug,
+            markdown: section_body,
+        });
+    }
+    ReviewReport {
+        verdict,
+        markdown: String::new(),
+        concerns,
+        per_change_sections: sections,
+        attribution,
+    }
+}
+
+fn verdict_label(v: ReviewVerdict) -> &'static str {
+    match v {
+        ReviewVerdict::Pass => "Pass",
+        ReviewVerdict::Concerns => "Concerns",
+        ReviewVerdict::Block => "Block",
+    }
+}
+
+fn worst_verdict(a: ReviewVerdict, b: ReviewVerdict) -> ReviewVerdict {
+    fn rank(v: ReviewVerdict) -> u8 {
+        match v {
+            ReviewVerdict::Pass => 0,
+            ReviewVerdict::Concerns => 1,
+            ReviewVerdict::Block => 2,
+        }
+    }
+    if rank(a) >= rank(b) { a } else { b }
 }
 
 /// Emit a single INFO log line describing the rendered prompt's shape:
@@ -1128,7 +1229,7 @@ this is not yaml: at all: ::: {{{ broken
         unsafe { std::env::set_var("REVIEWER_TEST_SKIP_DEFAULT", "k") };
         let cfg_default = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_SKIP_DEFAULT".into()),
             api_key: None,
@@ -1154,7 +1255,7 @@ this is not yaml: at all: ::: {{{ broken
         unsafe { std::env::set_var("REVIEWER_TEST_SKIP_TRUE", "k") };
         let cfg_true = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_SKIP_TRUE".into()),
             api_key: None,
@@ -1224,7 +1325,7 @@ this is not yaml: at all: ::: {{{ broken
         unsafe { std::env::set_var("REVIEWER_TEST_SKIP_FALSE_GATE", "k") };
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_SKIP_FALSE_GATE".into()),
             api_key: None,
@@ -1260,7 +1361,7 @@ this is not yaml: at all: ::: {{{ broken
         unsafe { std::env::set_var("REVIEWER_TEST_KEY_OVERRIDE", "k") };
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_KEY_OVERRIDE".into()),
             api_key: None,
@@ -1301,7 +1402,7 @@ this is not yaml: at all: ::: {{{ broken
         let bogus = std::path::PathBuf::from("/nonexistent/orchestrator-test-template.md");
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_KEY_MISSING_TMPL".into()),
             api_key: None,
@@ -1341,7 +1442,7 @@ this is not yaml: at all: ::: {{{ broken
         std::fs::write(&legacy, "LEGACY REVIEW TEMPLATE").unwrap();
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_KEY_NESTED".into()),
             api_key: None,
@@ -1370,7 +1471,7 @@ this is not yaml: at all: ::: {{{ broken
         unsafe { std::env::set_var("REVIEWER_TEST_KEY_DEFAULT", "k") };
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "x".into(),
             api_key_env: Some("REVIEWER_TEST_KEY_DEFAULT".into()),
             api_key: None,
@@ -1742,6 +1843,139 @@ this is not yaml: at all: ::: {{{ broken
         assert_eq!(result.markdown, report.markdown);
         assert_eq!(result.concerns.len(), report.concerns.len());
         assert_eq!(Verdict::from(report.verdict), result.verdict);
+    }
+
+    /// a53 task 3.1: `review_pr_at_state_with` over a synthetic 3-change
+    /// `ReviewContext` in per_change mode invokes the reviewer once per
+    /// change (3 calls) AND returns a `ReviewResult` carrying 3
+    /// `per_change_sections`, one per change, in input order. This is the
+    /// regression the change pins: the operator-trigger entry point now
+    /// honors `reviewer.mode == per_change` instead of always bundling.
+    #[tokio::test]
+    async fn review_pr_at_state_per_change_dispatches_once_per_change() {
+        use std::sync::Mutex;
+        struct CountingClient {
+            prompts: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl LlmClient for CountingClient {
+            async fn complete(&self, prompt: &str) -> anyhow::Result<String> {
+                self.prompts.lock().unwrap().push(prompt.to_string());
+                Ok("VERDICT: Pass\n\nlooks fine\n".to_string())
+            }
+        }
+        let prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let client = Box::new(CountingClient { prompts: prompts.clone() });
+        let reviewer = CodeReviewer::new(
+            client,
+            "{{cross_change_preamble}}{{changed_files}}{{diff}}".to_string(),
+        )
+        .with_mode(crate::config::ReviewerMode::PerChange);
+
+        let brief = |name: &str| ChangeBrief {
+            name: name.into(),
+            proposal: format!("## Why\nreasons for {name}\n"),
+            design: None,
+            tasks: String::new(),
+        };
+        let ctx = ReviewContext {
+            archived_changes: vec![brief("alpha"), brief("beta"), brief("gamma")],
+            changed_files: vec![ChangedFile {
+                path: "src/x.rs".into(),
+                contents: "fn x() {}".into(),
+            }],
+            diff: "the union diff".into(),
+        };
+
+        let result = review_pr_at_state_with(&reviewer, &ctx)
+            .await
+            .expect("per-change review succeeds");
+        assert_eq!(prompts.lock().unwrap().len(), 3, "one LLM call per change");
+        assert_eq!(result.per_change_sections.len(), 3);
+        let slugs: Vec<&str> = result
+            .per_change_sections
+            .iter()
+            .map(|s| s.change_slug.as_str())
+            .collect();
+        assert_eq!(slugs, ["alpha", "beta", "gamma"]);
+        for s in &result.per_change_sections {
+            assert!(
+                s.markdown.starts_with("VERDICT: "),
+                "each section body carries its own verdict line"
+            );
+        }
+    }
+
+    /// a53 task 3.2: in bundled mode `review_pr_at_state_with` invokes the
+    /// reviewer exactly once, returns empty `per_change_sections`, AND its
+    /// markdown is byte-identical to a direct `CodeReviewer::review` of the
+    /// same context — no behavior change for the default path.
+    #[tokio::test]
+    async fn review_pr_at_state_bundled_single_call_empty_sections() {
+        use std::sync::Mutex;
+        struct CountingClient {
+            prompts: Arc<Mutex<Vec<String>>>,
+            response: String,
+        }
+        #[async_trait]
+        impl LlmClient for CountingClient {
+            async fn complete(&self, prompt: &str) -> anyhow::Result<String> {
+                self.prompts.lock().unwrap().push(prompt.to_string());
+                Ok(self.response.clone())
+            }
+        }
+        let raw = "VERDICT: Concerns\n\nminor nit.\n";
+        let make_ctx = || ReviewContext {
+            archived_changes: vec![
+                ChangeBrief {
+                    name: "alpha".into(),
+                    proposal: "## Why\na\n".into(),
+                    design: None,
+                    tasks: String::new(),
+                },
+                ChangeBrief {
+                    name: "beta".into(),
+                    proposal: "## Why\nb\n".into(),
+                    design: None,
+                    tasks: String::new(),
+                },
+            ],
+            changed_files: vec![ChangedFile {
+                path: "src/x.rs".into(),
+                contents: "fn x() {}".into(),
+            }],
+            diff: "the diff".into(),
+        };
+
+        // Reference: a direct bundled review of the same context.
+        let (ref_client, _) = stub_with_capture(raw);
+        let ref_reviewer = CodeReviewer::new(ref_client, "{{changed_files}}{{diff}}".to_string());
+        let ref_report = ref_reviewer.review(&make_ctx()).await.unwrap();
+
+        // System under test: the bundled-mode entry point.
+        let prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let client = Box::new(CountingClient {
+            prompts: prompts.clone(),
+            response: raw.to_string(),
+        });
+        let reviewer = CodeReviewer::new(client, "{{changed_files}}{{diff}}".to_string())
+            .with_mode(crate::config::ReviewerMode::Bundled);
+        let result = review_pr_at_state_with(&reviewer, &make_ctx()).await.unwrap();
+
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            1,
+            "bundled mode: exactly one LLM call regardless of change count"
+        );
+        assert!(
+            result.per_change_sections.is_empty(),
+            "bundled mode leaves per_change_sections empty"
+        );
+        assert_eq!(
+            result.markdown, ref_report.markdown,
+            "bundled output byte-identical to a direct review"
+        );
+        assert_eq!(Verdict::from(ref_report.verdict), result.verdict);
     }
 
     /// Behavior test (a48): the shipped default template must reference

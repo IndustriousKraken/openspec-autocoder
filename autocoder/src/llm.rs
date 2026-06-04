@@ -222,7 +222,9 @@ impl LlmClient for OllamaChatClient {
 /// resolution entirely — config-load validation rejects `api_key` when
 /// `provider: ollama`, so no key is ever in scope here.
 pub fn build_from_config(cfg: &ReviewerConfig) -> Result<Box<dyn LlmClient>> {
-    let provider = cfg.provider;
+    let provider = cfg
+        .provider
+        .expect("reviewer.provider resolved at config-load");
     let model = cfg.model.clone();
     let base = cfg.api_base_url.clone();
 
@@ -284,7 +286,9 @@ fn resolve_reviewer_api_key(cfg: &ReviewerConfig) -> Result<String> {
 pub fn build_from_contradiction_check_config(
     cfg: &ContradictionCheckLlmConfig,
 ) -> Result<Box<dyn LlmClient>> {
-    let provider = cfg.provider;
+    let provider = cfg
+        .provider
+        .expect("change_internal_contradiction_check_llm.provider resolved at config-load");
     let model = cfg.model.clone();
     let base = cfg.api_base_url.clone();
 
@@ -354,7 +358,7 @@ mod tests {
         use crate::config::{ReviewerConfig, ReviewerProvider};
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "claude-sonnet-4-6".into(),
             api_key_env: None,
             api_key: None,
@@ -393,7 +397,7 @@ mod tests {
             .await;
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "claude-sonnet-4-6".into(),
             api_key_env: None,
             api_key: Some(SecretSource::Inline {
@@ -441,7 +445,7 @@ mod tests {
         };
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Anthropic,
+            provider: Some(ReviewerProvider::Anthropic),
             model: "claude-sonnet-4-6".into(),
             api_key_env: Some("AUTOCODER_TEST_INLINE_PREC_KEY".into()),
             api_key: Some(SecretSource::Inline {
@@ -805,7 +809,7 @@ mod tests {
             .await;
         let cfg = ReviewerConfig {
             enabled: true,
-            provider: ReviewerProvider::Ollama,
+            provider: Some(ReviewerProvider::Ollama),
             model: "qwen2.5-coder:32b".into(),
             api_key_env: None,
             api_key: None,

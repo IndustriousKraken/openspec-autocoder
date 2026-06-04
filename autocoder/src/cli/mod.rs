@@ -54,6 +54,7 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
         paths: config::DaemonPathsConfig::default(),
         features: config::FeaturesConfig::default(),
         canonical_rag: None,
+        models: None,
     };
     crate::paths::resolve_daemon_paths(&cfg)
 }

@@ -109,7 +109,7 @@ Cross-link:
 | `busy_marker_stale_threshold_secs` | no | `600` | Stale-threshold (in seconds) for the live-PID busy-marker recovery branch. The next polling iteration finding an existing marker whose recorded PID is STILL ALIVE AND older than this value treats the pass as stuck: `SIGTERM`s the process group, waits 5s, `SIGKILL`s if still alive, clears the marker, and proceeds. **Decoupled** from `executor.timeout_secs` — raising the executor timeout for one legitimately long-running change does NOT delay stale-marker recovery on unrelated iterations. Dead-PID markers (recorded `pid` no longer in `/proc`) are recovered IMMEDIATELY regardless of this value; this field gates ONLY the live-PID branch. `0` is permitted — every live-PID marker is then treated as stale on inspection (useful for diagnostics). Values above `7200` (2 hours) are clamped to `7200` with a WARN log at startup. See [Busy marker](OPERATIONS.md#busy-marker). |
 | `change_internal_contradiction_check` | no | `disabled` | Opt-in gate for the change-internal contradiction pre-flight (a19). `disabled` (default) skips the LLM call entirely. `enabled` runs the check AFTER `a17`'s archivability check AND BEFORE the executor; non-empty findings write `.needs-spec-revision.json` and halt the queue walk. Enabling without `change_internal_contradiction_check_llm` is a fail-fast startup error. See [Pre-flight checks](OPERATIONS.md#pre-flight-checks). |
 | `change_internal_contradiction_check_prompt_path` | no | _embedded_ | Path to a file overriding the built-in contradiction-check prompt template. Unset → use the template compiled into the binary from `prompts/change-contradiction-check.md`. An empty override file is rejected at use time so the daemon does NOT feed an empty prompt to the LLM. See [Pre-flight checks](OPERATIONS.md#pre-flight-checks). |
-| `change_internal_contradiction_check_llm` | required when enabled | _absent_ | LLM block for the contradiction check. Fields parallel the `reviewer:` LLM surface — `provider` (`anthropic` \| `openai_compatible`), `model`, `api_key_env` / `api_key`, `api_base_url`. Held as its own block so operators can pick a cheaper model than the reviewer (the prompt is small AND the failure mode is fail-open). See [Pre-flight checks](OPERATIONS.md#pre-flight-checks). |
+| `change_internal_contradiction_check_llm` | required when enabled | _absent_ | LLM block for the contradiction check. Fields parallel the `reviewer:` LLM surface — `provider` (`anthropic` \| `openai_compatible` \| `ollama`), `model`, `api_key_env` / `api_key`, `api_base_url`. `provider` may be **omitted** to reference a [`models:` nickname](#models-optional) (its `model` is then the nickname). Held as its own block so operators can pick a cheaper model than the reviewer (the prompt is small AND the failure mode is fail-open). See [Pre-flight checks](OPERATIONS.md#pre-flight-checks). |
 
 ## `github:` (required)
 
@@ -156,6 +156,79 @@ github:
 
 See [Operating notes — authorizing PR-comment triggers](OPERATIONS.md#authorizing-pr-comment-triggers).
 
+## `models:` (optional)
+
+A top-level **model registry**: define a model once under a nickname, then
+reference it by name from any LLM-consuming block (`reviewer:`,
+`canonical_rag:`, `executor.change_internal_contradiction_check_llm:`).
+Absent block → no registry; every LLM block must be inline. The registry is
+the de-duplicated form, **not** a forced migration — inline blocks remain
+valid indefinitely.
+
+`models:` is a map from nickname to an entry carrying the same four LLM
+fields the per-subsystem blocks use, plus an optional `cli:` override:
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `provider` | yes | — | `anthropic`, `openai_compatible`, or `ollama`. Always inline on a registry entry (the nickname shorthand lives on the *referencing* block, not here). |
+| `model` | yes | — | Provider-specific model identifier. |
+| `api_base_url` | depends | provider default | Required for `openai_compatible` and `ollama`; optional for `anthropic` (defaults to `https://api.anthropic.com`). |
+| `api_key_env` / `api_key` | depends | _absent_ | Provider API key (env-var name, or inline `{ value: "..." }`). Required for `anthropic`/`openai_compatible`; **forbidden** for `ollama`. Inline wins over `api_key_env` (dual-set logs a WARN). |
+| `cli` | no | from `provider` | Overrides the default agentic CLI for this model (`claude` \| `opencode`). |
+
+Each entry is validated at config-load via the same per-provider auth rules
+as an inline block — e.g. an `ollama` entry with an `api_key` fails load even
+if no block references it.
+
+### Nickname references (omit `provider`)
+
+An LLM block is **discriminated by the presence of `provider`**:
+
+- A block that **sets** `provider` is the legacy inline form; the registry
+  is **not** consulted. Every existing config takes this path unchanged.
+- A block that **omits** `provider` has its `model` field interpreted as a
+  `models:` nickname and resolved to that entry's
+  `(provider, model, api_base_url, api_key/api_key_env)` before the block's
+  downstream consumer runs.
+
+```yaml
+models:
+  beefy_security:
+    provider: openai_compatible
+    model: moonshotai/kimi-k2
+    api_base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_KEY
+reviewer:
+  enabled: true
+  model: beefy_security        # no provider → registry nickname
+change_internal_contradiction_check_llm:
+  provider: anthropic          # provider present → legacy inline, unchanged
+  model: claude-opus-4-8
+  api_key_env: ANTHROPIC_API_KEY
+```
+
+A nickname that names no registry entry fails config-load with an error
+naming both the missing nickname and the referencing block. The resolved
+provider passes the same per-subsystem validity gate as an inline provider
+(e.g. a `canonical_rag` block resolving to `anthropic` is rejected, because
+Anthropic exposes no embeddings API).
+
+### Provider → default CLI rule
+
+Each entry's `provider` fixes the default agentic CLI for that model:
+
+| Provider | Default CLI |
+|---|---|
+| `anthropic` | `claude` |
+| `openai_compatible` | `opencode` |
+| `ollama` | `opencode` |
+
+The optional per-entry `cli:` field overrides this default (e.g. drive an
+`openai_compatible` model through the `claude` CLI with `cli: claude`). The
+CLI strategies that consume this rule arrive with the agentic-run primitive
+(a later change); the registry defines the rule so model and CLI selection
+are specified in one place.
+
 ## `reviewer:` (optional)
 
 See [Code Review](CODE-REVIEW.md). Absent block disables the reviewer step.
@@ -163,8 +236,8 @@ See [Code Review](CODE-REVIEW.md). Absent block disables the reviewer step.
 | Field                      | Required | Default | Description |
 |----------------------------|----------|---------|-------------|
 | `enabled`                  | no       | `false` | Master toggle. When `false`, the reviewer step is skipped entirely even if the block is present. |
-| `provider`                 | yes      | —       | `anthropic` or `openai_compatible`. |
-| `model`                    | yes      | —       | Provider-specific model identifier. |
+| `provider`                 | no¹      | —       | `anthropic`, `openai_compatible`, or `ollama`. **Omit** to interpret `model` as a [`models:` nickname](#models-optional); when set, the block is inline and the registry is not consulted. |
+| `model`                    | yes      | —       | Provider-specific model identifier, **or** a `models:` nickname when `provider` is omitted. |
 | `api_key_env`              | no       | _absent_ | Name of the env var holding the provider API key. Used when `api_key` is unset. |
 | `api_key`                  | no       | _absent_ | Inline alternative to `api_key_env` (`{ value: "..." }`); when set, `api_key_env` is ignored. |
 | `api_base_url`             | no       | provider default | Override the base URL — useful for OpenRouter, Grok, local Ollama, etc. |
@@ -172,6 +245,12 @@ See [Code Review](CODE-REVIEW.md). Absent block disables the reviewer step.
 | `auto_revise`              | no       | `false` | When `true`, posts one `<!-- reviewer-revision -->` PR comment per concern the reviewer marked `should_request_revision: true` (with a non-empty `actionable_request`) — fires on actionable concerns **regardless of verdict** (`Pass`, `Concerns`, or `Block`). The [PR-comment revision dispatcher](OPERATIONS.md#revising-an-open-pr-via-comment) picks them up on the next iteration. Reviewer-initiated revisions are **automatic** and count against the per-PR `executor.max_auto_revisions_per_pr` cap (human `@<bot> revise` requests do not); concerns dropped due to the cap budget are annotated in the `## Code Review` PR-body section with `(not auto-revised; cap budget exhausted)`. Operator-customized reviewer templates must be updated to emit the structured `revision-requests` YAML block at the end of the response — see [Reviewer-initiated revisions on actionable concerns](CODE-REVIEW.md#reviewer-initiated-revisions-on-actionable-concerns) for the schema and the operator-template migration steps. The legacy key `auto_revise_on_block` is accepted as a silent alias. Default `false` (no behavioural change for sites already running the reviewer). |
 | `prompt_budget_chars`      | no       | `2000000` | Maximum size (in chars) of the rendered reviewer prompt body — change context + changed files + diff combined. No hard ceiling; operator matches the value to their LLM provider's actual context window (Grok-4 / Claude Sonnet 4.6 fit `4000000`+; smaller-window providers may want a tighter cap). YAML integers do NOT accept underscore separators — write the value as a plain decimal. Hot-applicable via `autocoder reload`. See [Prompt budget](CODE-REVIEW.md#prompt-budget) for the full discussion. |
 | `mode`                     | no       | `bundled` | Reviewer dispatch mode. `bundled` (default) keeps the existing one-reviewer-call-per-PR behaviour. `per_change` dispatches one reviewer call per change in a multi-change PR, emits a separate `## Code Review: <slug>` section per change in the PR body, and scales LLM cost linearly with the change count. See [Per-change reviewer mode](CODE-REVIEW.md#per-change-reviewer-mode) for the full discussion. |
+
+¹ `provider` is required **unless** the block references a [`models:`
+nickname](#models-optional), in which case it must be omitted (its presence
+is what discriminates the inline form from the nickname form). When omitted,
+`api_base_url` and `api_key`/`api_key_env` are also resolved from the
+registry entry and should not be set on the block.
 
 ## `chatops:` (optional)
 
@@ -548,14 +627,19 @@ canonical specs.
 | Field                | Type                  | Default              | Description                                                                                                                          |
 |----------------------|-----------------------|----------------------|--------------------------------------------------------------------------------------------------------------------------------------|
 | `enabled`            | `bool`                | `false`              | Master switch. `false` (the implicit default) makes the daemon behave as if the block were absent — useful for documenting a parked config without enabling. |
-| `provider`           | `ollama \| openai_compatible` | required             | Embedding provider. `ollama` posts to `<base>/api/embed`; `openai_compatible` posts to `<base>/embeddings` with `Authorization: Bearer <api_key>`. |
-| `model`              | `string`              | required             | Provider-specific embedding model identifier (e.g. `nomic-embed-text`, `qwen3-embedding:4b`, `voyage-2`).                            |
+| `provider`           | `ollama \| openai_compatible` | required¹    | Embedding provider. `ollama` posts to `<base>/api/embed`; `openai_compatible` posts to `<base>/embeddings` with `Authorization: Bearer <api_key>`. **Omit** to interpret `model` as a [`models:` nickname](#models-optional); a nickname resolving to `anthropic` is rejected here (no embeddings API). |
+| `model`              | `string`              | required             | Provider-specific embedding model identifier (e.g. `nomic-embed-text`, `qwen3-embedding:4b`, `voyage-2`), **or** a `models:` nickname when `provider` is omitted.                            |
 | `api_base_url`       | `string`              | required             | For `ollama`: `http://host:11434` (the `/api` prefix is implicit). For `openai_compatible`: include the `/v1` prefix.                |
 | `api_key_env`        | `string?`             | `None`               | Env-var name carrying the API key. Required for `openai_compatible`. Ignored for `ollama` unless the endpoint requires auth.         |
 | `api_key`            | `{ value: string }?`  | `None`               | Inline alternative to `api_key_env`. Mutually exclusive with `api_key_env`; inline wins with a WARN if both set (same as `reviewer:`). |
 | `top_k`              | `usize`               | `10`                 | Default chunk count when the tool caller omits `top_k`. Clamped to `[1, 100]` with WARN at startup.                                  |
 | `chunk_strategy`     | `per_requirement \| per_scenario \| per_capability` | `per_requirement` | Chunk granularity. `per_requirement` (default) is one chunk per `### Requirement:`. The other two are reserved for future variants. |
 | `reembed_on_archive` | `bool`                | `true`               | When `true`, post-archive iterations whose archive touched a canonical spec re-embed the affected capability. When `false`, the store goes stale until daemon restart. |
+
+¹ `provider` is required **unless** the block references a [`models:`
+nickname](#models-optional) (omit `provider` and set `model` to the
+nickname); `api_base_url` and `api_key`/`api_key_env` then come from the
+registry entry.
 
 ```yaml
 canonical_rag:

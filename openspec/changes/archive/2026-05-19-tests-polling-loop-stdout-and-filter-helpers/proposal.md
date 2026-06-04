@@ -1,3 +1,7 @@
+---
+changelog: skip
+---
+
 ## Why
 
 Three small pure helpers in `autocoder/src/polling_loop.rs` have **no
