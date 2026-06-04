@@ -134,7 +134,7 @@ See [Code Review](CODE-REVIEW.md). Absent block disables the reviewer step.
 | `api_key`                  | no       | _absent_ | Inline alternative to `api_key_env` (`{ value: "..." }`); when set, `api_key_env` is ignored. |
 | `api_base_url`             | no       | provider default | Override the base URL — useful for OpenRouter, Grok, local Ollama, etc. |
 | `prompt_template_path`     | no       | _embedded_ | Path to a file overriding the built-in reviewer prompt template. Must contain `{{change_context}}`, `{{changed_files}}`, and `{{diff}}` placeholders. |
-| `auto_revise`              | no       | `false` | When `true`, posts one `<!-- reviewer-revision -->` PR comment per concern the reviewer marked `should_request_revision: true` (with a non-empty `actionable_request`) — fires on actionable concerns **regardless of verdict** (`Pass`, `Concerns`, or `Block`). The [PR-comment revision dispatcher](OPERATIONS.md#revising-an-open-pr-via-comment) picks them up on the next iteration. Reviewer-initiated revisions share the per-PR `executor.max_revisions_per_pr` cap with operator-initiated ones; concerns dropped due to the cap are annotated in the `## Code Review` PR-body section with `(not auto-revised; cap budget exhausted)`. Operator-customized reviewer templates must be updated to emit the structured `revision-requests` YAML block at the end of the response — see [Reviewer-initiated revisions on actionable concerns](CODE-REVIEW.md#reviewer-initiated-revisions-on-actionable-concerns) for the schema and the operator-template migration steps. The legacy key `auto_revise_on_block` is accepted as a silent alias. Default `false` (no behavioural change for sites already running the reviewer). |
+| `auto_revise`              | no       | `false` | When `true`, posts one `<!-- reviewer-revision -->` PR comment per concern the reviewer marked `should_request_revision: true` (with a non-empty `actionable_request`) — fires on actionable concerns **regardless of verdict** (`Pass`, `Concerns`, or `Block`). The [PR-comment revision dispatcher](OPERATIONS.md#revising-an-open-pr-via-comment) picks them up on the next iteration. Reviewer-initiated revisions are **automatic** and count against the per-PR `executor.max_auto_revisions_per_pr` cap (human `@<bot> revise` requests do not); concerns dropped due to the cap budget are annotated in the `## Code Review` PR-body section with `(not auto-revised; cap budget exhausted)`. Operator-customized reviewer templates must be updated to emit the structured `revision-requests` YAML block at the end of the response — see [Reviewer-initiated revisions on actionable concerns](CODE-REVIEW.md#reviewer-initiated-revisions-on-actionable-concerns) for the schema and the operator-template migration steps. The legacy key `auto_revise_on_block` is accepted as a silent alias. Default `false` (no behavioural change for sites already running the reviewer). |
 | `prompt_budget_chars`      | no       | `2000000` | Maximum size (in chars) of the rendered reviewer prompt body — change context + changed files + diff combined. No hard ceiling; operator matches the value to their LLM provider's actual context window (Grok-4 / Claude Sonnet 4.6 fit `4000000`+; smaller-window providers may want a tighter cap). YAML integers do NOT accept underscore separators — write the value as a plain decimal. Hot-applicable via `autocoder reload`. See [Prompt budget](CODE-REVIEW.md#prompt-budget) for the full discussion. |
 | `mode`                     | no       | `bundled` | Reviewer dispatch mode. `bundled` (default) keeps the existing one-reviewer-call-per-PR behaviour. `per_change` dispatches one reviewer call per change in a multi-change PR, emits a separate `## Code Review: <slug>` section per change in the PR body, and scales LLM cost linearly with the change count. See [Per-change reviewer mode](CODE-REVIEW.md#per-change-reviewer-mode) for the full discussion. |
 
@@ -332,26 +332,36 @@ This routing affects only HTTP calls to GitHub's REST API (PR creation, optional
 
 Two repositories under the same owner cannot use different tokens. Token routing is per-owner only.
 
-## `executor.max_revisions_per_pr`
+## `executor.max_auto_revisions_per_pr`
 
-Maximum number of `@<bot> revise <text>` rounds applied to a single open
-PR before further triggering comments are silently ignored. Default `5`.
-A value of `0` disables the PR-comment revision channel entirely (the
-dispatcher becomes a no-op).
+Maximum number of **automatic** revision rounds applied to a single open
+PR before further automatic triggers are silently ignored. Only revisions
+the code-reviewer auto-revise path posts — the comments carrying the
+`<!-- reviewer-revision -->` marker — count against this cap. Human
+`@<bot> revise <text>` requests are deliberate and **always process**:
+they are never counted against the cap and are never declined for cap
+reasons. Default `5`. A value of `0` disables the PR-comment revision
+channel entirely (the dispatcher becomes a no-op).
+
+> **Renamed (was `executor.max_revisions_per_pr`).** The legacy key is
+> still accepted as a silent serde alias, so existing config files load
+> unchanged — it now bounds automatic revisions specifically.
 
 Values above `20` are clamped to `20` at startup with a WARN log line —
-the ceiling exists so a runaway operator config (`max_revisions_per_pr:
-1000`) cannot let one PR burn tokens forever.
+the ceiling exists so a runaway reviewer-driven chain
+(`max_auto_revisions_per_pr: 1000`) cannot let one PR burn tokens forever.
 
 ```yaml
 executor:
   kind: claude_cli
-  max_revisions_per_pr: 5    # default; set to 0 to disable, max 20
+  max_auto_revisions_per_pr: 5    # default; set to 0 to disable, max 20
+  # legacy alias still accepted:
+  # max_revisions_per_pr: 5
 ```
 
 See [OPERATIONS.md](OPERATIONS.md#revising-an-open-pr-via-comment) for the
 full revision-loop flow. The cap is per PR (not per repository); each PR
-tracks its own count under
+tracks its own automatic-revision count under
 `<state_dir>/revisions/<repo-sanitized>/<pr-number>.json`. When a PR is closed
 or merged, its state file is pruned automatically — the cap resets if the
 PR is re-opened.

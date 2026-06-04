@@ -144,7 +144,10 @@ pub struct CodeReviewer {
     auto_revise: bool,
     prompt_budget: usize,
     mode: crate::config::ReviewerMode,
-    max_code_reviews_per_pr: u32,
+    /// Per-PR cap on operator-initiated re-reviews. `None` means UNLIMITED
+    /// (the default) — re-reviews are deliberate operator actions with no
+    /// runaway path, so the cap is opt-in only.
+    max_code_reviews_per_pr: Option<u32>,
     suggest_rereview_threshold: Option<f32>,
     /// a34 §6: cost-optimization knob. When `true`, the polling
     /// iteration skips the reviewer call for any PR whose diff lives
@@ -160,14 +163,15 @@ impl CodeReviewer {
             auto_revise: false,
             prompt_budget: DEFAULT_PROMPT_BUDGET,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: crate::config::default_max_code_reviews_per_pr(),
+            max_code_reviews_per_pr: None,
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         }
     }
 
-    /// Builder-style setter for the per-PR re-review cap.
-    pub fn with_max_code_reviews_per_pr(mut self, cap: u32) -> Self {
+    /// Builder-style setter for the per-PR re-review cap. `None` means
+    /// unlimited (the default).
+    pub fn with_max_code_reviews_per_pr(mut self, cap: Option<u32>) -> Self {
         self.max_code_reviews_per_pr = cap;
         self
     }
@@ -178,8 +182,9 @@ impl CodeReviewer {
         self
     }
 
-    /// Per-PR cap on operator-initiated re-reviews (a33).
-    pub fn max_code_reviews_per_pr(&self) -> u32 {
+    /// Per-PR cap on operator-initiated re-reviews (a33/a47). `None` means
+    /// unlimited (the default).
+    pub fn max_code_reviews_per_pr(&self) -> Option<u32> {
         self.max_code_reviews_per_pr
     }
 
@@ -1086,7 +1091,7 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -1112,7 +1117,7 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: true,
         };
@@ -1182,7 +1187,7 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -1218,21 +1223,23 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("should load custom template");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_OVERRIDE") };
 
-        // The override must not match the default template's scope statement.
-        assert!(
-            !reviewer.template.contains("You are reviewing code quality only"),
-            "user template should NOT contain the default's scope statement"
+        // Template identity, not wording: the loaded value is exactly the
+        // synthetic custom template this test wrote, AND is distinct from
+        // the embedded default (symbol comparison, no prose substring).
+        assert_eq!(
+            reviewer.template, "CUSTOM TEMPLATE: {{diff}}",
+            "loaded template must equal the synthetic custom template the test wrote"
         );
-        assert!(
-            reviewer.template.contains("CUSTOM TEMPLATE:"),
-            "user template should be the loaded file's contents"
+        assert_ne!(
+            reviewer.template, DEFAULT_TEMPLATE,
+            "loaded custom template must not equal the embedded default"
         );
     }
 
@@ -1257,18 +1264,16 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
         let reviewer = CodeReviewer::from_config(&cfg)
             .expect("missing template must fall back to embedded default");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_MISSING_TMPL") };
-        assert!(
-            reviewer
-                .template
-                .contains("You are reviewing code quality only"),
-            "fallback must use embedded default"
+        assert_eq!(
+            reviewer.template, DEFAULT_TEMPLATE,
+            "fallback must use the embedded default template (symbol identity)"
         );
     }
 
@@ -1301,7 +1306,7 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -1328,41 +1333,15 @@ this is not yaml: at all: ::: {{{ broken
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("default template loads");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_DEFAULT") };
-        assert!(
-            reviewer
-                .template
-                .contains("You are reviewing code quality only"),
-            "default template must be used when prompt_template_path is None"
-        );
-    }
-
-    #[test]
-    fn default_template_describes_revision_requests_block() {
-        // Operators who flip `reviewer.auto_revise` rely on the
-        // default template producing the structured `revision-requests`
-        // block. The template must instruct the LLM on it.
-        assert!(
-            DEFAULT_TEMPLATE.contains("revision-requests"),
-            "default template must mention the `revision-requests` block name"
-        );
-        assert!(
-            DEFAULT_TEMPLATE.contains("should_request_revision"),
-            "default template must document the `should_request_revision` field"
-        );
-        assert!(
-            DEFAULT_TEMPLATE.contains("actionable_request"),
-            "default template must document the `actionable_request` field"
-        );
-        assert!(
-            DEFAULT_TEMPLATE.to_lowercase().contains("most-critical-first")
-                || DEFAULT_TEMPLATE.to_lowercase().contains("most critical first"),
-            "default template must instruct on ordering for cap-budget truncation"
+        assert_eq!(
+            reviewer.template, DEFAULT_TEMPLATE,
+            "default template must be used when prompt_template_path is None (symbol identity)"
         );
     }
 
@@ -1718,27 +1697,31 @@ this is not yaml: at all: ::: {{{ broken
         assert_eq!(Verdict::from(report.verdict), result.verdict);
     }
 
+    /// Behavior test (a48): the shipped default template must reference
+    /// all three substitution placeholders, because the production render
+    /// path (`review_with_preamble`) fills them. Rendering the real
+    /// default with a distinct sentinel per placeholder and asserting each
+    /// sentinel survives proves the references exist — without pinning any
+    /// of the template's hand-authored instruction prose (per the
+    /// project-documentation requirement "Tests assert behavior or
+    /// derivation, never message wording").
     #[test]
-    fn default_template_contains_scope_statement_and_format() {
-        // Architecture-baseline scenario: default template must contain the
-        // literal scope statement AND specify the verdict format.
+    fn default_template_references_all_placeholders() {
+        let rendered = DEFAULT_TEMPLATE
+            .replace("{{change_context}}", "SENTINEL_CHANGE_CONTEXT_a48")
+            .replace("{{changed_files}}", "SENTINEL_CHANGED_FILES_a48")
+            .replace("{{diff}}", "SENTINEL_DIFF_a48");
         assert!(
-            DEFAULT_TEMPLATE.contains("You are reviewing code quality only. Do NOT assess whether the diff implements the spec; that is handled separately by the verifier step."),
-            "default template must contain the exact scope statement"
+            rendered.contains("SENTINEL_CHANGE_CONTEXT_a48"),
+            "default template must reference the {{change_context}} placeholder"
         );
         assert!(
-            DEFAULT_TEMPLATE.contains("VERDICT:"),
-            "default template must instruct on verdict format"
+            rendered.contains("SENTINEL_CHANGED_FILES_a48"),
+            "default template must reference the {{changed_files}} placeholder"
         );
-        // Rubric points enumerated.
-        for rubric in &[
-            "Security", "Error handling", "Naming", "style", "idioms",
-            "Dead code", "bugs",
-        ] {
-            assert!(
-                DEFAULT_TEMPLATE.to_lowercase().contains(&rubric.to_lowercase()),
-                "default template missing rubric point `{rubric}`"
-            );
-        }
+        assert!(
+            rendered.contains("SENTINEL_DIFF_a48"),
+            "default template must reference the {{diff}} placeholder"
+        );
     }
 }

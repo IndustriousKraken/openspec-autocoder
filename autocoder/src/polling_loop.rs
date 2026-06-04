@@ -1178,6 +1178,8 @@ pub async fn execute_one_pass(
         &processed,
         includes_self_heal,
         review_report.as_ref(),
+        reviewer,
+        revision_cap,
         draft,
         &reviewer_revision_concerns,
         chatops_ctx,
@@ -4894,6 +4896,40 @@ async fn create_pull_request_via_hook(
     .await
 }
 
+/// Build the initial per-PR `RevisionState` written at PR-open time when the
+/// original automatic review ran (a33 §7.2 baseline + the per-PR caps).
+///
+/// The caps are SOURCED — never hardcoded — so this init agrees with the
+/// revision dispatcher's own state init in `revisions::process_one_pr`:
+/// - `revision_cap` is the resolved `executor.max_auto_revisions_per_pr`
+///   (already clamped at config load) — bounds AUTOMATIC revisions only.
+/// - `code_review_cap` is `reviewer.max_code_reviews_per_pr()`, where `None`
+///   means UNLIMITED (the a47 default). Hardcoding `Some(5)` here would
+///   silently re-cap re-reviews on every daemon-opened PR even when the
+///   operator set no cap, defeating a47's default-unlimited re-reviews.
+fn initial_revision_state_at_pr_open(
+    pr_number: u64,
+    agent_branch: String,
+    now: chrono::DateTime<chrono::Utc>,
+    revision_cap: u32,
+    reviewer: Option<&CodeReviewer>,
+    head_sha: String,
+) -> crate::revisions::RevisionState {
+    crate::revisions::RevisionState {
+        pr_number,
+        agent_branch,
+        last_seen_comment_at: now,
+        auto_revisions_applied: 0,
+        revision_cap,
+        cap_decline_posted: false,
+        code_reviews_applied: 0,
+        code_review_cap: reviewer.and_then(|r| r.max_code_reviews_per_pr()),
+        cap_decline_posted_for_code_review: false,
+        last_suggested_rereview_at_revisions_count: None,
+        original_review_head_sha: Some(head_sha),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn open_pull_request(
     paths: &DaemonPaths,
@@ -4902,6 +4938,8 @@ async fn open_pull_request(
     changes: &[String],
     includes_self_heal: bool,
     review_report: Option<&ReviewReport>,
+    reviewer: Option<&CodeReviewer>,
+    revision_cap: u32,
     draft: bool,
     reviewer_revision_concerns: &[ReviewConcern],
     chatops_ctx: Option<&ChatOpsContext>,
@@ -5028,19 +5066,14 @@ async fn open_pull_request(
                     s.original_review_head_sha = Some(head_sha);
                     s
                 }
-                None => crate::revisions::RevisionState {
-                    pr_number: pr.number,
-                    agent_branch: repo.agent_branch.clone(),
-                    last_seen_comment_at: now,
-                    revisions_applied: 0,
-                    revision_cap: 5,
-                    cap_decline_posted: false,
-                    code_reviews_applied: 0,
-                    code_review_cap: 5,
-                    cap_decline_posted_for_code_review: false,
-                    last_suggested_rereview_at_revisions_count: None,
-                    original_review_head_sha: Some(head_sha),
-                },
+                None => initial_revision_state_at_pr_open(
+                    pr.number,
+                    repo.agent_branch.clone(),
+                    now,
+                    revision_cap,
+                    reviewer,
+                    head_sha,
+                ),
             };
             if let Err(e) = crate::revisions::write_state(paths, workspace, &state) {
                 tracing::warn!(
@@ -16082,7 +16115,7 @@ mod tests {
     }
 
     /// 3-change per-change pass with 2 revision requests per change AND
-    /// `max_revisions_per_pr: 5` → 5 comments posted, 1 annotated as
+    /// `max_auto_revisions_per_pr: 5` → 5 comments posted, 1 annotated as
     /// "(not auto-revised; cap budget exhausted)" inside its OWN per-
     /// change section (not the bundled markdown).
     #[test]
@@ -16226,6 +16259,87 @@ mod tests {
         let taken = partition_and_annotate_reviewer_revisions(&mut r, 5);
         assert!(taken.is_empty(), "no actionable concerns => no posts under Concerns");
         assert!(!r.markdown.contains("cap budget exhausted"));
+    }
+
+    // ============================================================
+    // initial_revision_state_at_pr_open (caps are SOURCED, not hardcoded)
+    // ============================================================
+
+    /// Build a minimal `CodeReviewer` whose `max_code_reviews_per_pr` is the
+    /// given value, for the PR-open state-init tests below.
+    fn reviewer_with_review_cap(cap: Option<u32>) -> CodeReviewer {
+        use crate::llm::LlmClient;
+        use async_trait::async_trait;
+        struct NoopClient;
+        #[async_trait]
+        impl LlmClient for NoopClient {
+            async fn complete(&self, _: &str) -> Result<String> {
+                Ok(String::new())
+            }
+        }
+        CodeReviewer::new(Box::new(NoopClient), "t".to_string())
+            .with_max_code_reviews_per_pr(cap)
+    }
+
+    /// Regression guard: the PR-open state init must SOURCE the re-review cap
+    /// from the reviewer (NOT hardcode `Some(5)`). With the a47 default
+    /// (`reviewer.max_code_reviews_per_pr` unset → `None`), a freshly-opened
+    /// PR's state must carry `code_review_cap: None` (unlimited) — otherwise
+    /// every daemon-opened PR is silently re-capped at 5 reruns.
+    #[test]
+    fn pr_open_state_init_sources_unlimited_review_cap_from_reviewer() {
+        let reviewer = reviewer_with_review_cap(None);
+        let now = chrono::Utc::now();
+        let state = initial_revision_state_at_pr_open(
+            42,
+            "agent-q".to_string(),
+            now,
+            5,
+            Some(&reviewer),
+            "deadbeef".to_string(),
+        );
+        assert_eq!(
+            state.code_review_cap, None,
+            "unset reviewer cap must yield None (unlimited), not the old hardcoded Some(5)"
+        );
+        assert_eq!(state.revision_cap, 5, "auto-revision cap is sourced from the passed value");
+        assert_eq!(state.auto_revisions_applied, 0);
+        assert_eq!(state.code_reviews_applied, 0);
+        assert_eq!(state.original_review_head_sha.as_deref(), Some("deadbeef"));
+        assert_eq!(state.last_seen_comment_at, now);
+    }
+
+    /// When the operator set an opt-in re-review ceiling, the PR-open init
+    /// carries it through as `Some(n)`.
+    #[test]
+    fn pr_open_state_init_sources_set_review_cap_from_reviewer() {
+        let reviewer = reviewer_with_review_cap(Some(3));
+        let state = initial_revision_state_at_pr_open(
+            7,
+            "agent-q".to_string(),
+            chrono::Utc::now(),
+            12,
+            Some(&reviewer),
+            "cafe".to_string(),
+        );
+        assert_eq!(state.code_review_cap, Some(3));
+        // The auto-revision cap reflects the configured value, not a hardcoded 5.
+        assert_eq!(state.revision_cap, 12);
+    }
+
+    /// No reviewer configured → the re-review cap is `None` (unlimited).
+    #[test]
+    fn pr_open_state_init_no_reviewer_yields_unlimited_review_cap() {
+        let state = initial_revision_state_at_pr_open(
+            9,
+            "agent-q".to_string(),
+            chrono::Utc::now(),
+            0,
+            None,
+            "f00d".to_string(),
+        );
+        assert_eq!(state.code_review_cap, None);
+        assert_eq!(state.revision_cap, 0);
     }
 
     // ============================================================

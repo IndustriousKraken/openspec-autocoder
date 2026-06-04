@@ -201,30 +201,37 @@ good` are conversational and are ignored. Anyone with GitHub write access
 to the repo can post a revision — the trust boundary matches the existing
 ChatOps channel.
 
-**Revision cap.** Each PR has a per-PR cap (default `5`; configurable via
-`executor.max_revisions_per_pr`, hard-clamped at `20`). When the cap is
-reached, the daemon posts a one-time decline comment starting with
+**Revision cap (automatic only).** Each PR has a per-PR cap on
+**automatic** revisions (default `5`; configurable via
+`executor.max_auto_revisions_per_pr`, hard-clamped at `20`; the legacy
+key `executor.max_revisions_per_pr` is still accepted as an alias). The
+cap counts ONLY reviewer-marked automatic revisions (the
+`<!-- reviewer-revision -->` comments) — **human `@<bot> revise` requests
+are never capped and always process.** When an automatic revision would
+exceed the cap, the daemon posts a one-time decline comment starting with
 `🛑 Revision cap reached` AND a ChatOps notification, then silently
-ignores subsequent triggering comments on that PR. Close + re-open or
-merge as-is to reset the cap.
+ignores subsequent automatic triggers on that PR (human triggers continue
+to process). Close + re-open or merge as-is to reset the cap.
 
-**State persistence.** Per-PR state (last-seen-timestamp, revision count,
-cap-decline flag) lives at `<workspace>/.autocoder/revisions/<pr-number>.json`.
-Files for closed/merged PRs are pruned automatically at iteration start.
+**State persistence.** Per-PR state (last-seen-timestamp,
+automatic-revision count, cap-decline flag) lives at
+`<workspace>/.autocoder/revisions/<pr-number>.json`. Files for
+closed/merged PRs are pruned automatically at iteration start.
 
-**Disabling.** Set `executor.max_revisions_per_pr: 0` to opt out of the
-PR-comment revision channel entirely.
+**Disabling.** Set `executor.max_auto_revisions_per_pr: 0` to opt out of
+the PR-comment revision channel entirely.
 
 ### Reviewer-initiated revisions (cross-reference)
 
 The same revision dispatcher described above also processes
 `<!-- reviewer-revision -->`-marked comments posted by the code-quality
 reviewer when `reviewer.auto_revise: true` (fired on actionable concerns
-regardless of verdict). Both flows share the
-per-PR `executor.max_revisions_per_pr` cap and the same per-PR state file
-(`<workspace>/.autocoder/revisions/<pr-number>.json`); a reviewer-initiated
-revision applied in iteration N counts against the same budget a
-subsequent human `@<bot> revise ...` would consume.
+regardless of verdict). These reviewer-marked comments are the
+**automatic** revisions bounded by the per-PR
+`executor.max_auto_revisions_per_pr` cap; they share the same per-PR state
+file (`<workspace>/.autocoder/revisions/<pr-number>.json`). A human
+`@<bot> revise ...` request does NOT consume this automatic budget — it
+always processes regardless of how many automatic revisions have run.
 
 See [Reviewer-initiated revisions on actionable concerns](CODE-REVIEW.md#reviewer-initiated-revisions-on-actionable-concerns)
 for the full reviewer-side flow, the per-concern decision the reviewer

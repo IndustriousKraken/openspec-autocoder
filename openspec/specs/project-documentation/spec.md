@@ -1069,99 +1069,32 @@ The order matters: empty-path first (resolution failure precedes any path-based 
 - **THEN** the script's stderr does NOT contain the pre-spec generic text `cannot find config; pass --config-dir <path> if your install is non-standard`
 - **AND** instead emits one of the three specific messages above
 
-### Requirement: OpenSpec upstream-docs pointer is regression-tested across the spec-drafting prompt set AND `docs/README.md`
-The repository SHALL include a regression test asserting that nine files — eight agent-facing prompts AND `docs/README.md` — each contain a pointer to OpenSpec's upstream documentation. The pointer's purpose is to give both agents AND human contributors a canonical reference for scenario syntax (`GIVEN`/`WHEN`/`THEN`), delta format (`ADDED`/`MODIFIED`/`REMOVED`/`RENAMED`), AND requirement-header rules without authoring a parallel convention document.
+### Requirement: Tests assert behavior or derivation, never message wording
+The test suite SHALL assert what the code DOES (behavior) or that mechanically-derived output matches its source of truth (derivation). A test SHALL NOT read a real shipped prompt, message, or other human-authored content artifact and assert a hand-authored substring of its prose.
 
-The covered set is:
+Design intent about a prompt's content — for example "the security-bug audit prompt steers the agent toward high-confidence findings" — SHALL be captured as requirement prose and verified by the drift audit's semantic judgment, NOT by a unit test that pins verbatim wording. A unit test that reads a real embedded prompt (via `include_str!`, a named default-prompt constant, or the prompt loader resolving to a default) and asserts a hand-authored sentence or phrase is present is prohibited: it encodes no independent truth, breaks on meaning-preserving rewrites, and catches nothing code review and the drift audit do not.
 
-- `prompts/implementer.md`
-- `prompts/implementer-revision.md`
-- `prompts/chat-request-triage.md`
-- `prompts/audit-triage.md`
-- `prompts/missing-tests-audit.md`
-- `prompts/security-bug-audit.md`
-- `prompts/brownfield-draft.md`
-- `prompts/scout.md`
-- `docs/README.md`
+Behavior tests that exercise prompt- or message-handling code SHALL supply their own synthetic fixture (a template or input the test defines) and assert on the transformed output; they SHALL NOT depend on the content of the real shipped artifact. When a property of a real shipped prompt is genuinely behavior-relevant — for example it must reference a placeholder the substitution code fills — the test SHALL render the real prompt with a distinct sentinel value per placeholder and assert the sentinels appear in the output, asserting the substituted values and never the surrounding instruction prose.
 
-The regression test reads each file via `std::fs::read_to_string` AND verifies the contents contain BOTH (a) the literal substring `https://github.com/Fission-AI/OpenSpec`, AND (b) at least one of the topical hints `GIVEN`, `WHEN`, `scenario`, `delta`, OR `Requirement`. The two-part check ensures the link is present AND surrounded by enough context to give the agent (or human) the format vocabulary that motivates the link.
+Coarse "tripwire" content checks — asserting a URL or keyword is merely present in a real artifact — are the same prohibited category, not an exception; they guarantee nothing review and the drift audit do not.
 
-The test SHALL produce a single combined failure listing (NOT first-failure-only). Each entry in the failure message SHALL name the file path AND which check failed (URL substring missing, OR topical hint missing). Combined reporting lets a contributor editing several files at once see every offender in one run.
+This requirement is the source of truth the drift audit enforces against: a unit test that asserts prompt or message wording is a drift-audit finding, with the disposition to delete it (or, when it guards a behavior-relevant property, refactor it to a sentinel-substitution test) — never to substitute a less-brittle token check.
 
-The test SHALL be deterministic — no network, no clock, no environment mutation. File reads are the only I/O.
+#### Scenario: Behavior test uses a synthetic fixture rather than the real prompt
+- **GIVEN** a test that verifies prompt-placeholder substitution
+- **WHEN** the test is written per this requirement
+- **THEN** it constructs a synthetic template the test itself defines (e.g. `"ctx={{change_context}}"`) AND asserts the substituted value appears in the rendered output
+- **AND** it does NOT read the real shipped prompt to assert any substring of its instruction prose
 
-When a future change introduces a new spec-drafting prompt, OR removes one from the set, OR introduces a project-local convention document that consolidates project-specific deviations (e.g., `openspec/AGENTS.md`), the change SHALL update both this requirement's covered set AND the regression test's file list in lockstep.
+#### Scenario: Verifying a behavior-relevant property of a real prompt via sentinels
+- **GIVEN** a real shipped default template that must reference `{{change_context}}`, `{{changed_files}}`, AND `{{diff}}` because the substitution code fills them
+- **WHEN** a test verifies the template references all three
+- **THEN** it renders the real default with a distinct sentinel value per placeholder AND asserts each sentinel appears in the rendered output
+- **AND** it asserts the substituted sentinel values, NOT the template's hand-authored instruction wording
 
-#### Scenario: Regression test passes against the current repo state
-- **GIVEN** the repository is in its post-merge state for `a41-link-openspec-conventions`
-- **WHEN** the regression test runs
-- **THEN** every file in the covered set contains the substring `https://github.com/Fission-AI/OpenSpec`
-- **AND** every file in the covered set contains at least one of the topical hints (`GIVEN`, `WHEN`, `scenario`, `delta`, `Requirement`)
-- **AND** the test passes with no diagnostic output
-
-#### Scenario: Removing the URL from a covered file fails the test
-- **GIVEN** a hypothetical future change removes the `https://github.com/Fission-AI/OpenSpec` substring from `prompts/implementer.md` without updating this requirement OR the regression test
-- **WHEN** the regression test runs in CI for that change
-- **THEN** the test fails with a diagnostic naming `prompts/implementer.md: missing required substring 'https://github.com/Fission-AI/OpenSpec'`
-- **AND** the failure surfaces before the change can merge
-
-#### Scenario: Removing the topical hint from a covered file fails the test
-- **GIVEN** a hypothetical future change keeps the URL but strips out all five topical hints from `prompts/audit-triage.md`
-- **WHEN** the regression test runs
-- **THEN** the test fails with a diagnostic naming `prompts/audit-triage.md: missing topical hint (one of GIVEN, WHEN, scenario, delta, Requirement)`
-
-#### Scenario: Multiple offenders are reported in one run
-- **GIVEN** a hypothetical future change removes the URL from THREE covered files
-- **WHEN** the regression test runs
-- **THEN** the test fails with a single combined diagnostic naming ALL THREE files AND the failed check for each
-- **AND** the contributor can fix all three without re-running the test repeatedly
-
-#### Scenario: Path resolution works regardless of test-invocation directory
-- **GIVEN** the test is invoked via `cargo test` from the repo root OR from the `autocoder/` crate directory
-- **WHEN** the test resolves file paths via `CARGO_MANIFEST_DIR` AND its parent
-- **THEN** the test reads the same nine files in both invocations
-- **AND** the test passes identically in both
-
-### Requirement: `prompts/implementer-revision.md` instructs the revision agent on `outcome_success` AND `final_answer` content
-`prompts/implementer-revision.md` SHALL contain a section directing the revision agent to call `outcome_success` at end-of-run AND pass a brief content-shaped summary as the `final_answer` argument. The section ensures the revision agent produces summary content that the PR-comment composer (per the `orchestrator-cli` "Revision execution updates the agent branch and posts a reply comment" requirement) can surface to the operator.
-
-The section SHALL contain the following markers, in any order AND with any surrounding prose:
-
-- `outcome_success` — names the MCP tool the agent calls.
-- `final_answer` — names the field carrying the summary text.
-- `declined` — signals that declining the reviewer's request is a valid AND reportable outcome (the foundation the future critical-evaluation prompt will build on).
-- `Test counts` — names one of the content categories the summary should cover.
-
-The required markers are the load-bearing contract; the surrounding prose is flexible. Future contributors MAY reword the section for clarity OR style as long as the markers stay present.
-
-A regression test SHALL read `prompts/implementer-revision.md` via `std::fs::read_to_string` AND verify each required marker is present. The test produces a combined failure listing (NOT first-failure-only) when markers are missing. The test pattern matches the existing `a41-link-openspec-conventions` AND `a44-mcp-outcome-tool-descriptions` regression-test conventions; consolidating into a shared helper OR keeping per-file tests is an implementation choice.
-
-This requirement covers the prompt's outcome-tool guidance content ONLY. The prompt's other content (revision-mode framing, the rule about reading prior implementer notes as context rather than constraints, the input section markers) is unchanged AND remains governed by the prompt's existing role as the revision agent's primary instruction surface.
-
-#### Scenario: All required markers are present
-- **GIVEN** the repository is in its post-merge state for `a45-revision-summary-surfaces-in-pr-comment`
-- **WHEN** the regression test reads `prompts/implementer-revision.md` via `std::fs::read_to_string`
-- **THEN** the file contains the substring `outcome_success`
-- **AND** the file contains the substring `final_answer`
-- **AND** the file contains the substring `declined`
-- **AND** the file contains the substring `Test counts`
-- **AND** the test passes with no diagnostic output
-
-#### Scenario: Removing a required marker fails the test
-- **GIVEN** a hypothetical future change removes the `declined` substring from the outcome-signal section of `prompts/implementer-revision.md`
-- **WHEN** the regression test runs in CI for that change
-- **THEN** the test fails with a diagnostic naming `prompts/implementer-revision.md: missing required substring 'declined'`
-- **AND** the failure surfaces before the change can merge
-
-#### Scenario: Multiple missing markers are reported in one run
-- **GIVEN** a hypothetical future change rewrites the section AND inadvertently drops two markers
-- **WHEN** the regression test runs
-- **THEN** the test fails with a single combined diagnostic naming both missing markers
-- **AND** the contributor can fix both without re-running the test repeatedly
-
-#### Scenario: Rewording within the marker contract is permitted
-- **GIVEN** a future change rewrites the outcome-signal section for clarity, preserving all required substrings
-- **WHEN** the regression test runs
-- **THEN** the test passes
-- **AND** no diagnostic is produced (the prose is flexible; only the substring contract is binding)
+#### Scenario: A wording-assertion test is a drift-audit finding
+- **GIVEN** a unit test that reads a real embedded prompt AND asserts a hand-authored sentence is present as a substring
+- **WHEN** the drift audit reads this requirement against the test code
+- **THEN** the test is reported as a finding for asserting message wording rather than behavior or derivation
+- **AND** the recommended disposition is to delete the test, or refactor it to a sentinel-substitution test when it guards a behavior-relevant property — NOT to add a less-brittle token check
 

@@ -25,7 +25,7 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
             max_changes_per_pr: None,
             startup_jitter_max_secs: None,
             inter_iteration_jitter_pct: None,
-            max_revisions_per_pr: 5,
+            max_auto_revisions_per_pr: 5,
             wipe_drain_timeout_secs: config::default_wipe_drain_timeout_secs(),
             output_format: config::default_output_format(),
             log_retention_days: config::default_log_retention_days(),

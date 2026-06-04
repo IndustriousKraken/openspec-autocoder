@@ -503,11 +503,11 @@ async fn process_one_changelog_pr_revision(
             pr_number: pr.number,
             agent_branch: pr.head.ref_.clone(),
             last_seen_comment_at: pr.created_at,
-            revisions_applied: 0,
+            auto_revisions_applied: 0,
             revision_cap: u32::MAX,
             cap_decline_posted: false,
             code_reviews_applied: 0,
-            code_review_cap: 5,
+            code_review_cap: Some(5),
             cap_decline_posted_for_code_review: false,
             last_suggested_rereview_at_revisions_count: None,
             original_review_head_sha: None,
@@ -579,10 +579,10 @@ async fn process_one_changelog_pr_revision(
             )
             .await;
         } else {
-            state.revisions_applied = state.revisions_applied.saturating_add(1);
+            state.auto_revisions_applied = state.auto_revisions_applied.saturating_add(1);
             let body = format!(
                 "✅ Changelog revision applied. Total revisions on this PR: {}.",
-                state.revisions_applied
+                state.auto_revisions_applied
             );
             let _ = github::post_issue_comment(
                 github::DEFAULT_API_BASE,

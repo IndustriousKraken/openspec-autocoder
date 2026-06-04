@@ -5,6 +5,34 @@ suite. Update the **Disposition summary** at the bottom whenever a new
 flake is discovered (or an old one is resolved); the per-section notes
 above record the audit trail that justified each entry.
 
+## What a test may assert
+
+A test asserts what the code DOES (behavior) or that mechanically-derived
+output matches its source of truth (derivation) — never the wording of a
+prompt, message, or other human-authored content artifact. A test that
+reads a real shipped prompt and checks for a hand-authored substring of
+its prose is a change-detector: it passes because someone typed the words
+and fails because someone retyped them differently, encodes no
+independent truth, and catches nothing review and the drift audit do not.
+Coarse "tripwire" presence checks (a URL or keyword is still in a real
+artifact) are the same category, not an exception.
+
+Behavior tests that exercise prompt- or message-handling code supply
+their own synthetic fixture (a template the test defines) and assert on
+the transformed output. When a behavior-relevant property of a real
+shipped prompt must be checked — e.g. it references a placeholder the
+substitution code fills — render the real prompt with a distinct sentinel
+per placeholder and assert the sentinels appear, never the surrounding
+instruction prose. Design intent about a prompt's content lives in
+requirement prose, where the drift audit verifies it semantically.
+
+This is the canonical requirement `Tests assert behavior or derivation,
+never message wording` in
+`openspec/specs/project-documentation/spec.md`; a wording-assertion test
+is a drift-audit finding, to be deleted (or refactored to a
+sentinel-substitution test when it guards a behavior-relevant property),
+never replaced with a less-brittle token check.
+
 ## How to investigate a new flake
 
 1. Reproduce: run the suite in a loop (`for i in 1..20; cargo test

@@ -82,7 +82,7 @@ Trade-offs:
 - **LLM cost** scales linearly under `per_change`: an N-change PR costs N× the bundled-mode price. Pick `per_change` only if you specifically want per-change attention and are willing to pay for it.
 - **Per-change budget** — each per-change call independently respects `prompt_budget_chars`. One change touching a huge file gets its own truncation footer without affecting the other changes' reviews.
 - **Cross-change context preserved** — each per-change prompt includes a short preamble naming the OTHER changes in the same PR (slug + first paragraph of `## Why`, truncated to 200 chars each), so the reviewer sees that change A introduced a symbol change B consumes.
-- **Reviewer-initiated revisions still aggregate** — the union of revision requests across all per-change reviews shares the same `executor.max_revisions_per_pr` cap. Dropped requests are annotated inside their own `## Code Review: <change-slug>` section.
+- **Reviewer-initiated revisions still aggregate** — the union of revision requests across all per-change reviews shares the same `executor.max_auto_revisions_per_pr` cap (reviewer-initiated revisions are automatic). Dropped requests are annotated inside their own `## Code Review: <change-slug>` section.
 
 ```yaml
 reviewer:
@@ -116,9 +116,9 @@ The reviewer makes the per-concern decision: only concerns with a concrete, exec
 
 ### Cap-budget interaction
 
-Reviewer-initiated revisions count toward the same per-PR `executor.max_revisions_per_pr` cap as human-initiated ones (default 5; see [CONFIG.md](CONFIG.md#max_revisions_per_pr)). When the reviewer would post more comments than the remaining cap allows, autocoder posts the first N (the reviewer's prompt template instructs it to list concerns most-critical-first) and annotates the dropped concerns in the `## Code Review` PR-body section with `(not auto-revised; cap budget exhausted)` so the human reviewer sees what was skipped.
+Reviewer-initiated revisions are **automatic** and count toward the per-PR `executor.max_auto_revisions_per_pr` cap (default 5; see [CONFIG.md](CONFIG.md#executormax_auto_revisions_per_pr)). Human `@<bot> revise` requests are **not** counted against this cap — only reviewer-marked automatic revisions are. When the reviewer would post more comments than the remaining cap budget allows, autocoder posts the first N (the reviewer's prompt template instructs it to list concerns most-critical-first) and annotates the dropped concerns in the `## Code Review` PR-body section with `(not auto-revised; cap budget exhausted)` so the human reviewer sees what was skipped.
 
-The cap budget at posting time is a forward-looking estimate; the actual `revisions_applied` counter only increments when the dispatcher processes a comment on a subsequent iteration. Posting failures (transient GitHub errors) are logged at `WARN` per concern and do not abort the iteration — the PR is still created/updated, just without those comments.
+The cap budget at posting time is a forward-looking estimate; the actual `auto_revisions_applied` counter only increments when the dispatcher processes an automatic comment on a subsequent iteration. Posting failures (transient GitHub errors) are logged at `WARN` per concern and do not abort the iteration — the PR is still created/updated, just without those comments.
 
 ### Operator-customized reviewer templates
 

@@ -364,7 +364,7 @@ mod tests {
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -405,7 +405,7 @@ mod tests {
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -453,7 +453,7 @@ mod tests {
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };
@@ -815,7 +815,7 @@ mod tests {
             auto_revise: false,
             prompt_budget_chars: 2_000_000,
             mode: crate::config::ReviewerMode::Bundled,
-            max_code_reviews_per_pr: 5,
+            max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
         };

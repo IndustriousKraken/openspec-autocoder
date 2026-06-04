@@ -167,11 +167,17 @@ executor:
   # Values above 100 are clamped to 100.
   # inter_iteration_jitter_pct: 10
 
-  # Maximum number of `@<bot> revise ...` rounds applied to a single
-  # open PR before further triggering comments are silently ignored.
-  # Default `5`. `0` disables the PR-comment revision channel entirely.
-  # Values above `20` are clamped to `20` with a WARN log at startup.
-  # max_revisions_per_pr: 5
+  # Maximum number of AUTOMATIC (reviewer-marked) revision rounds applied
+  # to a single open PR before further automatic triggers are silently
+  # ignored. Only revisions the code-reviewer auto-revise path posts (the
+  # `<!-- reviewer-revision -->` comments) count against this cap — human
+  # `@<bot> revise` requests are deliberate and ALWAYS process (never
+  # capped, never declined). Default `5`. `0` disables the PR-comment
+  # revision channel entirely. Values above `20` are clamped to `20` with
+  # a WARN log at startup.
+  # The legacy key `max_revisions_per_pr` is still accepted as a silent
+  # alias (existing configs load unchanged).
+  # max_auto_revisions_per_pr: 5
 
   # Seconds the `@<bot> wipe-workspace` flow waits for the in-flight
   # per-repo polling iteration to drain (release its busy marker) after
@@ -354,7 +360,7 @@ github:
 #   # `<!-- reviewer-revision -->` PR comment that the revision dispatcher
 #   # picks up on the next polling iteration — REGARDLESS of the verdict
 #   # (`Pass`, `Concerns`, OR `Block`). Defaults to `false`. Requires
-#   # `executor.max_revisions_per_pr > 0` (the dispatcher); operator-
+#   # `executor.max_auto_revisions_per_pr > 0` (the dispatcher); operator-
 #   # customized reviewer templates must be updated to emit the new
 #   # per-concern fields. See README's "Reviewer-initiated revisions" section.
 #   # The legacy key `auto_revise_on_block` is still accepted as an alias.
@@ -381,12 +387,16 @@ github:
 #   # mode: bundled
 #   #
 #   # Per-PR cap on operator-initiated re-reviews triggered via the
-#   # `@<bot> code-review` PR-comment verb. Default `5`. The original
-#   # automatic review at PR-open time does NOT count against this cap.
-#   # Values above 20 are clamped down at startup with a WARN. Independent
-#   # of `executor.max_revisions_per_pr` — re-reviews are a separate cost
+#   # `@<bot> code-review` PR-comment verb. UNLIMITED by default (unset):
+#   # every re-review is a deliberate operator action and there is no
+#   # automatic re-review path, so there is no runaway to bound. Set a
+#   # positive integer to impose an opt-in ceiling (the Nth+1 `code-review`
+#   # then posts a one-time decline). Values above 20 are clamped down at
+#   # startup with a WARN. The original automatic review at PR-open time
+#   # does NOT count against this cap. Independent of
+#   # `executor.max_auto_revisions_per_pr` — re-reviews are a separate cost
 #   # surface (one LLM call) from revisions (full executor subprocess).
-#   # max_code_reviews_per_pr: 5
+#   # max_code_reviews_per_pr: 5   # unset = unlimited (opt-in ceiling)
 #   #
 #   # Optional diff-overlap threshold for re-review suggestion. Unset
 #   # (the default) disables the suggestion entirely. When set in the

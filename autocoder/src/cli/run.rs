@@ -401,14 +401,14 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     }
 
-    // Per-PR revision cap. Values above the ceiling are clamped down in
-    // `max_revisions_per_pr_clamped()`; we WARN once here so the operator
-    // notices the bogus value.
-    if cfg.executor.max_revisions_per_pr > crate::config::MAX_REVISIONS_PER_PR_CEILING {
+    // Per-PR automatic-revision cap. Values above the ceiling are clamped
+    // down in `max_auto_revisions_per_pr_clamped()`; we WARN once here so
+    // the operator notices the bogus value.
+    if cfg.executor.max_auto_revisions_per_pr > crate::config::MAX_AUTO_REVISIONS_PER_PR_CEILING {
         tracing::warn!(
-            configured = cfg.executor.max_revisions_per_pr,
-            ceiling = crate::config::MAX_REVISIONS_PER_PR_CEILING,
-            "executor.max_revisions_per_pr is set above the ceiling; clamping (a runaway revision loop would otherwise burn tokens — fix your config)"
+            configured = cfg.executor.max_auto_revisions_per_pr,
+            ceiling = crate::config::MAX_AUTO_REVISIONS_PER_PR_CEILING,
+            "executor.max_auto_revisions_per_pr is set above the ceiling; clamping (a runaway reviewer-driven revision chain would otherwise burn tokens — fix your config)"
         );
     }
 
@@ -474,7 +474,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     let task_map: RepoTaskMap = Arc::new(Mutex::new(HashMap::new()));
     let task_map_changed = Arc::new(tokio::sync::Notify::new());
     let executor_max_changes_per_pr = cfg.executor.max_changes_per_pr;
-    let revision_cap = cfg.executor.max_revisions_per_pr_clamped();
+    let revision_cap = cfg.executor.max_auto_revisions_per_pr_clamped();
     let startup_jitter_max_secs = cfg.executor.startup_jitter_max_secs();
     let inter_iteration_jitter_pct = cfg.executor.inter_iteration_jitter_pct();
     let spawn_repo = build_spawn_repo_fn(SpawnDeps {

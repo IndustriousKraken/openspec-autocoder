@@ -41,7 +41,16 @@ pub struct RevisionState {
     pub pr_number: u64,
     pub agent_branch: String,
     pub last_seen_comment_at: DateTime<Utc>,
-    pub revisions_applied: u32,
+    /// Count of AUTOMATIC (reviewer-marked, `<!-- reviewer-revision -->`)
+    /// revisions applied to this PR. Human-initiated `@<bot> revise`
+    /// comments are NOT counted here — they always process and never
+    /// touch this counter. This is the value compared against
+    /// `revision_cap`. `#[serde(default)]` so a legacy state file written
+    /// before the a47 rename (which used the field `revisions_applied`)
+    /// loads with `0` rather than failing — the pre-a47 mixed count is
+    /// intentionally dropped so the auto-only cap starts fresh.
+    #[serde(default)]
+    pub auto_revisions_applied: u32,
     pub revision_cap: u32,
     #[serde(default)]
     pub cap_decline_posted: bool,
@@ -49,12 +58,15 @@ pub struct RevisionState {
     /// Does NOT count the original automatic review at PR-open time.
     #[serde(default)]
     pub code_reviews_applied: u32,
-    /// Per-PR upper bound on operator-initiated re-reviews. Populated
-    /// from `reviewer.max_code_reviews_per_pr` at state-file write time.
-    /// Defaults to `5` (the documented config default) when missing from
-    /// a legacy state file.
-    #[serde(default = "default_code_review_cap")]
-    pub code_review_cap: u32,
+    /// Per-PR upper bound on operator-initiated re-reviews. Populated from
+    /// `reviewer.max_code_reviews_per_pr` at state-file write time. `None`
+    /// means UNLIMITED (the config default) — re-reviews are deliberate
+    /// operator actions with no runaway path. A legacy state file written
+    /// before a47 (when this was a bare `u32` defaulting to `5`) still
+    /// deserializes: a present number loads as `Some(n)`; a missing field
+    /// loads as `None` (unlimited).
+    #[serde(default)]
+    pub code_review_cap: Option<u32>,
     /// Set `true` after the one-time cap-decline PR comment AND chatops
     /// notification are posted on cap exceeded for re-reviews.
     #[serde(default)]
@@ -71,13 +83,6 @@ pub struct RevisionState {
     /// gracefully degrades to "no suggestion" in that case.
     #[serde(default)]
     pub original_review_head_sha: Option<String>,
-}
-
-/// Default per-PR cap on operator-initiated re-reviews, used by serde when
-/// a legacy state file is missing the field. Mirrors
-/// [`crate::config::default_max_code_reviews_per_pr`]'s value.
-fn default_code_review_cap() -> u32 {
-    5
 }
 
 /// Bundle of context passed to the executor when it runs in revision mode.
@@ -388,8 +393,9 @@ pub struct ChatOpsCtx<'a> {
 /// completion (per-PR errors are logged at WARN and do not abort the
 /// walk).
 ///
-/// `revision_cap` is the resolved `executor.max_revisions_per_pr` (already
-/// clamped at config load); it is stamped into freshly-initialized
+/// `revision_cap` is the resolved `executor.max_auto_revisions_per_pr`
+/// (already clamped at config load); it bounds only AUTOMATIC
+/// (reviewer-marked) revisions and is stamped into freshly-initialized
 /// per-PR state files. PRs whose state file pre-dates a config change
 /// continue to use the cap stored in their state file.
 #[allow(clippy::too_many_arguments)]
@@ -533,19 +539,18 @@ async fn process_one_pr(
     let _ = reviewer; // wired through; consumed by the code-review branch (task 4)
     // Load or initialize per-PR state. The revision_cap stored in state
     // reflects the cap in effect when the PR was first observed; callers
-    // that change `executor.max_revisions_per_pr` mid-PR live with the
-    // older cap until the PR closes (matches the chatops-channel
+    // that change `executor.max_auto_revisions_per_pr` mid-PR live with
+    // the older cap until the PR closes (matches the chatops-channel
     // hot-reload contract: changes apply to new work, not in-flight).
-    let code_review_cap_initial = reviewer
-        .map(|r| r.max_code_reviews_per_pr())
-        .unwrap_or_else(default_code_review_cap);
+    let code_review_cap_initial: Option<u32> =
+        reviewer.and_then(|r| r.max_code_reviews_per_pr());
     let mut state = match read_state(paths, workspace, pr.number)? {
         Some(s) => s,
         None => RevisionState {
             pr_number: pr.number,
             agent_branch: repo.agent_branch.clone(),
             last_seen_comment_at: pr.created_at,
-            revisions_applied: 0,
+            auto_revisions_applied: 0,
             revision_cap,
             cap_decline_posted: false,
             code_reviews_applied: 0,
@@ -556,28 +561,13 @@ async fn process_one_pr(
         },
     };
 
-    // If we've already posted the decline AND we're still at-or-above the
-    // cap, fast-skip the PR entirely so subsequent triggering comments are
-    // silently ignored. Still advance the timestamp so they're not
-    // re-processed if state is rewritten by other means.
-    if state.cap_decline_posted && state.revisions_applied >= state.revision_cap {
-        // Fetch comments only to advance the timestamp, so we don't keep
-        // re-reading the same set forever.
-        let comments = github::list_issue_comments_since(
-            api_base,
-            token,
-            owner,
-            repo_name,
-            pr.number,
-            state.last_seen_comment_at,
-        )
-        .await?;
-        if let Some(latest) = comments.iter().map(|c| c.created_at).max() {
-            state.last_seen_comment_at = latest;
-            write_state(paths, workspace, &state)?;
-        }
-        return Ok(());
-    }
+    // NOTE: there is deliberately NO whole-PR fast-skip when the automatic
+    // cap is reached + declined. Under a47 the cap bounds only AUTOMATIC
+    // (reviewer-marked) revisions; human `@<bot> revise` comments must
+    // still process even after the automatic decline has been posted. Each
+    // comment is classified per-iteration in the loop below, so an
+    // over-cap automatic trigger is silently advanced while a human
+    // trigger interleaved on the same PR is dispatched normally.
 
     let comments = github::list_issue_comments_since(
         api_base,
@@ -645,13 +635,19 @@ async fn process_one_pr(
                     let operator_login = comment.user_login().to_string();
                     let change_list =
                         extract_change_list_from_pr_body(pr.body.as_deref());
-                    // Cap check.
-                    if state.code_reviews_applied >= state.code_review_cap {
+                    // Cap check. The re-review cap is opt-in: when
+                    // `code_review_cap` is `None` (the a47 default) there is
+                    // no ceiling — `@<bot> code-review` always dispatches and
+                    // no decline is ever posted. The cap only engages when
+                    // the operator set a value.
+                    if let Some(cap) = state.code_review_cap
+                        && state.code_reviews_applied >= cap
+                    {
                         advance_seen(&mut latest_seen, comment.created_at);
                         if !state.cap_decline_posted_for_code_review {
                             let pr_text = format!(
                                 "🛑 Code review cap reached ({} reruns). Further @{} code-review requests will be ignored. Close + re-open the PR or merge as-is.",
-                                state.code_review_cap, bot_username,
+                                cap, bot_username,
                             );
                             if let Err(e) = github::post_issue_comment(
                                 api_base, token, owner, repo_name, pr.number, &pr_text,
@@ -667,7 +663,7 @@ async fn process_one_pr(
                             if let Some(ctx) = chatops_ctx {
                                 let chat_text = format!(
                                     "🛑 {}: PR #{} hit the code-review cap of {}. Further @{} code-review requests ignored.",
-                                    repo.url, pr.number, state.code_review_cap, bot_username,
+                                    repo.url, pr.number, cap, bot_username,
                                 );
                                 if let Err(e) = ctx
                                     .chatops
@@ -800,16 +796,29 @@ async fn process_one_pr(
                 continue;
             }
         };
-        if state.revisions_applied >= state.revision_cap {
-            // Cap hit. Post the one-time decline (if not posted) and
-            // break — subsequent triggering comments on this PR are
-            // silently ignored. We still advance `latest_seen` to the
-            // decline-triggering comment so re-running the iteration
-            // doesn't loop on the same comment.
+        // a47: classify the triggering comment. AUTOMATIC revisions are
+        // reviewer-marked — their body begins with the
+        // `<!-- reviewer-revision -->` marker the code-reviewer auto-revise
+        // path posts. Everything else is a deliberate human `@<bot> revise`
+        // request. Only automatic revisions count against
+        // `max_auto_revisions_per_pr` AND are subject to the cap/decline;
+        // human requests always process and never increment the automatic
+        // counter.
+        let is_automatic = comment
+            .body
+            .trim_start()
+            .starts_with(REVIEWER_REVISION_MARKER);
+        if is_automatic && state.auto_revisions_applied >= state.revision_cap {
+            // Automatic cap hit. Post the one-time decline (if not posted),
+            // then silently ignore THIS automatic trigger. We `continue`
+            // (rather than `break`) so a human `@<bot> revise` comment
+            // interleaved later on the same PR still gets processed. We
+            // advance `latest_seen` to the decline-triggering comment so
+            // re-running the iteration doesn't loop on the same comment.
             advance_seen(&mut latest_seen, comment.created_at);
             if !state.cap_decline_posted {
                 let pr_text = format!(
-                    "🛑 Revision cap reached ({} revisions). Further `@{} revise` requests on this PR will be ignored. Close + re-open or merge as-is.",
+                    "🛑 Revision cap reached ({} automatic revisions). Further reviewer-initiated revisions on this PR will be ignored; human `@{} revise` requests still process. Close + re-open or merge as-is.",
                     state.revision_cap, bot_username,
                 );
                 if let Err(e) = github::post_issue_comment(
@@ -844,7 +853,7 @@ async fn process_one_pr(
                 state.cap_decline_posted = true;
                 write_state(paths, workspace, &state)?;
             }
-            break;
+            continue;
         }
         // Apply the revision. The change name is derived from the PR's
         // body (the first change listed); v1 supports a single revision
@@ -969,12 +978,18 @@ async fn process_one_pr(
                         api_base, token, owner, repo_name, pr.number, &body,
                     )
                     .await;
-                    state.revisions_applied = state.revisions_applied.saturating_add(1);
+                    if is_automatic {
+                        state.auto_revisions_applied =
+                            state.auto_revisions_applied.saturating_add(1);
+                    }
                     advance_seen(&mut latest_seen, comment.created_at);
                     write_state(paths, workspace, &state)?;
                     continue;
                 }
-                state.revisions_applied = state.revisions_applied.saturating_add(1);
+                if is_automatic {
+                    state.auto_revisions_applied =
+                        state.auto_revisions_applied.saturating_add(1);
+                }
                 crate::polling_loop::maybe_post_revise_succeeded_alert(
                     paths,
                     chatops_ctx,
@@ -989,7 +1004,8 @@ async fn process_one_pr(
                 .await;
                 let reply = compose_revision_success_comment(
                     &commit_subject,
-                    state.revisions_applied,
+                    is_automatic,
+                    state.auto_revisions_applied,
                     state.revision_cap,
                     final_answer.as_deref(),
                 );
@@ -1070,7 +1086,10 @@ async fn process_one_pr(
                         "failed to post failure PR comment: {e:#}"
                     );
                 }
-                state.revisions_applied = state.revisions_applied.saturating_add(1);
+                if is_automatic {
+                    state.auto_revisions_applied =
+                        state.auto_revisions_applied.saturating_add(1);
+                }
                 advance_seen(&mut latest_seen, comment.created_at);
                 write_state(paths, workspace, &state)?;
             }
@@ -1097,7 +1116,10 @@ async fn process_one_pr(
                     api_base, token, owner, repo_name, pr.number, &body,
                 )
                 .await;
-                state.revisions_applied = state.revisions_applied.saturating_add(1);
+                if is_automatic {
+                    state.auto_revisions_applied =
+                        state.auto_revisions_applied.saturating_add(1);
+                }
                 advance_seen(&mut latest_seen, comment.created_at);
                 write_state(paths, workspace, &state)?;
             }
@@ -1124,13 +1146,16 @@ async fn process_one_pr(
                     api_base, token, owner, repo_name, pr.number, &body,
                 )
                 .await;
-                state.revisions_applied = state.revisions_applied.saturating_add(1);
+                if is_automatic {
+                    state.auto_revisions_applied =
+                        state.auto_revisions_applied.saturating_add(1);
+                }
                 advance_seen(&mut latest_seen, comment.created_at);
                 write_state(paths, workspace, &state)?;
             }
             Ok(ExecutorOutcome::Aborted { reason }) => {
                 // a39: subprocess killed by the daemon's own SIGTERM
-                // cascade. Do NOT bump revisions_applied, do NOT post
+                // cascade. Do NOT bump auto_revisions_applied, do NOT post
                 // a failure alert, AND do NOT advance latest_seen — so
                 // the next iteration after restart re-enters this same
                 // comment AND retries.
@@ -1171,7 +1196,10 @@ async fn process_one_pr(
                     api_base, token, owner, repo_name, pr.number, &body,
                 )
                 .await;
-                state.revisions_applied = state.revisions_applied.saturating_add(1);
+                if is_automatic {
+                    state.auto_revisions_applied =
+                        state.auto_revisions_applied.saturating_add(1);
+                }
                 advance_seen(&mut latest_seen, comment.created_at);
                 write_state(paths, workspace, &state)?;
             }
@@ -1201,26 +1229,37 @@ const REVISION_COMMENT_MAX: usize = 60_000;
 /// Compose the success reply comment body for a `Completed` revision.
 ///
 /// The success line stays at the top so operators scanning for the ✓
-/// confirmation see it immediately. When `final_answer` carries text
-/// that is non-empty after trimming, the agent's summary follows after a
-/// blank line, verbatim — no transformation, no re-wrapping. When
-/// `final_answer` is `None` (legacy text mode OR no outcome tool was
-/// called) OR is empty after trimming, the body is the single-line
-/// success form (today's behavior; no trailing blank section). The
-/// composed body is passed through [`crate::polling_loop::truncate_to_fit`]
-/// so it stays under GitHub's comment-size limit, with a truncation
-/// marker appended (naming the per-change log file) when it would
-/// overflow.
+/// confirmation see it immediately. For AUTOMATIC (reviewer-marked)
+/// revisions the line reports the automatic-revision count against the
+/// cap (`Automatic revision count: N of M`) since those are the revisions
+/// the cap bounds. For HUMAN `@<bot> revise` requests — which are never
+/// capped (a47) — the count is omitted entirely so the operator is not
+/// shown a misleading cap figure that their request did not move.
+///
+/// When `final_answer` carries text that is non-empty after trimming, the
+/// agent's summary follows after a blank line, verbatim — no
+/// transformation, no re-wrapping. When `final_answer` is `None` (legacy
+/// text mode OR no outcome tool was called) OR is empty after trimming,
+/// the body is the single-line success form (no trailing blank section).
+/// The composed body is passed through
+/// [`crate::polling_loop::truncate_to_fit`] so it stays under GitHub's
+/// comment-size limit, with a truncation marker appended (naming the
+/// per-change log file) when it would overflow.
 fn compose_revision_success_comment(
     commit_subject: &str,
-    revisions_applied: u32,
+    is_automatic: bool,
+    auto_revisions_applied: u32,
     revision_cap: u32,
     final_answer: Option<&str>,
 ) -> String {
-    let success_line = format!(
-        "✅ Revision applied: {}. Revision count: {} of {}.",
-        commit_subject, revisions_applied, revision_cap,
-    );
+    let success_line = if is_automatic {
+        format!(
+            "✅ Revision applied: {}. Automatic revision count: {} of {}.",
+            commit_subject, auto_revisions_applied, revision_cap,
+        )
+    } else {
+        format!("✅ Revision applied: {commit_subject}.")
+    };
     let body = match final_answer {
         Some(text) if !text.trim().is_empty() => format!("{success_line}\n\n{text}"),
         _ => success_line,
@@ -1287,8 +1326,10 @@ async fn execute_code_review(
     let Some(reviewer) = reviewer else {
         return Ok(CodeReviewOutcome::ReviewerDisabled);
     };
-    // Cap check.
-    if state.code_reviews_applied >= state.code_review_cap {
+    // Cap check. `None` means unlimited (a47 default) — no ceiling.
+    if let Some(cap) = state.code_review_cap
+        && state.code_reviews_applied >= cap
+    {
         return Ok(CodeReviewOutcome::CapExceeded);
     }
     // Build the ReviewContext from the workspace's git state. The
@@ -1313,11 +1354,16 @@ async fn execute_code_review(
             });
         }
     };
-    // Compose + post the fresh PR comment with the canonical heading.
+    // Compose + post the fresh PR comment with the canonical heading. When
+    // the re-review cap is unlimited (`None`), the heading shows just the
+    // rerun ordinal; when an opt-in ceiling is set it shows `N of M`.
     let n = state.code_reviews_applied.saturating_add(1);
-    let m = state.code_review_cap;
+    let rerun_label = match state.code_review_cap {
+        Some(m) => format!("rerun {n} of {m}"),
+        None => format!("rerun {n}"),
+    };
     let body = format!(
-        "## Code Review (rerun {n} of {m})\n\nVERDICT: {verdict}\n\n{markdown}",
+        "## Code Review ({rerun_label})\n\nVERDICT: {verdict}\n\n{markdown}",
         verdict = result.verdict.label(),
         markdown = result.markdown,
     );
@@ -1375,7 +1421,7 @@ async fn execute_code_review(
 /// a successful revision iteration. Gated by:
 /// - `reviewer.suggest_rereview_threshold` is `Some`.
 /// - `state.original_review_head_sha` is `Some`.
-/// - `state.last_suggested_rereview_at_revisions_count != Some(state.revisions_applied)`.
+/// - `state.last_suggested_rereview_at_revisions_count != Some(state.auto_revisions_applied)`.
 /// - `chatops_ctx.failure_alerts_enabled`.
 /// - The computed overlap >= threshold.
 ///
@@ -1398,7 +1444,7 @@ async fn maybe_post_rereview_suggestion(
         return;
     };
     if state.last_suggested_rereview_at_revisions_count
-        == Some(state.revisions_applied)
+        == Some(state.auto_revisions_applied)
     {
         return;
     }
@@ -1451,12 +1497,12 @@ async fn maybe_post_rereview_suggestion(
         pr.number,
         &pr.url,
         percent,
-        state.revisions_applied,
+        state.auto_revisions_applied,
     )
     .await;
     if posted {
         state.last_suggested_rereview_at_revisions_count =
-            Some(state.revisions_applied);
+            Some(state.auto_revisions_applied);
     }
 }
 
@@ -1526,11 +1572,11 @@ mod tests {
             pr_number: pr,
             agent_branch: "agent-q".to_string(),
             last_seen_comment_at: ts("2026-05-25T10:00:00Z"),
-            revisions_applied: 1,
+            auto_revisions_applied: 1,
             revision_cap: 5,
             cap_decline_posted: false,
             code_reviews_applied: 0,
-            code_review_cap: 5,
+            code_review_cap: Some(5),
             cap_decline_posted_for_code_review: false,
             last_suggested_rereview_at_revisions_count: None,
             original_review_head_sha: None,
@@ -1555,11 +1601,11 @@ mod tests {
             pr_number: 42,
             agent_branch: "agent-q".to_string(),
             last_seen_comment_at: ts("2026-05-25T10:00:00Z"),
-            revisions_applied: 3,
+            auto_revisions_applied: 3,
             revision_cap: 5,
             cap_decline_posted: true,
             code_reviews_applied: 0,
-            code_review_cap: 5,
+            code_review_cap: Some(5),
             cap_decline_posted_for_code_review: false,
             last_suggested_rereview_at_revisions_count: None,
             original_review_head_sha: None,
@@ -1569,10 +1615,13 @@ mod tests {
         assert_eq!(got, original);
     }
 
-    /// Task 2.2: a state file JSON without ANY of the new fields loads
-    /// cleanly with documented defaults.
+    /// a47 Task 1.2: a pre-a47 state file (legacy `revisions_applied` key,
+    /// numeric `code_review_cap`, none of the code-review fields) loads
+    /// gracefully. The pre-a47 `revisions_applied` mixed count is dropped —
+    /// the auto-only counter starts fresh at `0` — and a missing
+    /// `code_review_cap` migrates to `None` (unlimited).
     #[test]
-    fn legacy_state_file_loads_with_default_code_review_fields() {
+    fn legacy_state_file_migrates_auto_revision_and_code_review_fields() {
         let tmp = TempDir::new().unwrap();
         let (_td, paths) = crate::testing::test_daemon_paths();
         let legacy = serde_json::json!({
@@ -1587,11 +1636,40 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
         let got = read_state(&paths, tmp.path(), 7).unwrap().expect("legacy file loads");
+        // Pre-a47 `revisions_applied` is an unknown field now → dropped;
+        // the new auto-only counter defaults to 0.
+        assert_eq!(got.auto_revisions_applied, 0);
         assert_eq!(got.code_reviews_applied, 0);
-        assert_eq!(got.code_review_cap, 5);
+        // Missing `code_review_cap` → unlimited (None).
+        assert_eq!(got.code_review_cap, None);
         assert!(!got.cap_decline_posted_for_code_review);
         assert!(got.last_suggested_rereview_at_revisions_count.is_none());
         assert!(got.original_review_head_sha.is_none());
+    }
+
+    /// a47: a state file written by a47+ that carries a numeric
+    /// `code_review_cap` (an opt-in ceiling the operator set) loads it as
+    /// `Some(n)`.
+    #[test]
+    fn state_file_with_numeric_code_review_cap_loads_as_some() {
+        let tmp = TempDir::new().unwrap();
+        let (_td, paths) = crate::testing::test_daemon_paths();
+        let raw = serde_json::json!({
+            "pr_number": 8,
+            "agent_branch": "agent-q",
+            "last_seen_comment_at": "2026-05-25T10:00:00Z",
+            "auto_revisions_applied": 1,
+            "revision_cap": 5,
+            "cap_decline_posted": false,
+            "code_reviews_applied": 2,
+            "code_review_cap": 3
+        });
+        let path = state_path(&paths, tmp.path(), 8);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+        let got = read_state(&paths, tmp.path(), 8).unwrap().expect("file loads");
+        assert_eq!(got.auto_revisions_applied, 1);
+        assert_eq!(got.code_review_cap, Some(3));
     }
 
     /// Task 2.3: a state file with the new fields populated round-trips
@@ -1604,11 +1682,11 @@ mod tests {
             pr_number: 99,
             agent_branch: "agent-q".to_string(),
             last_seen_comment_at: ts("2026-05-25T10:00:00Z"),
-            revisions_applied: 3,
+            auto_revisions_applied: 3,
             revision_cap: 5,
             cap_decline_posted: false,
             code_reviews_applied: 2,
-            code_review_cap: 5,
+            code_review_cap: Some(5),
             cap_decline_posted_for_code_review: true,
             last_suggested_rereview_at_revisions_count: Some(3),
             original_review_head_sha: Some("abc123def".to_string()),
@@ -2021,11 +2099,13 @@ mod tests {
         let subject = "revise: a39-foo: please investigate";
         let body = compose_revision_success_comment(
             subject,
+            true,
             1,
             5,
             Some("Did X, declined Y because Z."),
         );
-        let success_line = format!("✅ Revision applied: {subject}. Revision count: 1 of 5.");
+        let success_line =
+            format!("✅ Revision applied: {subject}. Automatic revision count: 1 of 5.");
         // Success line at the top, summary after a single blank line.
         assert!(body.starts_with(&success_line), "got: {body:?}");
         assert!(body.contains("Did X, declined Y because Z."), "got: {body:?}");
@@ -2035,22 +2115,34 @@ mod tests {
     #[test]
     fn revision_success_comment_none_is_single_line() {
         let subject = "revise: a39-foo: please investigate";
-        let body = compose_revision_success_comment(subject, 2, 5, None);
+        let body = compose_revision_success_comment(subject, true, 2, 5, None);
         assert_eq!(
             body,
-            format!("✅ Revision applied: {subject}. Revision count: 2 of 5.")
+            format!("✅ Revision applied: {subject}. Automatic revision count: 2 of 5.")
         );
         // No trailing blank line / empty summary section.
         assert!(!body.contains("\n\n"), "expected single-line form: {body:?}");
     }
 
+    /// a47: a HUMAN revision's success comment omits the cap count entirely
+    /// (human `@<bot> revise` requests are uncapped, so showing a cap figure
+    /// would be misleading).
+    #[test]
+    fn revision_success_comment_human_omits_count() {
+        let subject = "revise: a39-foo: please investigate";
+        let body = compose_revision_success_comment(subject, false, 2, 5, None);
+        assert_eq!(body, format!("✅ Revision applied: {subject}."));
+        assert!(!body.contains("revision count"), "human form must not show a count: {body:?}");
+        assert!(!body.contains("of 5"), "human form must not show the cap: {body:?}");
+    }
+
     #[test]
     fn revision_success_comment_whitespace_only_is_single_line() {
         let subject = "revise: a39-foo: please investigate";
-        let body = compose_revision_success_comment(subject, 3, 5, Some("   "));
+        let body = compose_revision_success_comment(subject, true, 3, 5, Some("   "));
         assert_eq!(
             body,
-            format!("✅ Revision applied: {subject}. Revision count: 3 of 5.")
+            format!("✅ Revision applied: {subject}. Automatic revision count: 3 of 5.")
         );
         // Whitespace-only final_answer is treated as empty.
         assert!(!body.contains("\n\n"), "expected single-line form: {body:?}");
@@ -2061,6 +2153,7 @@ mod tests {
         let huge = "x".repeat(100_000);
         let body = compose_revision_success_comment(
             "revise: a39-foo: please investigate",
+            true,
             1,
             5,
             Some(&huge),
@@ -2349,9 +2442,11 @@ mod tests {
         token_env_clear(env_var);
     }
 
-    /// Integration: a triggering comment is detected and the executor's
-    /// `run_revision` method is invoked once. On `Completed`, a success
-    /// PR comment is posted and state is persisted.
+    /// Integration: a HUMAN triggering comment is detected and the
+    /// executor's `run_revision` method is invoked once. On `Completed`, a
+    /// success PR comment is posted and state is persisted. Per a47, a
+    /// human `@<bot> revise` does NOT increment the automatic-revision
+    /// counter.
     #[tokio::test]
     async fn dispatcher_triggering_comment_runs_revision() {
         let env_var = "REVISIONS_TOKEN_TRIGGER";
@@ -2421,7 +2516,9 @@ mod tests {
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
         post_reply.assert_async().await;
         let state = read_state(&paths, &ws, 9).unwrap().expect("state persisted");
-        assert_eq!(state.revisions_applied, 1);
+        // a47: the human revise processed (executor ran, reply posted) but
+        // the automatic counter is untouched — human requests are uncapped.
+        assert_eq!(state.auto_revisions_applied, 0);
 
         token_env_clear(env_var);
     }
@@ -2488,7 +2585,7 @@ mod tests {
         assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
         let state = read_state(&paths, &ws, 11).unwrap().expect("state persisted");
         // last_seen advanced past the bot comment but no revision applied.
-        assert_eq!(state.revisions_applied, 0);
+        assert_eq!(state.auto_revisions_applied, 0);
 
         token_env_clear(env_var);
     }
@@ -2566,6 +2663,10 @@ mod tests {
         // executor — proves the bypass works.
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
         post_reply.assert_async().await;
+        // a47 Task 5.1: a reviewer-marked (automatic) revision increments
+        // the automatic-revision counter.
+        let state = read_state(&paths, &ws, 19).unwrap().expect("state persisted");
+        assert_eq!(state.auto_revisions_applied, 1);
 
         token_env_clear(env_var);
     }
@@ -2637,9 +2738,11 @@ mod tests {
         token_env_clear(env_var);
     }
 
-    /// Integration: when the cap has been reached, the dispatcher posts
-    /// the cap-decline comment + chatops notification once, sets the
-    /// `cap_decline_posted` flag, and does NOT call the executor.
+    /// Integration: when the AUTOMATIC cap has been reached, an incoming
+    /// AUTOMATIC (reviewer-marked) trigger makes the dispatcher post the
+    /// cap-decline comment + chatops notification once, set the
+    /// `cap_decline_posted` flag, and NOT call the executor. (Human
+    /// `@<bot> revise` triggers are never capped — covered separately.)
     #[tokio::test]
     async fn dispatcher_cap_decline_fires_once() {
         let env_var = "REVISIONS_TOKEN_CAP";
@@ -2676,8 +2779,8 @@ mod tests {
             .with_body(
                 r#"[{
                     "id": 1,
-                    "body": "@my-bot revise after cap",
-                    "user": {"login": "operator"},
+                    "body": "<!-- reviewer-revision -->\n@my-bot revise after cap",
+                    "user": {"login": "my-bot"},
                     "created_at": "2026-05-25T11:00:00Z"
                 }]"#,
             )
@@ -2701,11 +2804,11 @@ mod tests {
             pr_number: 13,
             agent_branch: "agent-q".to_string(),
             last_seen_comment_at: ts("2026-05-25T09:00:00Z"),
-            revisions_applied: 5,
+            auto_revisions_applied: 5,
             revision_cap: 5,
             cap_decline_posted: false,
             code_reviews_applied: 0,
-            code_review_cap: 5,
+            code_review_cap: Some(5),
             cap_decline_posted_for_code_review: false,
             last_suggested_rereview_at_revisions_count: None,
             original_review_head_sha: None,
@@ -2739,6 +2842,114 @@ mod tests {
         );
         // State now records the decline was posted.
         let state = read_state(&paths, &ws, 13).unwrap().expect("state persisted");
+        assert!(state.cap_decline_posted);
+
+        token_env_clear(env_var);
+    }
+
+    /// a47 Task 5.2: a HUMAN `@<bot> revise` comment processes normally
+    /// even when the AUTOMATIC counter is at/over the cap AND
+    /// `cap_decline_posted: true`. It does NOT increment the automatic
+    /// counter AND does NOT post a cap-decline.
+    #[tokio::test]
+    async fn dispatcher_human_revise_uncapped_when_auto_cap_reached() {
+        let env_var = "REVISIONS_TOKEN_HUMAN_UNCAPPED";
+        token_env_set(env_var);
+        let mut server = mockito::Server::new_async().await;
+        let _user = server
+            .mock("GET", "/user")
+            .with_status(200)
+            .with_body(r#"{"login":"my-bot"}"#)
+            .create_async()
+            .await;
+        let _pulls = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"[{
+                    "number": 14,
+                    "title": "PR",
+                    "html_url": "https://example.invalid/pr/14",
+                    "state": "open",
+                    "body": "Changes implemented in this pass:\n\n- my-change",
+                    "created_at": "2026-05-25T10:00:00Z",
+                    "head": {"ref": "agent-q"},
+                    "base": {"ref": "main"}
+                }]"#,
+            )
+            .create_async()
+            .await;
+        // A human (operator-authored, no marker) revise comment.
+        let _comments = server
+            .mock("GET", "/repos/owner/repo/issues/14/comments")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"[{
+                    "id": 1,
+                    "body": "@my-bot revise please tighten the error message",
+                    "user": {"login": "operator"},
+                    "created_at": "2026-05-25T11:00:00Z"
+                }]"#,
+            )
+            .create_async()
+            .await;
+        // The success reply IS posted (the human revision processes).
+        let success = server
+            .mock("POST", "/repos/owner/repo/issues/14/comments")
+            .match_body(mockito::Matcher::Regex("Revision applied".to_string()))
+            .with_status(201)
+            .with_body(r#"{"id":42}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // A cap-decline must NEVER be posted for a human trigger.
+        let decline = server
+            .mock("POST", "/repos/owner/repo/issues/14/comments")
+            .match_body(mockito::Matcher::Regex("Revision cap reached".to_string()))
+            .with_status(201)
+            .with_body(r#"{"id":99}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (_dir, ws) = init_git_workspace();
+        let (_td_paths, paths) = crate::testing::test_daemon_paths();
+        // Pre-seed: automatic cap already reached AND decline already posted.
+        let pre_state = RevisionState {
+            pr_number: 14,
+            agent_branch: "agent-q".to_string(),
+            last_seen_comment_at: ts("2026-05-25T09:00:00Z"),
+            auto_revisions_applied: 5,
+            revision_cap: 5,
+            cap_decline_posted: true,
+            code_reviews_applied: 0,
+            code_review_cap: Some(5),
+            cap_decline_posted_for_code_review: false,
+            last_suggested_rereview_at_revisions_count: None,
+            original_review_head_sha: None,
+        };
+        write_state(&paths, &ws, &pre_state).unwrap();
+
+        let repo = make_repo("git@github.com:owner/repo.git");
+        let gh = make_github(env_var);
+        let executor = StubExecutor::new(vec![ExecutorOutcome::Completed { final_answer: None }]);
+        let cancel = CancellationToken::new();
+        process_revision_requests_at(
+            &paths,
+            &ws, &repo, &gh, None, &executor, None, 5, cancel, &server.url(),
+        )
+        .await
+        .expect("dispatcher should succeed");
+        // The human revision ran exactly once.
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        success.assert_async().await;
+        // No cap-decline was posted (expect(0)).
+        decline.assert_async().await;
+        let state = read_state(&paths, &ws, 14).unwrap().expect("state persisted");
+        // The automatic counter is untouched; the decline flag is unchanged.
+        assert_eq!(state.auto_revisions_applied, 5);
         assert!(state.cap_decline_posted);
 
         token_env_clear(env_var);
@@ -2878,12 +3089,19 @@ mod tests {
 
     // -------- strict-since dispatcher filter (a2705) --------
 
-    fn operator_comment_body(comment_created_at: &str) -> String {
+    // These strict-since tests exercise the timestamp dedup filter, which
+    // runs BEFORE human/automatic classification. We use an AUTOMATIC
+    // (reviewer-marked) trigger so the `auto_revisions_applied` counter
+    // increments on a processed comment — letting the assertions below use
+    // the counter as the "was it processed" signal. (Per a47, a human
+    // `@<bot> revise` would process identically but leave the counter at 0;
+    // the human-uncapped path is covered by its own dedicated test.)
+    fn reviewer_marked_comment_body(comment_created_at: &str) -> String {
         format!(
             r#"[{{
                 "id": 1,
-                "body": "@my-bot revise tweak the helper",
-                "user": {{"login": "operator"}},
+                "body": "<!-- reviewer-revision -->\n@my-bot revise tweak the helper",
+                "user": {{"login": "my-bot"}},
                 "created_at": "{comment_created_at}"
             }}]"#,
         )
@@ -2932,7 +3150,7 @@ mod tests {
             .mock("GET", "/repos/owner/repo/issues/31/comments")
             .match_query(mockito::Matcher::Any)
             .with_status(200)
-            .with_body(operator_comment_body("2026-05-25T11:00:00Z"))
+            .with_body(reviewer_marked_comment_body("2026-05-25T11:00:00Z"))
             .create_async()
             .await;
 
@@ -2945,11 +3163,11 @@ mod tests {
                 pr_number: 31,
                 agent_branch: "agent-q".to_string(),
                 last_seen_comment_at: ts("2026-05-25T11:00:00Z"),
-                revisions_applied: 0,
+                auto_revisions_applied: 0,
                 revision_cap: 5,
                 cap_decline_posted: false,
                 code_reviews_applied: 0,
-                code_review_cap: 5,
+                code_review_cap: Some(5),
                 cap_decline_posted_for_code_review: false,
                 last_suggested_rereview_at_revisions_count: None,
                 original_review_head_sha: None,
@@ -2973,7 +3191,7 @@ mod tests {
             "comment at exact marker timestamp must not invoke run_revision",
         );
         let state = read_state(&paths, &ws, 31).unwrap().expect("state persisted");
-        assert_eq!(state.revisions_applied, 0);
+        assert_eq!(state.auto_revisions_applied, 0);
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
 
         token_env_clear(env_var);
@@ -3003,7 +3221,7 @@ mod tests {
             .mock("GET", "/repos/owner/repo/issues/33/comments")
             .match_query(mockito::Matcher::Any)
             .with_status(200)
-            .with_body(operator_comment_body("2026-05-25T10:30:00Z"))
+            .with_body(reviewer_marked_comment_body("2026-05-25T10:30:00Z"))
             .create_async()
             .await;
 
@@ -3015,11 +3233,11 @@ mod tests {
                 agent_branch: "agent-q".to_string(),
                 // Marker is 30 minutes AFTER the comment's created_at.
                 last_seen_comment_at: ts("2026-05-25T11:00:00Z"),
-                revisions_applied: 1,
+                auto_revisions_applied: 1,
                 revision_cap: 5,
                 cap_decline_posted: false,
                 code_reviews_applied: 0,
-                code_review_cap: 5,
+                code_review_cap: Some(5),
                 cap_decline_posted_for_code_review: false,
                 last_suggested_rereview_at_revisions_count: None,
                 original_review_head_sha: None,
@@ -3043,7 +3261,7 @@ mod tests {
             "comment older than marker must not invoke run_revision",
         );
         let state = read_state(&paths, &ws, 33).unwrap().expect("state persisted");
-        assert_eq!(state.revisions_applied, 1);
+        assert_eq!(state.auto_revisions_applied, 1);
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
 
         token_env_clear(env_var);
@@ -3074,7 +3292,7 @@ mod tests {
             .mock("GET", "/repos/owner/repo/issues/35/comments")
             .match_query(mockito::Matcher::Any)
             .with_status(200)
-            .with_body(operator_comment_body("2026-05-25T12:00:00Z"))
+            .with_body(reviewer_marked_comment_body("2026-05-25T12:00:00Z"))
             .create_async()
             .await;
         // The Completed path posts a "Revision applied" PR reply.
@@ -3095,11 +3313,11 @@ mod tests {
                 agent_branch: "agent-q".to_string(),
                 // Marker is one hour BEFORE the comment's created_at.
                 last_seen_comment_at: ts("2026-05-25T11:00:00Z"),
-                revisions_applied: 0,
+                auto_revisions_applied: 0,
                 revision_cap: 5,
                 cap_decline_posted: false,
                 code_reviews_applied: 0,
-                code_review_cap: 5,
+                code_review_cap: Some(5),
                 cap_decline_posted_for_code_review: false,
                 last_suggested_rereview_at_revisions_count: None,
                 original_review_head_sha: None,
@@ -3125,7 +3343,7 @@ mod tests {
         );
         post_reply.assert_async().await;
         let state = read_state(&paths, &ws, 35).unwrap().expect("state persisted");
-        assert_eq!(state.revisions_applied, 1);
+        assert_eq!(state.auto_revisions_applied, 1);
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T12:00:00Z"));
 
         token_env_clear(env_var);
@@ -3164,7 +3382,7 @@ mod tests {
             .mock("GET", "/repos/owner/repo/issues/37/comments")
             .match_query(mockito::Matcher::Any)
             .with_status(200)
-            .with_body(operator_comment_body("2026-05-25T11:00:00Z"))
+            .with_body(reviewer_marked_comment_body("2026-05-25T11:00:00Z"))
             .create_async()
             .await;
         // Iter 1's Failed path posts a "Revision attempt failed" reply.
@@ -3189,11 +3407,11 @@ mod tests {
                 pr_number: 37,
                 agent_branch: "agent-q".to_string(),
                 last_seen_comment_at: ts("2026-05-25T09:00:00Z"),
-                revisions_applied: 0,
+                auto_revisions_applied: 0,
                 revision_cap: 5,
                 cap_decline_posted: false,
                 code_reviews_applied: 0,
-                code_review_cap: 5,
+                code_review_cap: Some(5),
                 cap_decline_posted_for_code_review: false,
                 last_suggested_rereview_at_revisions_count: None,
                 original_review_head_sha: None,
@@ -3206,7 +3424,7 @@ mod tests {
         // Only iter 1 should call run_revision; script a single Failed
         // outcome. (If iter 2 leaked a call through, the stub would fall
         // back to its empty-script default of Completed, which we'd
-        // notice via state.revisions_applied incrementing.)
+        // notice via state.auto_revisions_applied incrementing.)
         let executor = StubExecutor::new(vec![ExecutorOutcome::Failed {
             reason: "timeout".to_string(),
         }]);
@@ -3232,7 +3450,7 @@ mod tests {
             "iter 1: comment should be processed",
         );
         let state = read_state(&paths, &ws, 37).unwrap().expect("iter 1 state persisted");
-        assert_eq!(state.revisions_applied, 1);
+        assert_eq!(state.auto_revisions_applied, 1);
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
 
         // Iteration 2: same comment is re-fetched, strict-since filter
@@ -3259,7 +3477,7 @@ mod tests {
         post_reply.assert_async().await;
         let state = read_state(&paths, &ws, 37).unwrap().expect("iter 2 state persisted");
         assert_eq!(
-            state.revisions_applied, 1,
+            state.auto_revisions_applied, 1,
             "counter must not be incremented twice",
         );
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
@@ -3296,7 +3514,7 @@ mod tests {
             .mock("GET", "/repos/owner/repo/issues/39/comments")
             .match_query(mockito::Matcher::Any)
             .with_status(200)
-            .with_body(operator_comment_body("2026-05-25T11:00:00Z"))
+            .with_body(reviewer_marked_comment_body("2026-05-25T11:00:00Z"))
             .create_async()
             .await;
         // Iter 2 (Completed) posts a "Revision applied" reply.
@@ -3317,11 +3535,11 @@ mod tests {
                 pr_number: 39,
                 agent_branch: "agent-q".to_string(),
                 last_seen_comment_at: ts("2026-05-25T09:00:00Z"),
-                revisions_applied: 0,
+                auto_revisions_applied: 0,
                 revision_cap: 5,
                 cap_decline_posted: false,
                 code_reviews_applied: 0,
-                code_review_cap: 5,
+                code_review_cap: Some(5),
                 cap_decline_posted_for_code_review: false,
                 last_suggested_rereview_at_revisions_count: None,
                 original_review_head_sha: None,
@@ -3366,7 +3584,7 @@ mod tests {
             "iter 1: AskUser-returning comment was processed",
         );
         let state = read_state(&paths, &ws, 39).unwrap().expect("iter 1 state persisted");
-        assert_eq!(state.revisions_applied, 0);
+        assert_eq!(state.auto_revisions_applied, 0);
         assert_eq!(
             state.last_seen_comment_at,
             ts("2026-05-25T09:00:00Z"),
@@ -3402,7 +3620,7 @@ mod tests {
         );
         post_reply.assert_async().await;
         let state = read_state(&paths, &ws, 39).unwrap().expect("iter 2 state persisted");
-        assert_eq!(state.revisions_applied, 1);
+        assert_eq!(state.auto_revisions_applied, 1);
         assert_eq!(state.last_seen_comment_at, ts("2026-05-25T11:00:00Z"));
 
         token_env_clear(env_var);
@@ -4357,5 +4575,145 @@ mod tests {
         rerun_mock.assert_async().await;
         revision_mock.assert_async().await;
         assert_eq!(state.code_reviews_applied, 1);
+    }
+
+    /// Minimal Approve-verdict reviewer (no auto-revise) for the re-review
+    /// cap tests below. Posts only the `## Code Review (rerun ...)` heading.
+    fn approve_reviewer() -> CodeReviewer {
+        struct ReviewStub;
+        #[async_trait]
+        impl crate::llm::LlmClient for ReviewStub {
+            async fn complete(&self, _prompt: &str) -> anyhow::Result<String> {
+                Ok("VERDICT: Approve\n\n## Summary\n- looks fine\n".to_string())
+            }
+        }
+        CodeReviewer::new(Box::new(ReviewStub), "review the code".to_string())
+    }
+
+    /// Minimal open-PR summary on `agent-q` for the `execute_code_review`
+    /// cap tests.
+    fn pr_summary(number: u64) -> github::PrSummary {
+        github::PrSummary {
+            number,
+            title: "t".to_string(),
+            url: format!("https://github.com/owner/repo/pull/{number}"),
+            state: "open".to_string(),
+            body: None,
+            created_at: ts("2026-05-25T10:00:00Z"),
+            head: github::PrRefSummary {
+                ref_: "agent-q".to_string(),
+            },
+            base: github::PrRefSummary {
+                ref_: "main".to_string(),
+            },
+        }
+    }
+
+    /// a47 Task 5.4: when `code_review_cap` is `None` (unlimited — the
+    /// default), `execute_code_review` never returns `CapExceeded` no
+    /// matter how many re-reviews have already run; it dispatches AND
+    /// increments the (display-only) counter.
+    #[tokio::test]
+    async fn execute_code_review_unlimited_cap_never_blocks() {
+        let reviewer = approve_reviewer();
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+        let mut server = mockito::Server::new_async().await;
+        let heading = server
+            .mock("POST", "/repos/owner/repo/issues/61/comments")
+            .match_body(mockito::Matcher::Regex(r"Code Review \(rerun 101\)".to_string()))
+            .with_status(201)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let pr = pr_summary(61);
+        let mut state = sample_state(61);
+        state.code_review_cap = None; // unlimited
+        state.code_reviews_applied = 100;
+        let outcome = execute_code_review(
+            &ws, &repo, Some(&reviewer), &pr, &[], &mut state,
+            &server.url(), "test-token", "owner", "repo",
+        )
+        .await
+        .expect("execute_code_review succeeds");
+        assert!(
+            matches!(outcome, CodeReviewOutcome::Completed { .. }),
+            "unlimited cap must dispatch even at 100 prior re-reviews; got {outcome:?}"
+        );
+        // The rerun heading omits the `of M` ceiling when unlimited.
+        heading.assert_async().await;
+        assert_eq!(state.code_reviews_applied, 101);
+    }
+
+    /// a47 Task 5.4: when `code_review_cap` is `Some(n)` and the applied
+    /// count is at the ceiling, `execute_code_review` returns
+    /// `CapExceeded` (the dispatcher then posts the one-time decline).
+    #[tokio::test]
+    async fn execute_code_review_set_cap_blocks_at_ceiling() {
+        let reviewer = approve_reviewer();
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+        let server = mockito::Server::new_async().await; // no POST expected
+        let pr = pr_summary(62);
+        let mut state = sample_state(62);
+        state.code_review_cap = Some(3);
+        state.code_reviews_applied = 3;
+        let outcome = execute_code_review(
+            &ws, &repo, Some(&reviewer), &pr, &[], &mut state,
+            &server.url(), "test-token", "owner", "repo",
+        )
+        .await
+        .expect("execute_code_review succeeds");
+        assert!(
+            matches!(outcome, CodeReviewOutcome::CapExceeded),
+            "a set cap at its ceiling must block; got {outcome:?}"
+        );
+        // Counter is NOT incremented when the cap blocks.
+        assert_eq!(state.code_reviews_applied, 3);
+    }
+
+    /// a47 Task 5.5: the automatic-revision counter being AT its cap does
+    /// NOT block a re-review — the two counters are independent. Mirrors
+    /// the code-reviewer spec scenario "Revision cap AND re-review cap are
+    /// independent".
+    #[tokio::test]
+    async fn execute_code_review_independent_of_auto_revision_cap() {
+        let reviewer = approve_reviewer();
+        let (_dir, ws) = init_git_workspace();
+        let mut repo = make_repo("git@github.com:owner/repo.git");
+        repo.local_path = Some(ws.clone());
+        let mut server = mockito::Server::new_async().await;
+        let heading = server
+            .mock("POST", "/repos/owner/repo/issues/63/comments")
+            .match_body(mockito::Matcher::Regex(r"Code Review \(rerun 3 of 5\)".to_string()))
+            .with_status(201)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let pr = pr_summary(63);
+        let mut state = sample_state(63);
+        // Automatic-revision cap reached, but re-reviews remain available.
+        state.auto_revisions_applied = 5;
+        state.revision_cap = 5;
+        state.code_reviews_applied = 2;
+        state.code_review_cap = Some(5);
+        let outcome = execute_code_review(
+            &ws, &repo, Some(&reviewer), &pr, &[], &mut state,
+            &server.url(), "test-token", "owner", "repo",
+        )
+        .await
+        .expect("execute_code_review succeeds");
+        assert!(
+            matches!(outcome, CodeReviewOutcome::Completed { .. }),
+            "auto-revision cap must NOT block re-reviews; got {outcome:?}"
+        );
+        heading.assert_async().await;
+        // Re-review counter advanced; auto counter untouched.
+        assert_eq!(state.code_reviews_applied, 3);
+        assert_eq!(state.auto_revisions_applied, 5);
     }
 }

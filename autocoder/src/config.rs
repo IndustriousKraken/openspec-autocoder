@@ -772,14 +772,21 @@ pub struct ExecutorConfig {
     /// could otherwise exceed the interval and would saturate at zero).
     #[serde(default)]
     pub inter_iteration_jitter_pct: Option<u8>,
-    /// Maximum number of `@<bot> revise ...` rounds applied to a single
-    /// open PR before further triggering comments are silently ignored.
-    /// Default `5`. A value of `0` disables the revision channel
-    /// entirely (sites that want to opt out). Values above `20` are
-    /// clamped to `20` with a WARN log at startup so a runaway operator
-    /// config does not let one PR loop forever.
-    #[serde(default = "default_max_revisions_per_pr")]
-    pub max_revisions_per_pr: u32,
+    /// Maximum number of AUTOMATIC (reviewer-marked, carrying the
+    /// `<!-- reviewer-revision -->` marker) revision rounds applied to a
+    /// single open PR before further automatic triggering comments are
+    /// silently ignored. Human-initiated `@<bot> revise` comments are NOT
+    /// counted against this cap and always process. Default `5`. A value
+    /// of `0` disables the revision channel entirely (sites that want to
+    /// opt out). Values above `20` are clamped to `20` with a WARN log at
+    /// startup so a runaway reviewer-driven chain does not let one PR loop
+    /// forever. The legacy key `max_revisions_per_pr` is accepted as a
+    /// silent serde alias so existing config files load unchanged.
+    #[serde(
+        default = "default_max_auto_revisions_per_pr",
+        alias = "max_revisions_per_pr"
+    )]
+    pub max_auto_revisions_per_pr: u32,
     /// Seconds the `wipe_workspace` control-socket handler waits for the
     /// in-flight per-repo iteration to drain (release its busy marker)
     /// after firing the per-iteration cancel token. The wipe runs
@@ -1033,11 +1040,12 @@ pub fn default_wipe_drain_timeout_secs() -> u64 {
 /// clamped down at startup with a WARN log so the operator notices.
 pub const WIPE_DRAIN_TIMEOUT_CEILING_SECS: u64 = 300;
 
-/// Upper bound on `executor.max_revisions_per_pr`. Anything above this is
-/// clamped down at startup with a WARN log so the operator notices.
-pub const MAX_REVISIONS_PER_PR_CEILING: u32 = 20;
+/// Upper bound on `executor.max_auto_revisions_per_pr`. Anything above
+/// this is clamped down at startup with a WARN log so the operator
+/// notices.
+pub const MAX_AUTO_REVISIONS_PER_PR_CEILING: u32 = 20;
 
-fn default_max_revisions_per_pr() -> u32 {
+fn default_max_auto_revisions_per_pr() -> u32 {
     5
 }
 
@@ -1063,12 +1071,13 @@ impl ExecutorConfig {
         self.inter_iteration_jitter_pct.unwrap_or(10).min(100)
     }
 
-    /// Effective per-PR revision cap. Raw configured values above
-    /// `MAX_REVISIONS_PER_PR_CEILING` are clamped down to it; callers
-    /// that want to detect-and-warn about the original value read
-    /// `self.max_revisions_per_pr` directly first.
-    pub fn max_revisions_per_pr_clamped(&self) -> u32 {
-        self.max_revisions_per_pr.min(MAX_REVISIONS_PER_PR_CEILING)
+    /// Effective per-PR automatic-revision cap. Raw configured values
+    /// above `MAX_AUTO_REVISIONS_PER_PR_CEILING` are clamped down to it;
+    /// callers that want to detect-and-warn about the original value read
+    /// `self.max_auto_revisions_per_pr` directly first.
+    pub fn max_auto_revisions_per_pr_clamped(&self) -> u32 {
+        self.max_auto_revisions_per_pr
+            .min(MAX_AUTO_REVISIONS_PER_PR_CEILING)
     }
 
     /// Effective wipe-workspace drain timeout (seconds). Values above
@@ -1300,13 +1309,16 @@ pub struct ReviewerConfig {
     #[serde(default)]
     pub mode: ReviewerMode,
     /// Per-PR cap on operator-initiated re-reviews triggered via the
-    /// `@<bot> code-review` PR-comment verb. Default `5`. Independent of
-    /// `executor.max_revisions_per_pr`. Values above
-    /// `MAX_CODE_REVIEWS_PER_PR_CEILING` are clamped down at startup with a
-    /// WARN. The original automatic review at PR-open time does NOT count
-    /// against this cap.
-    #[serde(default = "default_max_code_reviews_per_pr")]
-    pub max_code_reviews_per_pr: u32,
+    /// `@<bot> code-review` PR-comment verb. `None` (the default) means
+    /// UNLIMITED — every re-review is a deliberate operator action and
+    /// there is no automatic re-review path, so there is no runaway to
+    /// bound. When set to a positive integer it acts as an opt-in ceiling:
+    /// values above `MAX_CODE_REVIEWS_PER_PR_CEILING` are clamped down at
+    /// startup with a WARN. Independent of
+    /// `executor.max_auto_revisions_per_pr`. The original automatic review
+    /// at PR-open time does NOT count against this cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_code_reviews_per_pr: Option<u32>,
     /// Optional diff-overlap threshold for the daemon to suggest an
     /// operator-initiated re-review after a revision iteration. `None`
     /// disables the suggestion entirely (default). When `Some(threshold)`,
@@ -1330,11 +1342,6 @@ pub struct ReviewerConfig {
 
 fn default_prompt_budget_chars() -> usize {
     2_000_000
-}
-
-/// Default per-PR cap on operator-initiated re-reviews.
-pub fn default_max_code_reviews_per_pr() -> u32 {
-    5
 }
 
 /// Upper bound on `reviewer.max_code_reviews_per_pr`. Anything above this
@@ -2035,8 +2042,12 @@ impl Config {
             )?;
         }
         if let Some(rev) = cfg.reviewer.as_mut() {
-            let (clamped, _) = clamp_max_code_reviews_per_pr(rev.max_code_reviews_per_pr);
-            rev.max_code_reviews_per_pr = clamped;
+            // The re-review cap is an opt-in ceiling: clamp only when the
+            // operator set a value. `None` means unlimited and stays so.
+            if let Some(cap) = rev.max_code_reviews_per_pr {
+                let (clamped, _) = clamp_max_code_reviews_per_pr(cap);
+                rev.max_code_reviews_per_pr = Some(clamped);
+            }
             if let Some(t) = rev.suggest_rereview_threshold
                 && !(0.0..=1.0).contains(&t)
             {
@@ -2982,7 +2993,7 @@ github:
             "perma_stuck_after_failures",
             "startup_jitter_max_secs",
             "inter_iteration_jitter_pct",
-            "max_revisions_per_pr",
+            "max_auto_revisions_per_pr",
             "wipe_drain_timeout_secs",
             "output_format",
             "log_retention_days",
@@ -4673,7 +4684,7 @@ github: {}
     }
 
     #[test]
-    fn max_revisions_per_pr_default_is_5() {
+    fn max_auto_revisions_per_pr_default_is_5() {
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -4686,12 +4697,48 @@ github: {}
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
-        assert_eq!(cfg.executor.max_revisions_per_pr, 5);
-        assert_eq!(cfg.executor.max_revisions_per_pr_clamped(), 5);
+        assert_eq!(cfg.executor.max_auto_revisions_per_pr, 5);
+        assert_eq!(cfg.executor.max_auto_revisions_per_pr_clamped(), 5);
+    }
+
+    /// Task 5.3: the legacy key `executor.max_revisions_per_pr` still loads
+    /// via the serde alias into `max_auto_revisions_per_pr`, AND the new
+    /// key loads identically.
+    #[test]
+    fn legacy_max_revisions_per_pr_key_loads_via_alias() {
+        let legacy = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  max_revisions_per_pr: 8
+github: {}
+"#;
+        let (_dir, path) = write_config(legacy);
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.executor.max_auto_revisions_per_pr, 8);
+
+        let modern = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+  max_auto_revisions_per_pr: 8
+github: {}
+"#;
+        let (_dir2, path2) = write_config(modern);
+        let cfg2 = Config::load_from(&path2).unwrap();
+        assert_eq!(cfg2.executor.max_auto_revisions_per_pr, 8);
     }
 
     #[test]
-    fn max_revisions_per_pr_explicit_zero_disables_feature() {
+    fn max_auto_revisions_per_pr_explicit_zero_disables_feature() {
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -4700,17 +4747,17 @@ repositories:
     poll_interval_sec: 60
 executor:
   kind: claude_cli
-  max_revisions_per_pr: 0
+  max_auto_revisions_per_pr: 0
 github: {}
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
-        assert_eq!(cfg.executor.max_revisions_per_pr, 0);
-        assert_eq!(cfg.executor.max_revisions_per_pr_clamped(), 0);
+        assert_eq!(cfg.executor.max_auto_revisions_per_pr, 0);
+        assert_eq!(cfg.executor.max_auto_revisions_per_pr_clamped(), 0);
     }
 
     #[test]
-    fn max_revisions_per_pr_at_ceiling_is_kept() {
+    fn max_auto_revisions_per_pr_at_ceiling_is_kept() {
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -4719,17 +4766,17 @@ repositories:
     poll_interval_sec: 60
 executor:
   kind: claude_cli
-  max_revisions_per_pr: 20
+  max_auto_revisions_per_pr: 20
 github: {}
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
-        assert_eq!(cfg.executor.max_revisions_per_pr, 20);
-        assert_eq!(cfg.executor.max_revisions_per_pr_clamped(), 20);
+        assert_eq!(cfg.executor.max_auto_revisions_per_pr, 20);
+        assert_eq!(cfg.executor.max_auto_revisions_per_pr_clamped(), 20);
     }
 
     #[test]
-    fn max_revisions_per_pr_above_ceiling_is_clamped() {
+    fn max_auto_revisions_per_pr_above_ceiling_is_clamped() {
         let yaml = r#"
 repositories:
   - url: "git@github.com:owner/repo.git"
@@ -4738,18 +4785,18 @@ repositories:
     poll_interval_sec: 60
 executor:
   kind: claude_cli
-  max_revisions_per_pr: 50
+  max_auto_revisions_per_pr: 50
 github: {}
 "#;
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
-        assert_eq!(cfg.executor.max_revisions_per_pr, 50);
-        assert_eq!(cfg.executor.max_revisions_per_pr_clamped(), 20);
+        assert_eq!(cfg.executor.max_auto_revisions_per_pr, 50);
+        assert_eq!(cfg.executor.max_auto_revisions_per_pr_clamped(), 20);
     }
 
-    /// Task 1.4: a reviewer block with no `max_code_reviews_per_pr` /
-    /// `suggest_rereview_threshold` keys defaults the former to `5` and
-    /// the latter to `None`.
+    /// a47 Task 2.1: a reviewer block with no `max_code_reviews_per_pr` /
+    /// `suggest_rereview_threshold` keys defaults the former to `None`
+    /// (UNLIMITED) and the latter to `None`.
     #[test]
     fn reviewer_code_review_extension_fields_default_round_trip() {
         let yaml = r#"
@@ -4770,7 +4817,7 @@ reviewer:
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
         let r = cfg.reviewer.expect("reviewer block present");
-        assert_eq!(r.max_code_reviews_per_pr, 5);
+        assert_eq!(r.max_code_reviews_per_pr, None);
         assert!(r.suggest_rereview_threshold.is_none());
     }
 
@@ -4809,8 +4856,8 @@ reviewer:
     /// Above-ceiling `reviewer.max_code_reviews_per_pr` clamps down at
     /// startup with the WARN message documented in
     /// `clamp_max_code_reviews_per_pr`. The raw stored value reflects the
-    /// CLAMPED value (matches `executor.max_revisions_per_pr`'s pattern
-    /// where the field is rewritten in place by `Config::load_from`).
+    /// CLAMPED value (matches `executor.max_auto_revisions_per_pr`'s
+    /// pattern where the field is rewritten in place by `Config::load_from`).
     #[test]
     fn reviewer_max_code_reviews_per_pr_above_ceiling_is_clamped() {
         let yaml = r#"
@@ -4832,10 +4879,39 @@ reviewer:
         let (_dir, path) = write_config(yaml);
         let cfg = Config::load_from(&path).unwrap();
         let r = cfg.reviewer.expect("reviewer block present");
-        assert_eq!(r.max_code_reviews_per_pr, MAX_CODE_REVIEWS_PER_PR_CEILING);
+        assert_eq!(
+            r.max_code_reviews_per_pr,
+            Some(MAX_CODE_REVIEWS_PER_PR_CEILING)
+        );
         let (clamped, warn) = clamp_max_code_reviews_per_pr(50);
         assert_eq!(clamped, MAX_CODE_REVIEWS_PER_PR_CEILING);
         assert!(warn.is_some());
+    }
+
+    /// a47 Task 5.4 (config layer): an explicit `max_code_reviews_per_pr`
+    /// below the ceiling loads as `Some(n)`.
+    #[test]
+    fn reviewer_max_code_reviews_per_pr_explicit_loads_as_some() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+reviewer:
+  enabled: true
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
+  max_code_reviews_per_pr: 3
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).unwrap();
+        let r = cfg.reviewer.expect("reviewer block present");
+        assert_eq!(r.max_code_reviews_per_pr, Some(3));
     }
 
     #[test]

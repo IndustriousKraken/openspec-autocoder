@@ -1468,7 +1468,7 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
                 auto_revise: false,
                 prompt_budget_chars: 2_000_000,
                 mode: crate::config::ReviewerMode::Bundled,
-                max_code_reviews_per_pr: 5,
+                max_code_reviews_per_pr: None,
                 suggest_rereview_threshold: None,
                 skip_spec_only_prs: false,
             })
@@ -2256,7 +2256,7 @@ pub(crate) async fn reconfigure_reviewer(
                 auto_revise: false,
                 prompt_budget_chars: 2_000_000,
                 mode: crate::config::ReviewerMode::Bundled,
-                max_code_reviews_per_pr: 5,
+                max_code_reviews_per_pr: None,
                 suggest_rereview_threshold: None,
                 skip_spec_only_prs: false,
             });

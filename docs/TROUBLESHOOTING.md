@@ -124,8 +124,9 @@ No bot reply, no apparent action. Check:
 - **PR is not in autocoder's PR set:** the dispatcher only polls PRs
   whose head branch matches `repositories[].agent_branch`. PRs opened by
   hand on a different branch are not watched.
-- **Feature disabled:** `executor.max_revisions_per_pr: 0` in config
-  disables the dispatcher entirely. Check `config.yaml`.
+- **Feature disabled:** `executor.max_auto_revisions_per_pr: 0` (legacy
+  alias `executor.max_revisions_per_pr: 0`) in config disables the
+  dispatcher entirely. Check `config.yaml`.
 
 ## Agent timed out — what was it doing?
 
