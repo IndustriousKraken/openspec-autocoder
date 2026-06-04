@@ -343,9 +343,14 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         Some(rcfg) if rcfg.enabled => {
             let r = CodeReviewer::from_config(rcfg)
                 .context("initializing code reviewer from config")?;
+            // a64: when the effective kind is `agentic` but the resolved
+            // reviewer CLI is unavailable on this host, degrade to the
+            // `oneshot` HTTP path for the boot (one loud WARN logged inside).
+            let r = crate::code_reviewer::apply_startup_cli_fallback(r);
             tracing::info!(
                 provider = ?rcfg.provider,
                 model = rcfg.model.as_str(),
+                kind = ?r.kind(),
                 "code reviewer enabled"
             );
             Some(Arc::new(r))

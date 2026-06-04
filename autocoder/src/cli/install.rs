@@ -1472,7 +1472,11 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
                 max_code_reviews_per_pr: None,
                 suggest_rereview_threshold: None,
                 skip_spec_only_prs: false,
-                kind: crate::config::ReviewerKind::Oneshot,
+                // a64: track the spec-mandated `reviewer.kind` default
+                // (now `Agentic`) rather than pinning the wizard's output to
+                // `oneshot`. On a host whose reviewer CLI is missing, the
+                // daemon's startup fallback degrades to `oneshot` with a WARN.
+                kind: crate::config::ReviewerKind::default(),
                 command: "claude".to_string(),
             })
         }
@@ -2262,7 +2266,11 @@ pub(crate) async fn reconfigure_reviewer(
                 max_code_reviews_per_pr: None,
                 suggest_rereview_threshold: None,
                 skip_spec_only_prs: false,
-                kind: crate::config::ReviewerKind::Oneshot,
+                // a64: track the spec-mandated `reviewer.kind` default
+                // (now `Agentic`) rather than pinning the wizard's output to
+                // `oneshot`. On a host whose reviewer CLI is missing, the
+                // daemon's startup fallback degrades to `oneshot` with a WARN.
+                kind: crate::config::ReviewerKind::default(),
                 command: "claude".to_string(),
             });
             reviewer.provider = Some(provider);

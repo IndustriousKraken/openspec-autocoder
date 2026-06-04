@@ -477,6 +477,22 @@ github:
 #   #   prompt_budget_chars: 300000
 #   #   mode: per_change
 #   #
+#   # Reviewer transport. `agentic` (the default since a64) runs the
+#   # reviewer as a read-only CLI-wrapped session (via the `command`
+#   # CLI below) that reads files on demand and returns its verdict
+#   # through the `submit_review` MCP tool — no 2M-char prompt-budget
+#   # truncation, schema-validated verdict, discard-and-alert instead of
+#   # default-approve. `oneshot` is the legacy single-shot HTTP path that
+#   # pre-dumps every touched file into one prompt. When the effective
+#   # kind is `agentic` but the resolved reviewer CLI (`command`, resolved
+#   # per provider: anthropic → `claude`, others → `opencode`) is not
+#   # installed on the daemon host, the reviewer logs one startup WARN and
+#   # degrades to the `oneshot` HTTP path for that boot — review is never
+#   # disabled. Set `kind: oneshot` to opt out of agentic and silence the
+#   # warning. Re-evaluated on restart / `autocoder reload`.
+#   # kind: agentic
+#   # command: claude        # the agentic CLI binary; default `claude`
+#   #
 #   # Reviewer-initiated revisions on actionable concerns. When `true`,
 #   # every concern the reviewer marked `should_request_revision: true`
 #   # (with a non-empty `actionable_request`) posts a

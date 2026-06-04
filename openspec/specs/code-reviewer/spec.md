@@ -485,11 +485,18 @@ The reviewer SHALL assemble its prompt using the single-pass substitution helper
 - **AND** the rendered prompt is byte-identical to the prior chained-`.replace` rendering
 
 ### Requirement: Agentic reviewer mode
-The reviewer SHALL support an `agentic` transport selected by `reviewer.kind: agentic` (the field defaults to `oneshot`, the existing HTTP path governed by the **AI-driven code-quality review** requirement). In agentic mode the reviewer runs through the shared `agentic_run` primitive (a56) as a CLI-wrapped session that reads files on demand and returns its verdict via the `submit_review` MCP tool, instead of pre-dumping every touched file into one prompt and scraping a `VERDICT:` line from the response.
+The reviewer SHALL support an `agentic` transport selected by `reviewer.kind: agentic`. The `reviewer.kind` field SHALL default to `agentic`: now that the `opencode` strategy makes the agentic path provider-agnostic (a60), agentic is the preferred default for every provider, not only Anthropic-shaped ones. The `oneshot` HTTP path (governed by the **AI-driven code-quality review** requirement) remains available as an explicit opt-in AND as the automatic startup fallback described below. In agentic mode the reviewer runs through the shared `agentic_run` primitive (a56) as a CLI-wrapped session that reads files on demand and returns its verdict via the `submit_review` MCP tool, instead of pre-dumping every touched file into one prompt and scraping a `VERDICT:` line from the response.
 
 The agentic session SHALL run in a read-only sandbox whose CLI tool permissions are `["Read", "Glob", "Grep"]` ONLY — NO `Bash`, NO `Write`, NO `Edit` — plus the `submit_review` MCP tool, with `ORCH_MCP_ROLE = reviewer`. The rendered prompt SHALL carry the change briefs, the unified diff, AND the list of changed file paths; it SHALL NOT pre-dump full file contents — the agent reads whatever files it needs via `Read`. Because there is no touched-file pre-dump, `reviewer.prompt_budget_chars` does NOT apply in agentic mode AND no `## Skipped (budget exhausted)` truncation occurs.
 
-The agentic path SHALL produce the same `ReviewResult { verdict, per_concern, raw_output }` the one-shot path produces, so per_change dispatch, `auto_revise` revision comments, the operator re-review verb, AND the revision/re-review caps all operate unchanged. The path SHALL honor `reviewer.mode` (per_change → one session per change; bundled → one session per PR) identically to one-shot. `reviewer.command` (default `claude`) selects the CLI; a non-`claude` command resolves its strategy via the a55/a56 `provider → CLI` rule, AND a CLI with no registered strategy SHALL return a clear error naming it. The default `reviewer.kind` is `oneshot` because the `claude` strategy reaches only Anthropic-shaped endpoints; agentic review for other providers becomes available once their CLI strategy is registered.
+The agentic path SHALL produce the same `ReviewResult { verdict, per_concern, raw_output }` the one-shot path produces, so per_change dispatch, `auto_revise` revision comments, the operator re-review verb, AND the revision/re-review caps all operate unchanged. The path SHALL honor `reviewer.mode` (per_change → one session per change; bundled → one session per PR) identically to one-shot. `reviewer.command` (default `claude`) selects the CLI; a non-`claude` command resolves its strategy via the a55/a56 `provider → CLI` rule.
+
+When the effective reviewer kind is `agentic` (whether defaulted OR set explicitly) but the resolved reviewer CLI is unavailable at startup — its strategy is not registered OR its binary is not found on the daemon host — the reviewer SHALL fall back to the `oneshot` HTTP path for that boot AND log ONE loud startup WARN naming the missing CLI AND the remedy (install it, OR set `reviewer.kind: oneshot` to silence the warning). The fallback SHALL NOT disable review: every provider has a working `oneshot` HTTP client, so a missing CLI degrades to HTTP review rather than no review. This keeps the default flip upgrade-safe — an operator whose reviewer points at a provider whose CLI is not installed keeps reviewing via HTTP until they install it. A daemon restart OR `autocoder reload` re-evaluates CLI availability.
+
+#### Scenario: `reviewer.kind` defaults to agentic when the CLI is available
+- **WHEN** `reviewer.kind` is unset AND the resolved reviewer CLI (default `claude`) is available at startup
+- **THEN** the reviewer runs in agentic mode (the default)
+- **AND** no fallback WARN fires
 
 #### Scenario: Agentic session runs in a read-only, no-Bash sandbox
 - **WHEN** `reviewer.kind: agentic` AND a review runs
@@ -520,8 +527,14 @@ The agentic path SHALL produce the same `ReviewResult { verdict, per_concern, ra
 - **WHEN** `reviewer.mode` is the bundled default
 - **THEN** the reviewer runs one session for the whole PR
 
-#### Scenario: A reviewer command with no registered strategy returns a clear error
-- **WHEN** `reviewer.kind: agentic` AND `reviewer.command` resolves (via the a55/a56 `provider → CLI` rule) to a CLI with no registered strategy
-- **THEN** strategy resolution returns an error naming the CLI
-- **AND** no review session is spawned
+#### Scenario: Unavailable reviewer CLI falls back to oneshot
+- **WHEN** the effective reviewer kind is `agentic` (defaulted OR explicit) AND the resolved reviewer CLI is unavailable at startup (its strategy is not registered OR its binary is not found on the daemon host)
+- **THEN** the reviewer logs ONE loud startup WARN naming the CLI AND the remedy (install it, OR set `reviewer.kind: oneshot`)
+- **AND** it uses the `oneshot` HTTP path for that boot — review continues AND is NOT disabled
+- **AND** a daemon restart OR `autocoder reload` re-evaluates availability
+
+#### Scenario: Explicit oneshot is honored as the opt-out
+- **WHEN** `reviewer.kind: oneshot` is set explicitly
+- **THEN** the reviewer uses the HTTP one-shot path AND no agentic session is spawned
+- **AND** no fallback WARN fires (the operator chose `oneshot` deliberately)
 

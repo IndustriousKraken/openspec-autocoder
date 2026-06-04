@@ -2700,6 +2700,10 @@ fn build_reviewer(cfg: Option<&ReviewerConfig>) -> Result<Option<Arc<CodeReviewe
         Some(rcfg) if rcfg.enabled => {
             let r = CodeReviewer::from_config(rcfg)
                 .context("initializing code reviewer from new config")?;
+            // a64: re-evaluate agentic-CLI availability on reload via the
+            // existing `reviewer:` hot-reload path; an unavailable CLI
+            // degrades to `oneshot` for this boot with one loud WARN.
+            let r = crate::code_reviewer::apply_startup_cli_fallback(r);
             Ok(Some(Arc::new(r)))
         }
         _ => Ok(None),

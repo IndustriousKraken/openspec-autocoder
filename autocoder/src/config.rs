@@ -1662,24 +1662,28 @@ pub struct ReviewerConfig {
     /// (preserves canonical behavior: reviewer runs against every PR).
     #[serde(default)]
     pub skip_spec_only_prs: bool,
-    /// a58: reviewer transport. `oneshot` (default) is the existing
-    /// single-shot HTTP path that pre-dumps every touched file into one
-    /// prompt and scrapes a `VERDICT:` line. `agentic` runs the reviewer
-    /// through the shared `agentic_run` primitive (a56) as a CLI-wrapped,
-    /// read-only session that reads files on demand AND returns its
-    /// verdict via the `submit_review` MCP tool. The default stays
-    /// `oneshot`: the agentic path runs through the `claude` strategy,
-    /// which only reaches Anthropic-shaped endpoints, so non-Anthropic
-    /// reviewers cannot go agentic until the opencode strategy lands
-    /// (a60). Hot-applicable via the existing `reviewer:` reload path.
+    /// a58: reviewer transport. `agentic` (the default since a64) runs the
+    /// reviewer through the shared `agentic_run` primitive (a56) as a
+    /// CLI-wrapped, read-only session that reads files on demand AND returns
+    /// its verdict via the `submit_review` MCP tool. `oneshot` is the
+    /// existing single-shot HTTP path that pre-dumps every touched file into
+    /// one prompt and scrapes a `VERDICT:` line. The default flipped to
+    /// `agentic` once the `opencode` strategy (a60) made the agentic path
+    /// provider-agnostic. When the resolved reviewer CLI is unavailable at
+    /// startup, an effective-`agentic` reviewer degrades to the `oneshot`
+    /// HTTP path for that boot with one WARN (review is never disabled); set
+    /// `kind: oneshot` explicitly to opt out of agentic and silence the
+    /// warning. Hot-applicable via the existing `reviewer:` reload path.
     #[serde(default)]
     pub kind: ReviewerKind,
     /// a58: the CLI binary the agentic reviewer wraps. Default `"claude"`.
     /// A non-`claude` command resolves its strategy via the a55/a56
-    /// `provider → CLI` rule AND currently returns a clear "strategy not
-    /// yet implemented" error (only `claude` is registered until a60).
-    /// Ignored when `kind: oneshot`. Hot-applicable via the `reviewer:`
-    /// reload path.
+    /// `provider → CLI` rule (Anthropic → `claude`, other providers →
+    /// `opencode` since a60). When the effective kind is `agentic` but this
+    /// CLI is unavailable at startup (no registered strategy OR the binary
+    /// is not on the daemon host's PATH) the reviewer falls back to
+    /// `oneshot` for that boot. Ignored when `kind: oneshot`. Hot-applicable
+    /// via the `reviewer:` reload path.
     #[serde(default = "default_reviewer_command")]
     pub command: String,
 }
@@ -1722,18 +1726,22 @@ pub enum ReviewerMode {
 
 /// a58: reviewer transport selector (`reviewer.kind`).
 ///
-/// `Oneshot` (default) is the existing HTTP single-shot path governed by
-/// the `AI-driven code-quality review` requirement. `Agentic` runs the
-/// reviewer through the shared `agentic_run` primitive (a56) — a read-only
-/// CLI-wrapped session that reads files on demand AND returns its verdict
-/// via the `submit_review` MCP tool. The default stays `Oneshot` because
-/// the `claude` strategy reaches only Anthropic-shaped endpoints (a60
-/// lifts that restriction).
+/// `Oneshot` is the existing HTTP single-shot path governed by the
+/// `AI-driven code-quality review` requirement. `Agentic` (the default
+/// since a64) runs the reviewer through the shared `agentic_run` primitive
+/// (a56) — a read-only CLI-wrapped session that reads files on demand AND
+/// returns its verdict via the `submit_review` MCP tool. The default is
+/// `Agentic` now that the `opencode` strategy (a60) makes the agentic path
+/// provider-agnostic, so it is the preferred default for every provider —
+/// not only Anthropic-shaped ones. When the resolved reviewer CLI is
+/// unavailable at startup the reviewer degrades to the `Oneshot` HTTP path
+/// for that boot (see the `Agentic reviewer mode` requirement's startup
+/// fallback); review is never disabled.
 #[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewerKind {
-    #[default]
     Oneshot,
+    #[default]
     Agentic,
 }
 
@@ -3720,6 +3728,36 @@ github:
         assert_eq!(cfg.executor.command, "claude");
         assert_eq!(cfg.executor.timeout_secs, 1800);
         assert_eq!(cfg.github.token_env, "GITHUB_TOKEN");
+    }
+
+    /// a64 task 1.1: an unset `reviewer.kind` resolves to `Agentic` (the
+    /// field stays optional in YAML; omitting it picks the default), while
+    /// explicit `oneshot` / `agentic` values are honored verbatim.
+    #[test]
+    fn reviewer_kind_defaults_to_agentic_and_honors_explicit() {
+        // Unset → the post-a64 default.
+        let unset: ReviewerConfig =
+            serde_yml::from_str("enabled: true\nmodel: x\n").expect("minimal reviewer parses");
+        assert_eq!(
+            unset.kind,
+            ReviewerKind::Agentic,
+            "unset reviewer.kind must default to agentic"
+        );
+        assert_eq!(
+            ReviewerKind::default(),
+            ReviewerKind::Agentic,
+            "the ReviewerKind Default impl is agentic"
+        );
+
+        // Explicit values round-trip unchanged.
+        let oneshot: ReviewerConfig =
+            serde_yml::from_str("enabled: true\nmodel: x\nkind: oneshot\n")
+                .expect("explicit oneshot parses");
+        assert_eq!(oneshot.kind, ReviewerKind::Oneshot);
+        let agentic: ReviewerConfig =
+            serde_yml::from_str("enabled: true\nmodel: x\nkind: agentic\n")
+                .expect("explicit agentic parses");
+        assert_eq!(agentic.kind, ReviewerKind::Agentic);
     }
 
     #[test]

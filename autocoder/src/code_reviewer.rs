@@ -876,12 +876,115 @@ fn resolve_reviewer_strategy(
     )
 }
 
+/// Whether `cli` resolves to an executable on the daemon host. An absolute
+/// or path-qualified command (`/usr/local/bin/claude`, `./claude`) is tested
+/// directly; a bare name (`claude`) is searched across the entries in `$PATH`.
+/// No subprocess is spawned — the binary is located, not executed — so the
+/// startup probe is fast AND has no side effects. Used by
+/// [`resolve_startup_reviewer_kind`] for the a64 agentic-CLI fallback.
+fn reviewer_binary_on_path(cli: &str) -> bool {
+    let candidate = Path::new(cli);
+    if candidate.is_absolute() || cli.contains('/') {
+        return candidate.is_file();
+    }
+    match std::env::var_os("PATH") {
+        Some(path_var) => std::env::split_paths(&path_var).any(|dir| dir.join(cli).is_file()),
+        None => false,
+    }
+}
+
+/// Pure decision behind the a64 startup CLI-availability fallback. Given the
+/// configured reviewer transport, the resolved CLI name, AND whether that CLI
+/// is available on the host, return the effective startup transport plus an
+/// optional loud WARN message:
+///
+/// - `Oneshot` configured → `(Oneshot, None)`: the operator opted out of
+///   agentic deliberately, so no probe AND no warning.
+/// - `Agentic` configured AND CLI available → `(Agentic, None)`: agentic runs.
+/// - `Agentic` configured AND CLI unavailable → `(Oneshot, Some(warn))`: the
+///   reviewer degrades to the HTTP one-shot path for the boot (review is NOT
+///   disabled) AND the caller logs `warn`, which names the missing CLI AND the
+///   remedy. The same disposition applies whether `agentic` was the default or
+///   set explicitly.
+///
+/// Separated from the host probe ([`resolve_startup_reviewer_kind`]) so tests
+/// assert the decision without depending on what is installed on the host —
+/// mirroring [`crate::config::clamp_max_code_reviews_per_pr`]'s observable
+/// `Option<String>` warning return.
+pub fn startup_reviewer_kind_decision(
+    configured: ReviewerKind,
+    cli: &str,
+    cli_available: bool,
+) -> (ReviewerKind, Option<String>) {
+    match configured {
+        ReviewerKind::Oneshot => (ReviewerKind::Oneshot, None),
+        ReviewerKind::Agentic if cli_available => (ReviewerKind::Agentic, None),
+        ReviewerKind::Agentic => {
+            let warn = format!(
+                "reviewer.kind is `agentic` but the resolved reviewer CLI `{cli}` is unavailable \
+                 on the daemon host (no registered strategy, OR the binary is not on PATH); \
+                 falling back to the `oneshot` HTTP review path for this boot — review is NOT \
+                 disabled. Install `{cli}` to enable the agentic reviewer, OR set \
+                 `reviewer.kind: oneshot` to silence this warning. A daemon restart or \
+                 `autocoder reload` re-evaluates availability."
+            );
+            (ReviewerKind::Oneshot, Some(warn))
+        }
+    }
+}
+
+/// Resolve the reviewer's effective transport at startup AND on
+/// `autocoder reload`, applying the a64 agentic-CLI-availability fallback.
+///
+/// When the configured kind is `agentic` (defaulted OR explicit) this probes
+/// the host: the CLI is "available" only when its strategy is registered
+/// (resolved via the a55/a56 `provider → CLI` rule) AND its binary is found on
+/// PATH. An unavailable CLI degrades to `oneshot` for the boot, returning the
+/// loud WARN for the caller to log exactly once. When the configured kind is
+/// `oneshot` no probe runs. The daemon wires this in at the two reviewer
+/// construction sites (startup in `cli::run`, reload in `control_socket`), so
+/// availability is evaluated once per boot/reload — never per polling
+/// iteration. This supersedes a58's "a reviewer CLI with no registered
+/// strategy returns a clear error, no session" behavior for the reviewer role:
+/// instead of erroring, the reviewer degrades to HTTP review.
+pub fn resolve_startup_reviewer_kind(reviewer: &CodeReviewer) -> (ReviewerKind, Option<String>) {
+    if reviewer.kind() != ReviewerKind::Agentic {
+        return (reviewer.kind(), None);
+    }
+    // "Available" requires BOTH a registered strategy AND a binary on PATH.
+    let cli_available =
+        resolve_reviewer_strategy(reviewer).is_ok() && reviewer_binary_on_path(&reviewer.command);
+    startup_reviewer_kind_decision(ReviewerKind::Agentic, &reviewer.command, cli_available)
+}
+
+/// Apply the a64 startup CLI-availability fallback to a freshly built
+/// reviewer. When the effective kind is `agentic` but the resolved reviewer
+/// CLI is unavailable, log ONE loud WARN (naming the missing CLI AND the
+/// remedy) AND return the reviewer with its kind overridden to `oneshot` for
+/// the boot — review continues over HTTP, never disabled. Otherwise the
+/// reviewer is returned unchanged. Both reviewer construction sites (startup
+/// in `cli::run`, reload in `control_socket::build_reviewer`) call this, so
+/// availability is evaluated once per boot/reload — the live polling-loop
+/// reviewer slot already carries the resolved kind, so no per-iteration probe
+/// (and no re-warn) occurs.
+pub fn apply_startup_cli_fallback(reviewer: CodeReviewer) -> CodeReviewer {
+    let (effective, warn) = resolve_startup_reviewer_kind(&reviewer);
+    if let Some(msg) = warn {
+        tracing::warn!("{msg}");
+    }
+    reviewer.with_kind(effective)
+}
+
 /// Run the agentic reviewer against `ctx` (a58). Production entry point for
 /// both the polling-loop initial review AND the operator-triggered rerun
 /// composer. Resolves the CLI strategy (`claude` for Anthropic, `opencode`
-/// for non-Anthropic providers — a60; erroring before any spawn only for a
-/// CLI with no registered strategy), then dispatches one session per
-/// `reviewer.mode()`.
+/// for non-Anthropic providers — a60), then dispatches one session per
+/// `reviewer.mode()`. This is reached only when the reviewer's effective
+/// kind is `agentic`; under a64 the startup CLI-availability check
+/// ([`resolve_startup_reviewer_kind`]) has already degraded an
+/// unavailable-CLI reviewer to `oneshot` for the boot, so the strategy
+/// resolution here succeeds in the common case (a later availability change
+/// still surfaces as `Err`, handled by the caller).
 pub async fn run_agentic_review(
     reviewer: &CodeReviewer,
     ctx: &ReviewContext,
@@ -2678,14 +2781,21 @@ this is not yaml: at all: ::: {{{ broken
         }
     }
 
-    /// 4.1: `kind: oneshot` is the default AND its prompt + parsed output
-    /// are byte-identical to the pre-change one-shot path (the agentic
-    /// branch is never taken).
+    /// The `oneshot` transport's prompt + parsed output are byte-identical
+    /// to the pre-change one-shot path (the agentic branch is never taken).
+    /// `CodeReviewer::new` is the test-only constructor and keeps `oneshot`
+    /// so this surface exercises the HTTP path directly; the operator-facing
+    /// `reviewer.kind` config default is `agentic` since a64 (see
+    /// `config::ReviewerKind` AND `startup_reviewer_kind_decision`).
     #[tokio::test]
-    async fn oneshot_kind_is_default_and_byte_identical() {
+    async fn oneshot_kind_is_byte_identical() {
         let (client, captured) = stub_with_capture("VERDICT: Pass\n\nthe review body");
         let reviewer = CodeReviewer::new(client, "{{diff}}".to_string());
-        assert_eq!(reviewer.kind(), ReviewerKind::Oneshot, "default kind is oneshot");
+        assert_eq!(
+            reviewer.kind(),
+            ReviewerKind::Oneshot,
+            "the test-only `new` constructor keeps oneshot"
+        );
         let ctx = ctx_with_diff("DIFFTEXT");
         let result = review_pr_at_state_with(&reviewer, &ctx).await.unwrap();
         // The one-shot prompt is the unchanged render: the bare diff for a
@@ -2694,6 +2804,127 @@ this is not yaml: at all: ::: {{{ broken
         assert_eq!(prompt, "DIFFTEXT");
         assert_eq!(result.verdict, Verdict::Approve);
         assert_eq!(result.markdown, "the review body");
+    }
+
+    // =================================================================
+    // a64: startup CLI-availability fallback (tasks 3.1–3.4)
+    // =================================================================
+
+    /// An absolute path to a file that is guaranteed to exist on the host
+    /// (the running test binary). `reviewer_binary_on_path` treats a
+    /// path-qualified command as "available" when the file exists, giving the
+    /// "CLI present" branch a deterministic input that does not depend on
+    /// what bare-name binaries happen to be on the CI `$PATH`.
+    fn present_cli() -> String {
+        std::env::current_exe()
+            .expect("current_exe resolves in tests")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// A bare command name guaranteed NOT to be on any sane `$PATH`, so
+    /// `reviewer_binary_on_path` reports it missing.
+    const MISSING_CLI: &str = "autocoder-a64-definitely-not-installed-cli";
+
+    /// 3.1: unset `reviewer.kind` resolves to agentic AND, with an available
+    /// reviewer CLI, the startup resolver keeps the reviewer agentic with no
+    /// fallback WARN.
+    #[test]
+    fn unset_kind_with_available_cli_stays_agentic() {
+        // Unset kind defaults to agentic (the `new` test constructor is
+        // oneshot, so model the config default explicitly).
+        assert_eq!(ReviewerKind::default(), ReviewerKind::Agentic);
+
+        let (client, _captured) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "{{diff}}".to_string())
+            .with_kind(ReviewerKind::Agentic)
+            .with_command(present_cli());
+        let (effective, warn) = resolve_startup_reviewer_kind(&reviewer);
+        assert_eq!(effective, ReviewerKind::Agentic, "available CLI → agentic");
+        assert!(warn.is_none(), "no WARN when the CLI is available: {warn:?}");
+    }
+
+    /// 3.2 / 3.3: an effective-agentic reviewer (defaulted OR explicit) whose
+    /// CLI is unavailable degrades to `oneshot` for the boot AND emits exactly
+    /// one WARN naming the CLI + the remedy. Review is NOT disabled — the
+    /// effective kind is `oneshot`, not "off".
+    #[test]
+    fn agentic_with_unavailable_cli_falls_back_to_oneshot_with_warn() {
+        let (client, _captured) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "{{diff}}".to_string())
+            .with_kind(ReviewerKind::Agentic)
+            .with_command(MISSING_CLI.to_string());
+        let (effective, warn) = resolve_startup_reviewer_kind(&reviewer);
+        assert_eq!(
+            effective,
+            ReviewerKind::Oneshot,
+            "missing CLI → oneshot fallback (review continues, not disabled)"
+        );
+        let warn = warn.expect("missing CLI must produce a fallback WARN");
+        assert!(
+            warn.contains(MISSING_CLI),
+            "WARN must name the missing CLI: {warn}"
+        );
+        assert!(
+            warn.contains("oneshot"),
+            "WARN must name the `reviewer.kind: oneshot` remedy: {warn}"
+        );
+    }
+
+    /// 3.4: an explicit `oneshot` reviewer is honored with no probe, no
+    /// agentic session, AND no fallback WARN — even when the CLI is missing
+    /// (the operator opted out deliberately).
+    #[test]
+    fn explicit_oneshot_is_honored_without_warn() {
+        let (client, _captured) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "{{diff}}".to_string())
+            .with_kind(ReviewerKind::Oneshot)
+            .with_command(MISSING_CLI.to_string());
+        let (effective, warn) = resolve_startup_reviewer_kind(&reviewer);
+        assert_eq!(effective, ReviewerKind::Oneshot);
+        assert!(warn.is_none(), "explicit oneshot never warns: {warn:?}");
+    }
+
+    /// The pure decision function covers all four arms independently of any
+    /// host probe (tasks 3.1–3.4 condensed): oneshot is always honored
+    /// warning-free; agentic + available stays agentic; agentic + unavailable
+    /// degrades to oneshot with a CLI-naming, remedy-naming WARN.
+    #[test]
+    fn startup_kind_decision_truth_table() {
+        // Oneshot configured: honored, never warns, regardless of availability.
+        for available in [true, false] {
+            assert_eq!(
+                startup_reviewer_kind_decision(ReviewerKind::Oneshot, "claude", available),
+                (ReviewerKind::Oneshot, None)
+            );
+        }
+        // Agentic + available CLI: agentic, no warn.
+        assert_eq!(
+            startup_reviewer_kind_decision(ReviewerKind::Agentic, "claude", true),
+            (ReviewerKind::Agentic, None)
+        );
+        // Agentic + unavailable CLI: oneshot + WARN naming the CLI and remedy.
+        let (kind, warn) =
+            startup_reviewer_kind_decision(ReviewerKind::Agentic, "qwen-cli", false);
+        assert_eq!(kind, ReviewerKind::Oneshot);
+        let warn = warn.expect("unavailable agentic CLI warns");
+        assert!(warn.contains("qwen-cli"), "names the CLI: {warn}");
+        assert!(warn.contains("oneshot"), "names the remedy: {warn}");
+    }
+
+    /// `reviewer_binary_on_path` finds a real file via an absolute path AND
+    /// reports a bare name absent from `$PATH` as missing — the primitive the
+    /// startup resolver's binary check rests on.
+    #[test]
+    fn binary_on_path_detects_present_and_missing() {
+        assert!(
+            reviewer_binary_on_path(&present_cli()),
+            "an absolute path to an existing file is available"
+        );
+        assert!(
+            !reviewer_binary_on_path(MISSING_CLI),
+            "a bare name not on PATH is unavailable"
+        );
     }
 
     /// 4.2: the agentic sandbox advertises Read/Glob/Grep + `submit_review`
