@@ -3,13 +3,13 @@
 ## 1. Integration spike (per non-claude strategy)
 
 - [ ] 1.1 Confirm `opencode` headless resume: capture a session ID from a non-interactive `opencode run`, then continue it non-interactively via `--session <id>` (or `--continue`) with a new prompt. Confirm the answer reaches the same conversation.
-- [ ] 1.2 Confirm `gemini` headless resume: under the one-session-per-workspace serializer, `gemini --resume` restores the correct prior session for that project hash; confirm a queried UUID (`--list-sessions`) also works if needed.
-- [ ] 1.3 Confirm the per-CLI **scoped** session-delete that targets only one session and leaves settings/memory/auth intact: `gemini --delete-session <id>`; the specific Claude `<uuid>` record under `~/.claude/projects/<hash>/`; the `opencode` session-delete path. Confirm a session handle is capturable for EVERY role (implementer AND single-shot audits/reviewer) so each run can delete its own session.
+- [ ] 1.2 Confirm `antigravity` headless resume by **probing the installed `agy`** (`agy --help`, inspect `~/.antigravity/`; the binary is installed and runnable — the sandbox denies only `curl`/`git push`): whether `agy` can restore a prior session non-interactively and the exact mechanism/flag. If Antigravity has no headless resume, the AskUser path falls through to requeue (§5.3) — acceptable, just confirm which. Do NOT guess from training (it predates Antigravity).
+- [ ] 1.3 Confirm the per-CLI **scoped** session-delete that targets only one session and leaves settings/memory/auth intact: Antigravity's session delete under `~/.antigravity/`; the specific Claude `<uuid>` record under `~/.claude/projects/<hash>/`; the `opencode` session-delete path. Confirm a session handle is capturable for EVERY role (implementer AND single-shot audits/reviewer) so each run can delete its own session.
 
 ## 2. CliStrategy trait: resume + scoped delete
 
-- [ ] 2.1 Add to the `CliStrategy` trait (a56) a headless-resume mechanism (given a session handle + the answer prompt, build the resume invocation) AND a scoped session-delete (given a session handle, delete ONLY that session's record). Implement for `claude` (`session_id` → `--resume`; delete the `<uuid>` record), `opencode` (`--session`; its delete path), AND `gemini` (`--resume`; `--delete-session`).
-- [ ] 2.2 Capture the session handle for each run: `claude` from the streamed `session_id`; `opencode` from its emitted/queryable session ID; `gemini` via "latest for this project hash" (serializer-guaranteed) or a `--list-sessions` UUID. Persist the handle where the cleanup (and, for the implementer, the resume) step can reach it.
+- [ ] 2.1 Add to the `CliStrategy` trait (a56) a headless-resume mechanism (given a session handle + the answer prompt, build the resume invocation) AND a scoped session-delete (given a session handle, delete ONLY that session's record). Implement for `claude` (`session_id` → `--resume`; delete the `<uuid>` record), `opencode` (`--session`; its delete path), AND `antigravity` (its spike-confirmed resume + session delete).
+- [ ] 2.2 Capture the session handle for each run: `claude` from the streamed `session_id`; `opencode` from its emitted/queryable session ID; `antigravity` via its session handle (spike-confirmed; state under `~/.antigravity/`). Persist the handle where the cleanup (and, for the implementer, the resume) step can reach it.
 
 ## 3. Strategy-agnostic implementer
 
@@ -40,4 +40,4 @@
 
 - [ ] 7.1 `cargo test` passes for the autocoder crate.
 - [ ] 7.2 `cargo clippy --all-targets -- -D warnings` is clean.
-- [ ] 7.3 `openspec validate a70-capture-mode-implementer --strict` passes.
+- [ ] 7.3 `openspec validate a70-strategy-agnostic-implementer --strict` passes.

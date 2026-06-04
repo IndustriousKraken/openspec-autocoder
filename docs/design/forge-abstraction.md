@@ -6,7 +6,7 @@
 
 A user already runs autocoder against a private GitLab instance, and self-hosted GitLab is concentrated where it matters for this tool: security/pentest shops whose tooling gets flagged by GitHub scanners, air-gapped or compliance-controlled infra, and operators who keep their own code on their own servers. The core loop already works there *by accident* — the git half (clone / fetch / branch / commit / push) uses the raw URL and the `origin` remote, so it is host-neutral. What does NOT work is everything routed through `github.rs`: `parse_repo_url` literally rejects non-GitHub URLs (test `parse_url_rejects_non_github`), and the REST calls are GitHub-shaped (`/repos/{owner}/{repo}/pulls`). So a GitLab user today gets autonomous implementation + a pushed agent branch (especially under `auto_submit_pr: false`), and opens the MR by hand.
 
-Making the forge swappable turns that into first-class support — and is the same trait-with-providers shape already used for `CliStrategy` (claude / opencode / gemini).
+Making the forge swappable turns that into first-class support — and is the same trait-with-providers shape already used for `CliStrategy` (claude / opencode / antigravity).
 
 ## The abstraction
 
