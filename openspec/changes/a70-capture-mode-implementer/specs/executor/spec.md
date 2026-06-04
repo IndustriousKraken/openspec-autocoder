@@ -23,21 +23,37 @@ The streaming (live-log) implementer path remains claude-specific (per a60's `Op
 - **THEN** it runs in streaming mode with the live log, parsed `final_answer`, AND `session_id` exactly as before
 - **AND** an operator who configures no implementer CLI gets `claude`
 
-### Requirement: Agentic implementer session lifecycle: resume, requeue-on-failure, surgical prune
-The agentic implementer SHALL own the lifecycle of the session it creates per change.
+### Requirement: Every agentic role cleans up the session it creates
+Any role that runs through `agentic_run` — the implementer AND every single-shot agentic role (the advisory audits, the reviewer, the contradiction check, AND any future agentic role) — SHALL remove the session it created from the CLI's session store when the role is done with it. The CLIs persist a transcript per invocation in the operator's home directory (`~/.claude/projects/<hash>/`, `~/.gemini/tmp/<hash>/chats/`, OpenCode's store); left alone these accumulate without bound. The principle: a run that creates litter — even when it is upstream software writing into the home directory — cleans it up at the end.
 
-**AskUser retains the session.** On an AskUser outcome, the implementer SHALL submit the question via the outcome relay AND end the run with the change in the waiting state, retaining (NOT pruning) the agentic session.
+"Done with it" is role-dependent: a single-shot role (which never resumes) prunes on run completion; the implementer (which may retain a session across AskUser — see the implementer-resume requirement) prunes on its terminal outcome (the change archives/completes OR fails terminally).
 
-**The operator's answer resumes the same session.** When the operator answers, the implementer SHALL resume the same agentic session via the resolved strategy's native headless resume mechanism — `claude` via the captured `session_id`, `opencode` via `--session <id>`, `gemini` via `--resume` — delivering the answer into that session.
+The prune SHALL be surgical: it removes ONLY the specific session record the run created, addressed by that session's identifier, via the CLI's own session-delete mechanism (`gemini --delete-session <id>`; the specific Claude `<uuid>` record under `~/.claude/projects/<hash>/`; OpenCode's session deletion). It SHALL NOT remove settings, memory/context files (`CLAUDE.md` / `GEMINI.md` / project memories), credentials, OR the generated MCP config — only the session record. (Claude's store is known to grow unbounded and to risk destroying settings and auth when the disk fills, so the prune is deliberately surgical rather than a directory wipe.)
 
-**Resume failure requeues; there is no stash fallback.** If the session cannot be restored (not found, corrupt, OR expired by the CLI's own retention), the implementer SHALL NOT fall back to a fresh-run-with-answer. It SHALL treat the attempt as a retryable failure AND requeue the change via the existing failure-counter path (repeated failures escalate per the existing perma-stuck policy). No stash-and-recombine path exists.
+#### Scenario: A single-shot agentic role prunes its session on completion
+- **WHEN** an advisory audit, the reviewer, OR the contradiction check finishes its agentic run
+- **THEN** the session record it created is removed by its identifier via the CLI's session-delete mechanism
+- **AND** nothing it created persists in the CLI's session store
 
-**Terminal outcome prunes only the created session.** On a terminal outcome (the change archives/completes OR fails terminally), the implementer SHALL prune ONLY the specific session it created — addressed by that session's identifier, via the CLI's own session-delete mechanism (`claude`: the session's `<uuid>` record under `~/.claude/projects/<hash>/`; `gemini --delete-session <id>`; `opencode` session deletion). The prune SHALL NOT remove settings, memory/context files (`CLAUDE.md` / `GEMINI.md` / project memories), credentials, OR the generated MCP config — only the session record. (Claude's store is known to grow unbounded and to risk destroying settings and auth when the disk fills, so the prune is deliberately surgical rather than a directory wipe.)
+#### Scenario: The implementer prunes on terminal outcome, not while waiting
+- **WHEN** the implementer reaches a terminal outcome (archives/completes OR fails terminally)
+- **THEN** the session it created is removed
+- **AND** while the change is instead waiting on an AskUser answer, the session is retained (NOT pruned)
+
+#### Scenario: The prune is surgical
+- **WHEN** any agentic role prunes the session it created
+- **THEN** only that session's record is removed, addressed by its identifier
+- **AND** settings, memory/context files, credentials, AND the generated MCP config remain intact
+
+### Requirement: Implementer resumes its session on AskUser; resume failure requeues
+On an AskUser outcome, the implementer SHALL submit the question via the outcome relay AND end the run with the change in the waiting state, retaining the agentic session (the cleanup requirement does NOT prune a retained session until the implementer's terminal outcome). When the operator answers, the implementer SHALL resume the same agentic session via the resolved strategy's native headless resume mechanism — `claude` via the captured `session_id`, `opencode` via `--session <id>`, `gemini` via `--resume` — delivering the answer into that session.
+
+If the session cannot be restored (not found, corrupt, OR expired by the CLI's own retention), the implementer SHALL NOT fall back to a fresh-run-with-answer. It SHALL treat the attempt as a retryable failure AND requeue the change via the existing failure-counter path (repeated failures escalate per the existing perma-stuck policy). No stash-and-recombine path exists.
 
 #### Scenario: AskUser retains the session and waits
-- **WHEN** a capture-mode implementer returns an AskUser outcome
+- **WHEN** the implementer returns an AskUser outcome
 - **THEN** the question is posted via the outcome relay AND the change enters the waiting state
-- **AND** the agentic session is NOT pruned
+- **AND** the agentic session is retained
 
 #### Scenario: The operator's answer resumes the same session
 - **WHEN** the operator answers a waiting AskUser AND the session is restorable
@@ -48,8 +64,3 @@ The agentic implementer SHALL own the lifecycle of the session it creates per ch
 - **THEN** the implementer does NOT start a fresh-run-with-answer
 - **AND** the change is requeued as a retryable failure via the existing failure-counter path
 - **AND** repeated resume failures escalate under the existing perma-stuck policy
-
-#### Scenario: Session prune is scoped to the created session
-- **WHEN** the implementer prunes its session on a terminal outcome
-- **THEN** only that session's record is removed, addressed by its identifier via the CLI's session-delete mechanism
-- **AND** settings, memory/context files, credentials, AND the generated MCP config remain intact
