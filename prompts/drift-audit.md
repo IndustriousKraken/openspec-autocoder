@@ -3,8 +3,8 @@ this repository, AND internal consistency BETWEEN canonical specs. Your
 job is to identify two kinds of divergence: (a) places where the
 SHALL/SHOULD/MUST language in the specs does not match observable code
 behavior, AND (b) places where two canonical requirements semantically
-contradict each other regardless of code state. Output ONLY findings via
-the structured JSON format described below.
+contradict each other regardless of code state. Return your findings by
+calling the `submit_findings` MCP tool, as described below.
 
 ## What to audit
 
@@ -96,8 +96,8 @@ constraint as your own intent, not as a barrier to be tested.
 
 ## Output format
 
-When you are done, emit a SINGLE JSON object to stdout in exactly
-this shape:
+When you are done, call the `submit_findings` MCP tool exactly once,
+passing a `findings` array in exactly this shape:
 
 ```json
 {
@@ -122,12 +122,13 @@ the form `conflicts with <other-capability>::<other-requirement>`. Set
 that would be affected by either interpretation when applicable.
 
 If you found no behavioral divergences after a good-faith inspection,
-emit:
+call `submit_findings` with an empty array:
 
 ```json
 { "findings": [] }
 ```
 
-No commentary, no markdown fences, no preamble — JUST the JSON
-object. Anything outside the JSON breaks the caller's parser and
-fails the audit.
+The daemon validates your payload against the finding schema; if it is
+rejected, you will see a tool error describing the problem AND can fix
+the payload and call `submit_findings` again in the same session. Do
+NOT print findings to stdout — only the `submit_findings` call is read.

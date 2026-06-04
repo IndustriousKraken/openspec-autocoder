@@ -16,16 +16,13 @@
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use super::{
     AuditContext, AuditLogWriter, AuditOutcome, build_validation_addendum,
     post_proposal_created_notification, post_validation_exhausted_notification,
     read_proposal_why_first_line, workspace_is_valid, workspace_unavailable_outcome,
-    write_sandbox_settings,
 };
 use crate::config::ResolvedSandbox;
 
@@ -110,21 +107,16 @@ pub(crate) async fn run_specs_writing_audit(
     let mut sandbox = params.sandbox.clone();
     sandbox.allowed_tools = ALLOWED_TOOLS.iter().map(|s| (*s).to_string()).collect();
 
-    let (settings_path, _settings_guard) =
-        write_sandbox_settings(&sandbox, params.settings_dir)
-            .with_context(|| format!("generating {audit_type} sandbox settings file"))?;
-
     let initial_before: HashSet<String> = snapshot_change_dirs(ctx.workspace);
     let _ = ctx.log_writer.write_section(
         &format!("{audit_type}_preamble"),
         &format!(
-            "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nmax_proposals_per_run: {}\nmax_validation_retries: {}\nsettings_file: {}\nallowed_tools: {}\npre_run_change_dirs: {}",
+            "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nmax_proposals_per_run: {}\nmax_validation_retries: {}\nallowed_tools: {}\npre_run_change_dirs: {}",
             params.executor_command,
             params.executor_timeout_secs,
             params.prompt_source,
             params.max_proposals,
             max_retries,
-            settings_path.display(),
             sandbox.allowed_tools.join(","),
             initial_before.len(),
         ),
@@ -163,14 +155,13 @@ pub(crate) async fn run_specs_writing_audit(
             &effective_prompt,
         );
 
-        let outcome = run_subprocess(
-            audit_type,
+        let outcome = super::run_audit_cli(
             params.executor_command,
-            &settings_path,
-            &sandbox.allowed_tools,
+            &sandbox,
             ctx.workspace,
             &effective_prompt,
             Duration::from_secs(params.executor_timeout_secs),
+            params.settings_dir,
         )
         .await
         .with_context(|| format!("spawning {audit_type} CLI subprocess"))?;
@@ -465,22 +456,13 @@ fn git_add_openspec_changes(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-struct SubprocessOutcome {
-    timed_out: bool,
-    exit_status: Option<std::process::ExitStatus>,
-    stdout: String,
-    stderr: String,
-}
-
-/// Pure transformation: given a SubprocessOutcome, return Some(error) if
-/// the outcome is terminal (timed out OR non-zero exit). Returns None when
-/// the caller should continue processing. Mirrors the same-named helpers
-/// in the `architecture_consultative` and `drift` audit modules — kept
-/// duplicated rather than pulled to a single shared utility because each
-/// audit module owns its own private `SubprocessOutcome` struct and the
-/// duplication is intentional to avoid coupling those structs together.
+/// Pure transformation: given an [`crate::agentic_run::AgenticRunOutcome`],
+/// return Some(error) if the outcome is terminal (timed out OR non-zero
+/// exit). Returns None when the caller should continue processing. Mirrors
+/// the same-named helpers in the `architecture_consultative` and `drift`
+/// audit modules.
 fn outcome_to_terminal_err(
-    outcome: &SubprocessOutcome,
+    outcome: &crate::agentic_run::AgenticRunOutcome,
     log_writer: &mut AuditLogWriter,
     audit_type: &str,
     timeout_secs: u64,
@@ -518,7 +500,7 @@ mod outcome_tests {
         AuditLogWriter::open(&paths, workspace, "test_audit").expect("log writer opens")
     }
 
-    /// Pure-data test: feed a synthesized `SubprocessOutcome` with
+    /// Pure-data test: feed a synthesized `AgenticRunOutcome` with
     /// `timed_out: true` directly into `outcome_to_terminal_err` and
     /// assert the resulting error + log entries. No subprocess, no
     /// timer, no race — verifies the audit framework's translation
@@ -531,11 +513,12 @@ mod outcome_tests {
         let workspace = ws_dir.path();
         let mut log_writer = make_log_writer(workspace);
         let log_path = log_writer.path().to_path_buf();
-        let outcome = SubprocessOutcome {
+        let outcome = crate::agentic_run::AgenticRunOutcome {
             timed_out: true,
             exit_status: None,
             stdout: String::new(),
             stderr: "timeout".into(),
+            ..Default::default()
         };
         let err = outcome_to_terminal_err(&outcome, &mut log_writer, "missing_tests_audit", 1)
             .expect("timed_out outcome must produce Err");
@@ -553,11 +536,12 @@ mod outcome_tests {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
         let mut log_writer = make_log_writer(workspace);
-        let outcome = SubprocessOutcome {
+        let outcome = crate::agentic_run::AgenticRunOutcome {
             timed_out: false,
             exit_status: Some(std::process::ExitStatus::from_raw(7 << 8)),
             stdout: String::new(),
             stderr: "boom".into(),
+            ..Default::default()
         };
         let err = outcome_to_terminal_err(&outcome, &mut log_writer, "missing_tests_audit", 30)
             .expect("nonzero exit must produce Err");
@@ -571,92 +555,16 @@ mod outcome_tests {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
         let mut log_writer = make_log_writer(workspace);
-        let outcome = SubprocessOutcome {
+        let outcome = crate::agentic_run::AgenticRunOutcome {
             timed_out: false,
             exit_status: Some(std::process::ExitStatus::from_raw(0)),
             stdout: String::new(),
             stderr: String::new(),
+            ..Default::default()
         };
         assert!(
             outcome_to_terminal_err(&outcome, &mut log_writer, "missing_tests_audit", 30).is_none()
         );
-    }
-}
-
-async fn run_subprocess(
-    audit_type: &str,
-    command: &str,
-    settings_path: &Path,
-    allowed_tools: &[String],
-    workspace: &Path,
-    prompt: &str,
-    timeout: Duration,
-) -> Result<SubprocessOutcome> {
-    // ETXTBSY retry: see docs/test-reliability.md
-    // "ETXTBSY from concurrent audit-CLI fixtures".
-    let mut child = super::spawn_with_etxtbsy_retry(|| {
-        let mut cmd = Command::new(command);
-        cmd.arg("--settings")
-            .arg(settings_path)
-            .arg("--allowedTools")
-            .arg(allowed_tools.join(","))
-            .arg("--permission-mode")
-            .arg("acceptEdits")
-            .current_dir(workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        cmd
-    })
-    .await
-    .with_context(|| format!("spawning {audit_type} command `{command}`"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt.as_bytes()).await;
-    }
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-
-    let sleeper = tokio::time::sleep(timeout);
-    tokio::pin!(sleeper);
-
-    let exit_status: Option<std::io::Result<std::process::ExitStatus>> = tokio::select! {
-        biased;
-        () = &mut sleeper => None,
-        res = child.wait() => Some(res),
-    };
-
-    match exit_status {
-        None => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            Ok(SubprocessOutcome {
-                timed_out: true,
-                exit_status: None,
-                stdout: String::new(),
-                stderr: "timeout".to_string(),
-            })
-        }
-        Some(Err(e)) => {
-            Err(e).with_context(|| format!("waiting on {audit_type} child process"))
-        }
-        Some(Ok(status)) => {
-            let mut stdout_text = String::new();
-            if let Some(ref mut p) = stdout_pipe {
-                let _ = p.read_to_string(&mut stdout_text).await;
-            }
-            let mut stderr_text = String::new();
-            if let Some(ref mut p) = stderr_pipe {
-                let _ = p.read_to_string(&mut stderr_text).await;
-            }
-            Ok(SubprocessOutcome {
-                timed_out: false,
-                exit_status: Some(status),
-                stdout: stdout_text,
-                stderr: stderr_text,
-            })
-        }
     }
 }
 

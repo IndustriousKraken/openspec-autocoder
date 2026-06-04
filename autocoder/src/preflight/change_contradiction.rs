@@ -1,4 +1,4 @@
-//! Change-internal contradiction pre-flight check (a19).
+//! Change-internal contradiction pre-flight check (a19; agentic transport a59).
 //!
 //! `a17`'s archivability check catches structural defects (MODIFIED title
 //! missing from canonical, ADDED title already present). It does NOT
@@ -8,37 +8,95 @@
 //! `config.yaml`"). Pure-text logic cannot reliably detect this;
 //! contradictions hide in domain language across multiple SHALL clauses.
 //!
-//! This module runs a configurable LLM against the change's concatenated
-//! spec-delta files AND parses the response as a list of contradictions.
-//! Failures (network, parse, malformed JSON) FAIL OPEN — we log a WARN
-//! and return an empty Vec, matching the conservative bias documented in
-//! the proposal: a flaky pre-flight should not block work.
+//! a59 migrated this check off the `LlmClient::complete` + stdout-JSON
+//! transport onto a56's shared [`crate::agentic_run`] primitive: the check
+//! runs a CLI-wrapped agentic session in a read-only sandbox (`Read`,
+//! `Glob`, `Grep` — NO `Bash`/`Write`/`Edit`) with `ORCH_MCP_ROLE =
+//! contradiction_check` AND the `submit_contradictions` MCP tool. The agent
+//! reads the change's spec-delta files on demand AND returns its findings by
+//! calling `submit_contradictions` instead of emitting JSON on stdout.
+//!
+//! The check is **fail-open by contract**: a session error (spawn, timeout,
+//! a resolved CLI strategy that is not registered yet), a schema-rejected
+//! submission the agent never corrects, OR a session that ends with no
+//! submission all log a WARN and yield an empty `Vec` ("no contradictions
+//! found"). The daemon never gates iteration progress on the check.
 
-use crate::llm::LlmClient;
+use crate::agentic_run::ResolvedModel;
 use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
 use serde::Deserialize;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// The MCP role AND submission routing key the contradiction check uses.
+/// The per-execution MCP child advertises `submit_contradictions` ONLY when
+/// `ORCH_MCP_ROLE` equals this value; the daemon-side schema validator is
+/// registered under the same key (a56/a59).
+pub const CONTRADICTION_CHECK_ROLE: &str = "contradiction_check";
+
+/// Read-only CLI tool permissions for the contradiction-check sandbox. NO
+/// `Bash`, NO `Write`, NO `Edit` — the agent reads the change's spec-delta
+/// files on demand AND returns its findings through `submit_contradictions`.
+pub const AGENTIC_CONTRADICTION_ALLOWED_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
+
+/// Wall-clock cap for one contradiction-check session. Mirrors the agentic
+/// reviewer's bound (a58): the oneshot path had no analogous timeout (the
+/// HTTP client owned it); this bounds the wrapped CLI subprocess.
+const AGENTIC_CONTRADICTION_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// The full `--allowedTools` list the contradiction-check sandbox grants:
+/// the read-only file tools PLUS the qualified `submit_contradictions` MCP
+/// tool. Notably absent: `Bash`, `Write`, `Edit`. Exposed so tests can
+/// assert the advertised surface.
+pub fn agentic_contradiction_allowed_tools() -> Vec<String> {
+    let mut tools: Vec<String> = AGENTIC_CONTRADICTION_ALLOWED_TOOLS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    if let Some(t) =
+        crate::mcp_askuser_server::submission_tool_name_for_role(CONTRADICTION_CHECK_ROLE)
+    {
+        tools.push(crate::mcp_askuser_server::qualified_tool_name(t));
+    }
+    tools
+}
 
 /// Runtime context for the contradiction-check pre-flight.
 ///
-/// `llm` is the configured `LlmClient` (Anthropic or OpenAI-compatible
-/// per the operator's `executor.change_internal_contradiction_check_llm`
-/// block). `prompt_template` is the resolved prompt body — either the
-/// embedded default OR the override file's contents.
+/// a59: holds the agentic-transport pieces instead of an `LlmClient`. The
+/// `model` tuple (a56) is translated into the wrapped CLI's model-selection
+/// mechanism by the resolved [`crate::agentic_run::CliStrategy`]; its
+/// `provider` also selects which CLI strategy runs. `command` is the wrapped
+/// CLI binary (`executor.command`). `prompt_template` is the resolved prompt
+/// body — either the embedded default OR the override file's contents.
 ///
-/// Constructed once at daemon startup when the check is enabled. The
-/// polling loop reads it on every iteration via [`current`].
+/// Constructed once at daemon startup when the check is enabled. The polling
+/// loop reads it on every iteration via [`current`].
 pub struct ContradictionCheckCtx {
-    pub llm: Arc<dyn LlmClient>,
+    /// Wrapped CLI binary the agentic session spawns (`executor.command`).
+    pub command: String,
+    /// Resolved `(provider, model, api_base_url, api_key)` tuple (a56). The
+    /// `claude` strategy translates it into `ANTHROPIC_*`; its `provider`
+    /// selects the CLI strategy (Anthropic → `claude` until a60).
+    pub model: ResolvedModel,
+    /// Resolved prompt body (embedded default OR override file contents).
     pub prompt_template: String,
     /// Redaction-safe `<provider>/<model>` attribution (a49) for the
-    /// configured contradiction-check LLM. Surfaced as
+    /// configured contradiction-check model. Surfaced as
     /// `*Contradiction-check: <provider>/<model>*` on the operator-facing
     /// findings alert. `None` only for test contexts built without a
     /// resolved config block.
     pub attribution: Option<String>,
+    /// Test-only injected `submit_contradictions` submission, bypassing the
+    /// CLI subprocess AND the control socket. `Some(Some(p))` stands in for
+    /// a recorded payload; `Some(None)` simulates "agent never submitted";
+    /// `None` (default/production) uses the real CLI + `consume_submission`
+    /// path.
+    #[cfg(test)]
+    pub test_submission: Option<Option<serde_json::Value>>,
 }
 
 tokio::task_local! {
@@ -76,7 +134,7 @@ pub const EMBEDDED_PROMPT: &str =
 
 /// Resolve the prompt template. `None` returns the embedded default.
 /// `Some(path)` reads the override file; an empty file (after `trim`) is
-/// an error so the daemon does NOT feed an empty prompt to the LLM.
+/// an error so the daemon does NOT feed an empty prompt to the session.
 pub fn load_prompt_template(override_path: Option<&Path>) -> Result<String> {
     match override_path {
         None => Ok(EMBEDDED_PROMPT.to_string()),
@@ -89,7 +147,7 @@ pub fn load_prompt_template(override_path: Option<&Path>) -> Result<String> {
             })?;
             if body.trim().is_empty() {
                 return Err(anyhow!(
-                    "change-contradiction-check prompt override at {} is empty; refusing to feed an empty prompt to the LLM",
+                    "change-contradiction-check prompt override at {} is empty; refusing to feed an empty prompt to the session",
                     path.display()
                 ));
             }
@@ -98,8 +156,8 @@ pub fn load_prompt_template(override_path: Option<&Path>) -> Result<String> {
     }
 }
 
-/// One contradiction surfaced by [`check_change_internal_contradictions`].
-/// Mirrors the LLM's JSON output shape one-for-one.
+/// One contradiction surfaced by [`run_agentic_contradiction_check`].
+/// Mirrors the `submit_contradictions` payload's entry shape one-for-one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContradictionFinding {
     pub requirement_a: String,
@@ -107,141 +165,46 @@ pub struct ContradictionFinding {
     pub summary: String,
 }
 
+/// One entry as it arrives in the `submit_contradictions` payload.
 #[derive(Debug, Deserialize)]
-struct LlmResponse {
-    contradictions: Vec<LlmContradiction>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LlmContradiction {
+struct RawContradiction {
     requirement_a: String,
     requirement_b: String,
     summary: String,
 }
 
+/// The `submit_contradictions` payload shape.
+#[derive(Debug, Deserialize)]
+struct RawContradictionSubmission {
+    contradictions: Vec<RawContradiction>,
+}
+
 const PROMPT_DELIMITER: &str = "\n\n---\n\n";
 const RESPONSE_EXCERPT_MAX: usize = 200;
 
-/// Run the contradiction check for `change_slug` under `workspace_root`.
+/// Validate AND map a consumed `submit_contradictions` payload into
+/// [`ContradictionFinding`]s (a59). This is BOTH the daemon-side schema
+/// validator (registered via [`register_contradiction_submission_schema`]
+/// with its `Ok` value discarded) AND the consume-time mapper — so a payload
+/// that records successfully is exactly one that maps, and the two can never
+/// drift (mirrors the advisory audits' `payload_to_findings` and the
+/// reviewer's `payload_to_review_result`).
 ///
-/// Reads every `<workspace>/openspec/changes/<change>/specs/<cap>/spec.md`,
-/// concatenates them under `## File:` headers (same convention the
-/// reviewer uses), appends them to the prompt template, invokes
-/// `llm.complete(prompt)`, AND parses the response as
-/// `{ contradictions: [...] }`.
-///
-/// Returns an empty `Vec` on every fail-open path: no spec deltas to
-/// check, LLM transport error, malformed response. WARN logs name the
-/// specific failure so operators can investigate via journalctl.
-pub async fn check_change_internal_contradictions(
-    workspace_root: &Path,
-    change_slug: &str,
-    llm: &dyn LlmClient,
-    prompt_template: &str,
-) -> Result<Vec<ContradictionFinding>> {
-    let input = build_spec_input(workspace_root, change_slug)?;
-    let prompt = format!(
-        "{template}{delim}{input}",
-        template = prompt_template.trim_end(),
-        delim = PROMPT_DELIMITER,
-        input = input,
-    );
-    let response = match llm.complete(&prompt).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(
-                change = %change_slug,
-                "change-contradiction-check LLM call failed; treating as no contradictions found (fail-open): {e:#}"
-            );
-            return Ok(Vec::new());
-        }
-    };
-    match parse_llm_response(&response) {
-        Ok(findings) => Ok(findings),
-        Err(e) => {
-            let excerpt: String =
-                response.chars().take(RESPONSE_EXCERPT_MAX).collect();
-            tracing::warn!(
-                change = %change_slug,
-                "change-contradiction-check response did not parse as expected JSON; treating as no contradictions found (fail-open): {e:#}. Response excerpt: {excerpt}"
-            );
-            Ok(Vec::new())
-        }
-    }
-}
-
-/// Concatenate every `<workspace>/openspec/changes/<change>/specs/<cap>/spec.md`
-/// into a single input string. Each file is prefixed by
-/// `## File: openspec/changes/<change>/specs/<cap>/spec.md` so the LLM
-/// can name the source when reporting a finding. Returns the empty
-/// string when the change has no `specs/` subdir or no per-capability
-/// spec files — the caller passes that through to the LLM, which
-/// reports `{"contradictions": []}` on an empty input.
-fn build_spec_input(workspace_root: &Path, change_slug: &str) -> Result<String> {
-    let specs_dir = workspace_root
-        .join("openspec/changes")
-        .join(change_slug)
-        .join("specs");
-    if !specs_dir.is_dir() {
-        return Ok(String::new());
-    }
-    let read = std::fs::read_dir(&specs_dir)
-        .with_context(|| format!("reading {}", specs_dir.display()))?;
-    let mut caps: Vec<(String, std::path::PathBuf)> = Vec::new();
-    for entry in read.flatten() {
-        let name = match entry.file_name().into_string() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        caps.push((name, path));
-    }
-    caps.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut out = String::new();
-    for (cap_name, cap_path) in caps {
-        let spec_md = cap_path.join("spec.md");
-        if !spec_md.is_file() {
-            continue;
-        }
-        let body = match std::fs::read_to_string(&spec_md) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    capability = %cap_name,
-                    "change-contradiction-check: cannot read {}: {e}; skipping",
-                    spec_md.display()
-                );
-                continue;
-            }
-        };
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&format!(
-            "## File: openspec/changes/{change}/specs/{cap}/spec.md\n\n",
-            change = change_slug,
-            cap = cap_name,
-        ));
-        out.push_str(&body);
-        if !body.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    Ok(out)
-}
-
-/// Extract `contradictions: [...]` from the LLM's response. Accepts EITHER a
-/// bare JSON object OR a JSON object wrapped in a Markdown code fence
-/// (```json ... ``` or ``` ... ```) — both are common LLM output shapes.
-fn parse_llm_response(raw: &str) -> Result<Vec<ContradictionFinding>> {
-    let candidate = extract_json_object(raw)?;
-    let parsed: LlmResponse = serde_json::from_str(candidate)
-        .context("deserializing LLM response as {\"contradictions\": [...]}")?;
-    Ok(parsed
+/// Returns `Err(reason)` (a correction-suitable string) when the payload is
+/// missing the `contradictions` array, when it is not an array, OR when an
+/// entry is missing a required field. `record_submission` surfaces the
+/// reason to the agent as a correctable tool error.
+pub(crate) fn payload_to_contradictions(
+    payload: &serde_json::Value,
+) -> std::result::Result<Vec<ContradictionFinding>, String> {
+    let sub: RawContradictionSubmission =
+        serde_json::from_value(payload.clone()).map_err(|e| {
+            format!(
+                "submit_contradictions: payload does not match the expected shape \
+                 {{ contradictions: [{{ requirement_a, requirement_b, summary }}] }}: {e}"
+            )
+        })?;
+    Ok(sub
         .contradictions
         .into_iter()
         .map(|c| ContradictionFinding {
@@ -252,109 +215,338 @@ fn parse_llm_response(raw: &str) -> Result<Vec<ContradictionFinding>> {
         .collect())
 }
 
-/// Locate the JSON object inside the LLM response. Strips a leading
-/// Markdown code fence if present, then trims to the first balanced
-/// `{...}` so trailing prose doesn't confuse the parser.
-fn extract_json_object(raw: &str) -> Result<&str> {
-    let trimmed = raw.trim();
-    // Strip Markdown code fence if present.
-    let fenced = if let Some(rest) = trimmed.strip_prefix("```json") {
-        rest.trim_start_matches('\n')
-    } else if let Some(rest) = trimmed.strip_prefix("```") {
-        rest.trim_start_matches('\n')
-    } else {
-        trimmed
+/// Register the contradiction check's `submit_contradictions` payload schema
+/// (a59) with the daemon's submission store, under
+/// [`CONTRADICTION_CHECK_ROLE`]. The validator IS [`payload_to_contradictions`]
+/// with its `Ok` value discarded, so a payload that records successfully is
+/// exactly one that maps. Called once at daemon startup alongside the
+/// advisory audits' AND the reviewer's schema registration.
+pub fn register_contradiction_submission_schema(
+    store: &crate::submission_store::SubmissionStore,
+) {
+    store.register_schema(
+        CONTRADICTION_CHECK_ROLE,
+        Arc::new(|p: &serde_json::Value| payload_to_contradictions(p).map(|_| ())),
+    );
+}
+
+/// Outcome of one contradiction-check session: the consumed submission (or
+/// `None` when the agent recorded nothing valid) AND a truncated stdout
+/// excerpt for the no-submission fail-open WARN.
+struct ContradictionSessionOutcome {
+    submission: Option<serde_json::Value>,
+    stdout_excerpt: String,
+}
+
+/// Abstracts "run ONE contradiction-check session AND drain its submission"
+/// so the orchestration ([`run_agentic_contradiction_check_with_runner`]) is
+/// unit-testable without spawning a CLI. Production is
+/// [`CliContradictionSessionRunner`]; tests inject canned submissions.
+#[async_trait]
+trait ContradictionSessionRunner: Send + Sync {
+    async fn run_session(&self, prompt: &str) -> Result<ContradictionSessionOutcome>;
+}
+
+/// Production session runner: writes the per-execution MCP config
+/// (`ORCH_MCP_ROLE = contradiction_check`), runs the wrapped CLI through
+/// [`crate::agentic_run::agentic_run`] in a read-only capture sandbox, AND
+/// drains the stored submission via the control socket. Mirrors the agentic
+/// reviewer's `CliReviewSessionRunner`.
+struct CliContradictionSessionRunner<'a> {
+    workspace: &'a Path,
+    strategy: &'a dyn crate::agentic_run::CliStrategy,
+    model: &'a ResolvedModel,
+    settings_dir: Option<&'a Path>,
+    timeout: Duration,
+}
+
+#[async_trait]
+impl ContradictionSessionRunner for CliContradictionSessionRunner<'_> {
+    async fn run_session(&self, prompt: &str) -> Result<ContradictionSessionOutcome> {
+        // Write the per-execution MCP config advertising `submit_contradictions`.
+        // `change == CONTRADICTION_CHECK_ROLE` keys the submission-store entry;
+        // this runner consumes the same key after exit.
+        crate::executor::claude_cli::ClaudeCliExecutor::write_mcp_config(
+            self.workspace,
+            CONTRADICTION_CHECK_ROLE,
+            Some(CONTRADICTION_CHECK_ROLE),
+        )
+        .context("writing contradiction-check MCP config")?;
+
+        let result = crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+            workspace: self.workspace,
+            change: CONTRADICTION_CHECK_ROLE,
+            strategy: self.strategy,
+            prompt,
+            sandbox: crate::agentic_run::SandboxConfig {
+                allowed_tools: agentic_contradiction_allowed_tools(),
+                disallowed_bash_patterns: Vec::new(),
+                disallowed_read_paths: Vec::new(),
+                deny_writes: true,
+            },
+            model: Some(self.model),
+            output_mode: crate::agentic_run::OutputMode::Capture,
+            timeout: self.timeout,
+            paths: None,
+            settings_dir: self.settings_dir,
+            include_autocoder_tools: true,
+            emit_stream_json_in_capture: false,
+            resume_session_id: None,
+            track_subprocess_marker: false,
+            etxtbsy_retry_spawn: true,
+        })
+        .await;
+
+        // Always remove the config we wrote, regardless of run outcome.
+        crate::executor::claude_cli::ClaudeCliExecutor::delete_mcp_config(self.workspace);
+
+        let outcome = result.context("spawning contradiction-check subprocess")?;
+        if outcome.timed_out {
+            return Err(anyhow!(
+                "contradiction-check session timed out after {}s",
+                self.timeout.as_secs()
+            ));
+        }
+        let stdout_excerpt: String = outcome.stdout.chars().take(RESPONSE_EXCERPT_MAX).collect();
+        let submission =
+            crate::audits::try_consume_submission(self.workspace, CONTRADICTION_CHECK_ROLE).await;
+        Ok(ContradictionSessionOutcome {
+            submission,
+            stdout_excerpt,
+        })
+    }
+}
+
+/// Test-only session runner that stands in for the CLI + control socket:
+/// returns a canned submission (`Some(payload)`) or `None` for the
+/// no-submission case, with an empty stdout excerpt. Defined at module level
+/// (not inside `mod tests`) so the `#[cfg(test)]` seam in
+/// [`run_agentic_contradiction_check`] can construct it.
+#[cfg(test)]
+struct CannedContradictionRunner {
+    submission: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ContradictionSessionRunner for CannedContradictionRunner {
+    async fn run_session(&self, _prompt: &str) -> Result<ContradictionSessionOutcome> {
+        Ok(ContradictionSessionOutcome {
+            submission: self.submission.clone(),
+            stdout_excerpt: String::new(),
+        })
+    }
+}
+
+/// Run the contradiction check for `change_slug` under `workspace_root`
+/// (a59). Production entry point invoked from the polling loop's pre-flight.
+///
+/// Resolves the CLI strategy from the model's provider (a56); a provider
+/// whose CLI has no registered strategy yet (a60) fails open here with a
+/// WARN AND no subprocess is spawned. Otherwise runs one agentic session in
+/// the read-only sandbox, drains the `submit_contradictions` submission, AND
+/// maps it to findings.
+///
+/// Returns an empty `Vec` on EVERY fail-open path: strategy-not-registered,
+/// session error (spawn/timeout), a never-corrected schema rejection, OR a
+/// session that ends with no submission. WARN logs name the specific failure
+/// so operators can investigate via journalctl.
+pub async fn run_agentic_contradiction_check(
+    ctx: &ContradictionCheckCtx,
+    workspace_root: &Path,
+    change_slug: &str,
+) -> Vec<ContradictionFinding> {
+    // Test seam: an injected submission stands in for the CLI + control
+    // socket so the orchestration is exercised without spawning a process.
+    #[cfg(test)]
+    if let Some(injected) = &ctx.test_submission {
+        let runner = CannedContradictionRunner {
+            submission: injected.clone(),
+        };
+        return run_agentic_contradiction_check_with_runner(
+            ctx,
+            workspace_root,
+            change_slug,
+            &runner,
+        )
+        .await;
+    }
+
+    let strategy = match crate::agentic_run::strategy_for_provider(
+        ctx.model.provider,
+        ctx.command.clone(),
+        Vec::new(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                change = %change_slug,
+                "change-contradiction-check CLI strategy unavailable; treating as no contradictions found (fail-open): {e:#}"
+            );
+            return Vec::new();
+        }
     };
-    let fenced = fenced
-        .trim_end()
-        .strip_suffix("```")
-        .map(str::trim_end)
-        .unwrap_or(fenced);
-    // Find the first `{` and the matching `}` (balance-aware).
-    let bytes = fenced.as_bytes();
-    let start = bytes
-        .iter()
-        .position(|b| *b == b'{')
-        .ok_or_else(|| anyhow::anyhow!("response contains no JSON object"))?;
-    let mut depth: i32 = 0;
-    let mut end: Option<usize> = None;
-    let mut in_str = false;
-    let mut escape = false;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
-        if escape {
-            escape = false;
-            continue;
+    let runner = CliContradictionSessionRunner {
+        workspace: workspace_root,
+        strategy: strategy.as_ref(),
+        model: &ctx.model,
+        settings_dir: None,
+        timeout: AGENTIC_CONTRADICTION_TIMEOUT,
+    };
+    run_agentic_contradiction_check_with_runner(ctx, workspace_root, change_slug, &runner).await
+}
+
+/// Orchestration shared by production AND tests. Builds the prompt, runs one
+/// session via `runner`, AND applies the fail-open policy uniformly: a
+/// session error, a missing submission, OR a submission that fails re-mapping
+/// each WARN AND yield an empty `Vec`.
+async fn run_agentic_contradiction_check_with_runner(
+    ctx: &ContradictionCheckCtx,
+    workspace_root: &Path,
+    change_slug: &str,
+    runner: &dyn ContradictionSessionRunner,
+) -> Vec<ContradictionFinding> {
+    let prompt = build_contradiction_prompt(&ctx.prompt_template, workspace_root, change_slug);
+    match runner.run_session(&prompt).await {
+        Err(e) => {
+            tracing::warn!(
+                change = %change_slug,
+                "change-contradiction-check session failed; treating as no contradictions found (fail-open): {e:#}"
+            );
+            Vec::new()
         }
-        if in_str {
-            match b {
-                b'\\' => escape = true,
-                b'"' => in_str = false,
-                _ => {}
+        Ok(outcome) => match outcome.submission {
+            None => {
+                tracing::warn!(
+                    change = %change_slug,
+                    "change-contradiction-check session ended with no submit_contradictions submission; treating as no contradictions found (fail-open). Session output excerpt: {}",
+                    outcome.stdout_excerpt
+                );
+                Vec::new()
             }
-            continue;
-        }
-        match b {
-            b'"' => in_str = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(i + 1);
-                    break;
+            Some(payload) => match payload_to_contradictions(&payload) {
+                Ok(findings) => findings,
+                Err(e) => {
+                    // The payload already passed `record_submission`'s
+                    // validator, so a re-map failure is an internal invariant
+                    // violation — but the check is fail-open, so WARN AND
+                    // proceed rather than propagate.
+                    tracing::warn!(
+                        change = %change_slug,
+                        "change-contradiction-check submission failed re-validation; treating as no contradictions found (fail-open): {e}"
+                    );
+                    Vec::new()
                 }
-            }
-            _ => {}
+            },
+        },
+    }
+}
+
+/// Build the session prompt: the resolved template body, the change's
+/// spec-delta file PATHS (the agent reads them on demand via `Read` —
+/// contents are NOT inlined), AND the `submit_contradictions` instruction.
+fn build_contradiction_prompt(
+    template: &str,
+    workspace_root: &Path,
+    change_slug: &str,
+) -> String {
+    let paths = spec_delta_paths(workspace_root, change_slug);
+    let mut out = String::new();
+    out.push_str(template.trim_end());
+    out.push_str(PROMPT_DELIMITER);
+    out.push_str("# This change's spec-delta files\n\n");
+    if paths.is_empty() {
+        out.push_str(
+            "(this change has no spec-delta files under \
+             openspec/changes/<change>/specs/ — there is nothing to check)\n",
+        );
+    } else {
+        out.push_str(
+            "Read each of these files with the `Read` tool, then analyze them together for \
+             internal contradictions:\n\n",
+        );
+        for p in &paths {
+            out.push_str(&format!("- {p}\n"));
         }
     }
-    let end = end.ok_or_else(|| anyhow::anyhow!("response JSON object is unbalanced"))?;
-    Ok(&fenced[start..end])
+    out.push_str(
+        "\nWhen your analysis is complete, call the `submit_contradictions` MCP tool exactly \
+         once with `{ contradictions: [{ requirement_a, requirement_b, summary }] }` (an empty \
+         array means \"no contradictions found\"). Do NOT print the result to stdout — the \
+         daemon reads it ONLY from `submit_contradictions`.\n",
+    );
+    out
+}
+
+/// Enumerate every `openspec/changes/<change>/specs/<cap>/spec.md` path
+/// (workspace-relative) for the change, sorted by capability. Returns an
+/// empty `Vec` when the change has no `specs/` subdir or no per-capability
+/// spec files. The path-listing form replaces a59's predecessor, which
+/// concatenated file CONTENTS into the prompt; the agent now reads them on
+/// demand via the read-only sandbox.
+fn spec_delta_paths(workspace_root: &Path, change_slug: &str) -> Vec<String> {
+    let specs_dir = workspace_root
+        .join("openspec/changes")
+        .join(change_slug)
+        .join("specs");
+    let Ok(read) = std::fs::read_dir(&specs_dir) else {
+        return Vec::new();
+    };
+    let mut caps: Vec<(String, PathBuf)> = Vec::new();
+    for entry in read.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            caps.push((name, path));
+        }
+    }
+    caps.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = Vec::new();
+    for (cap_name, cap_path) in caps {
+        if cap_path.join("spec.md").is_file() {
+            out.push(format!(
+                "openspec/changes/{change_slug}/specs/{cap_name}/spec.md"
+            ));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use std::sync::Mutex;
+    use crate::config::LlmProvider;
     use tempfile::TempDir;
 
-    struct FixedResponseLlm {
-        body: Mutex<Option<String>>,
-        error: Mutex<Option<String>>,
-        last_prompt: Mutex<Option<String>>,
-    }
-
-    impl FixedResponseLlm {
-        fn ok(body: &str) -> Self {
-            Self {
-                body: Mutex::new(Some(body.to_string())),
-                error: Mutex::new(None),
-                last_prompt: Mutex::new(None),
-            }
-        }
-        fn err(msg: &str) -> Self {
-            Self {
-                body: Mutex::new(None),
-                error: Mutex::new(Some(msg.to_string())),
-                last_prompt: Mutex::new(None),
-            }
-        }
-        fn last_prompt(&self) -> String {
-            self.last_prompt
-                .lock()
-                .unwrap()
-                .clone()
-                .expect("complete() was never called")
-        }
-    }
+    /// Test runner that simulates a session error (spawn/timeout/strategy).
+    struct ErrorContradictionRunner;
 
     #[async_trait]
-    impl LlmClient for FixedResponseLlm {
-        async fn complete(&self, prompt: &str) -> Result<String> {
-            *self.last_prompt.lock().unwrap() = Some(prompt.to_string());
-            if let Some(msg) = self.error.lock().unwrap().clone() {
-                return Err(anyhow::anyhow!(msg));
-            }
-            Ok(self.body.lock().unwrap().clone().unwrap_or_default())
+    impl ContradictionSessionRunner for ErrorContradictionRunner {
+        async fn run_session(&self, _prompt: &str) -> Result<ContradictionSessionOutcome> {
+            Err(anyhow!("simulated session spawn error"))
+        }
+    }
+
+    fn test_model() -> ResolvedModel {
+        ResolvedModel {
+            provider: LlmProvider::Anthropic,
+            model: "claude-test".into(),
+            api_base_url: "https://example.invalid".into(),
+            api_key: "sk-test".into(),
+        }
+    }
+
+    fn test_ctx() -> ContradictionCheckCtx {
+        ContradictionCheckCtx {
+            command: "claude".into(),
+            model: test_model(),
+            prompt_template: "TEST_PROMPT".into(),
+            attribution: None,
+            test_submission: None,
         }
     }
 
@@ -377,88 +569,58 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn empty_contradictions_array_returns_empty_vec() {
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path();
-        write_change_spec(
-            ws,
-            "c1",
-            "cap",
-            "## ADDED Requirements\n\n### Requirement: New\nThe system SHALL new.\n",
-        );
-        let llm = FixedResponseLlm::ok(r#"{"contradictions": []}"#);
-        let out = check_change_internal_contradictions(ws, "c1", &llm, "template")
-            .await
-            .unwrap();
+    // ---- payload_to_contradictions (the registered validator + mapper) ----
+
+    #[test]
+    fn empty_contradictions_array_maps_to_empty_vec() {
+        let payload = serde_json::json!({ "contradictions": [] });
+        let out = payload_to_contradictions(&payload).expect("empty array deserializes");
         assert!(out.is_empty());
     }
 
-    #[tokio::test]
-    async fn single_contradiction_is_parsed() {
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path();
-        write_change_spec(
-            ws,
-            "c1",
-            "cap",
-            "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n\n### Requirement: B\nThe system SHALL b.\n",
-        );
-        let body = r#"{
-          "contradictions": [
-            {
-              "requirement_a": "A",
-              "requirement_b": "B",
-              "summary": "A and B cannot both hold"
-            }
-          ]
-        }"#;
-        let llm = FixedResponseLlm::ok(body);
-        let out = check_change_internal_contradictions(ws, "c1", &llm, "template")
-            .await
-            .unwrap();
+    #[test]
+    fn single_contradiction_is_mapped() {
+        let payload = serde_json::json!({
+            "contradictions": [
+                { "requirement_a": "A", "requirement_b": "B", "summary": "A and B cannot both hold" }
+            ]
+        });
+        let out = payload_to_contradictions(&payload).expect("deserializes");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].requirement_a, "A");
         assert_eq!(out[0].requirement_b, "B");
         assert_eq!(out[0].summary, "A and B cannot both hold");
     }
 
-    #[tokio::test]
-    async fn malformed_json_fails_open_with_empty_vec() {
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path();
-        write_change_spec(
-            ws,
-            "c1",
-            "cap",
-            "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
-        );
-        let llm = FixedResponseLlm::ok("this is not json at all");
-        let out = check_change_internal_contradictions(ws, "c1", &llm, "template")
-            .await
-            .unwrap();
-        assert!(out.is_empty(), "malformed JSON must fail open: {out:?}");
+    #[test]
+    fn missing_contradictions_key_is_correctable_error() {
+        let payload = serde_json::json!({ "results": [] });
+        let err = payload_to_contradictions(&payload).expect_err("missing key must error");
+        assert!(err.contains("contradictions"), "got: {err}");
     }
 
-    #[tokio::test]
-    async fn llm_transport_error_fails_open_with_empty_vec() {
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path();
-        write_change_spec(
-            ws,
-            "c1",
-            "cap",
-            "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
-        );
-        let llm = FixedResponseLlm::err("simulated network error");
-        let out = check_change_internal_contradictions(ws, "c1", &llm, "template")
-            .await
-            .unwrap();
-        assert!(out.is_empty(), "transport error must fail open: {out:?}");
+    #[test]
+    fn non_array_contradictions_is_correctable_error() {
+        let payload = serde_json::json!({ "contradictions": "not-an-array" });
+        let err = payload_to_contradictions(&payload).expect_err("non-array must error");
+        assert!(err.contains("contradictions"), "got: {err}");
     }
 
+    #[test]
+    fn entry_missing_field_is_correctable_error() {
+        let payload = serde_json::json!({
+            "contradictions": [ { "requirement_a": "A", "summary": "no b" } ]
+        });
+        let err =
+            payload_to_contradictions(&payload).expect_err("missing required field must error");
+        assert!(err.contains("submit_contradictions"), "got: {err}");
+    }
+
+    // ---- orchestration (run_agentic_contradiction_check_with_runner) ----
+
+    /// A schema-valid non-empty submission is consumed into findings.
     #[tokio::test]
-    async fn fenced_json_response_is_parsed() {
+    async fn valid_submission_is_consumed_into_findings() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
         write_change_spec(
@@ -467,31 +629,132 @@ mod tests {
             "cap",
             "## ADDED Requirements\n\n### Requirement: A\nThe system SHALL a.\n",
         );
-        let body = "Here's my answer:\n```json\n{\"contradictions\": [{\"requirement_a\":\"A\",\"requirement_b\":\"B\",\"summary\":\"x\"}]}\n```\n";
-        let llm = FixedResponseLlm::ok(body);
-        let out = check_change_internal_contradictions(ws, "c1", &llm, "template")
-            .await
-            .unwrap();
+        let ctx = test_ctx();
+        let runner = CannedContradictionRunner {
+            submission: Some(serde_json::json!({
+                "contradictions": [
+                    { "requirement_a": "A", "requirement_b": "B", "summary": "x" }
+                ]
+            })),
+        };
+        let out =
+            run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].requirement_a, "A");
     }
 
+    /// An empty submission yields an empty finding set (proceed-to-executor).
     #[tokio::test]
-    async fn change_with_no_specs_dir_still_calls_llm_with_empty_input() {
+    async fn empty_submission_yields_no_findings() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let ctx = test_ctx();
+        let runner = CannedContradictionRunner {
+            submission: Some(serde_json::json!({ "contradictions": [] })),
+        };
+        let out =
+            run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
+        assert!(out.is_empty());
+    }
+
+    /// A session that records NO submission fails open (empty Vec).
+    #[tokio::test]
+    async fn no_submission_fails_open() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let ctx = test_ctx();
+        let runner = CannedContradictionRunner { submission: None };
+        let out =
+            run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
+        assert!(out.is_empty(), "no submission must fail open: {out:?}");
+    }
+
+    /// A session error (spawn/timeout/strategy) fails open (empty Vec).
+    #[tokio::test]
+    async fn session_error_fails_open() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let ctx = test_ctx();
+        let out = run_agentic_contradiction_check_with_runner(
+            &ctx,
+            ws,
+            "c1",
+            &ErrorContradictionRunner,
+        )
+        .await;
+        assert!(out.is_empty(), "session error must fail open: {out:?}");
+    }
+
+    /// A non-`claude` provider resolves to a CLI with no registered strategy
+    /// (a60), so the production entry point fails open with no spawn.
+    #[tokio::test]
+    async fn unregistered_strategy_fails_open() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx();
+        ctx.model.provider = LlmProvider::Ollama;
+        ctx.command = "opencode".into();
+        let out = run_agentic_contradiction_check(&ctx, ws, "c1").await;
+        assert!(out.is_empty(), "unregistered strategy must fail open: {out:?}");
+    }
+
+    // ---- prompt construction ----
+
+    #[tokio::test]
+    async fn prompt_lists_every_capability_spec_path_and_submit_instruction() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        write_change_spec(
+            ws,
+            "c1",
+            "alpha",
+            "## ADDED Requirements\n\n### Requirement: A1\nBody.\n",
+        );
+        write_change_spec(
+            ws,
+            "c1",
+            "beta",
+            "## ADDED Requirements\n\n### Requirement: B1\nBody.\n",
+        );
+        let prompt = build_contradiction_prompt("PROMPT_TEMPLATE", ws, "c1");
+        assert!(prompt.starts_with("PROMPT_TEMPLATE"));
+        assert!(prompt.contains("openspec/changes/c1/specs/alpha/spec.md"));
+        assert!(prompt.contains("openspec/changes/c1/specs/beta/spec.md"));
+        assert!(
+            prompt.contains("submit_contradictions"),
+            "prompt must instruct the agent to call submit_contradictions"
+        );
+        // The agent reads files on demand — contents are NOT inlined.
+        assert!(!prompt.contains("Requirement: A1"));
+    }
+
+    #[test]
+    fn spec_delta_paths_empty_when_no_specs_dir() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
         std::fs::create_dir_all(ws.join("openspec/changes/c1")).unwrap();
-        let llm = FixedResponseLlm::ok(r#"{"contradictions": []}"#);
-        let out = check_change_internal_contradictions(ws, "c1", &llm, "template")
-            .await
-            .unwrap();
-        assert!(out.is_empty());
-        let p = llm.last_prompt();
+        assert!(spec_delta_paths(ws, "c1").is_empty());
+    }
+
+    // ---- allowed-tools surface ----
+
+    #[test]
+    fn allowed_tools_are_read_only_plus_submit_contradictions() {
+        let tools = agentic_contradiction_allowed_tools();
+        assert!(tools.contains(&"Read".to_string()));
+        assert!(tools.contains(&"Glob".to_string()));
+        assert!(tools.contains(&"Grep".to_string()));
         assert!(
-            p.starts_with("template"),
-            "prompt must begin with the template; got: {p}"
+            !tools.iter().any(|t| t == "Bash" || t == "Write" || t == "Edit"),
+            "sandbox must deny Bash/Write/Edit: {tools:?}"
+        );
+        assert!(
+            tools.iter().any(|t| t.contains("submit_contradictions")),
+            "submit_contradictions must be allowed: {tools:?}"
         );
     }
+
+    // ---- prompt loader (unchanged behavior) ----
 
     #[test]
     fn embedded_prompt_template_is_non_empty() {
@@ -535,33 +798,5 @@ mod tests {
         let err = load_prompt_template(Some(p)).expect_err("missing path must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("/nonexistent/path/to/template.md"));
-    }
-
-    #[tokio::test]
-    async fn prompt_concatenates_every_capability_spec_under_file_header() {
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path();
-        write_change_spec(
-            ws,
-            "c1",
-            "alpha",
-            "## ADDED Requirements\n\n### Requirement: A1\nBody.\n",
-        );
-        write_change_spec(
-            ws,
-            "c1",
-            "beta",
-            "## ADDED Requirements\n\n### Requirement: B1\nBody.\n",
-        );
-        let llm = FixedResponseLlm::ok(r#"{"contradictions": []}"#);
-        let _ = check_change_internal_contradictions(ws, "c1", &llm, "PROMPT_TEMPLATE")
-            .await
-            .unwrap();
-        let p = llm.last_prompt();
-        assert!(p.contains("PROMPT_TEMPLATE"));
-        assert!(p.contains("## File: openspec/changes/c1/specs/alpha/spec.md"));
-        assert!(p.contains("## File: openspec/changes/c1/specs/beta/spec.md"));
-        assert!(p.contains("Requirement: A1"));
-        assert!(p.contains("Requirement: B1"));
     }
 }

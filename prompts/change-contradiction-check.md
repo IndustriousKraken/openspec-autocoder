@@ -1,4 +1,4 @@
-You are checking a single OpenSpec change for internal contradictions: requirements within this change that cannot all hold simultaneously. Input: the change's spec-delta files concatenated (ADDED + MODIFIED + REMOVED + RENAMED blocks across every capability the change touches).
+You are checking a single OpenSpec change for internal contradictions: requirements within this change that cannot all hold simultaneously. The change's spec-delta files (ADDED + MODIFIED + REMOVED + RENAMED blocks across every capability the change touches) are listed below; read each one with the `Read` tool.
 
 A contradiction is when honoring requirement A would prevent honoring requirement B. Examples:
 - A says "all secrets in env vars"; B says "the API key in config.yaml" (same change adds both)
@@ -12,8 +12,10 @@ NOT a contradiction:
 
 Read every delta block. Apply domain knowledge — a "5-minute workflow" IS longer than a "60-second cap" even if the math isn't spelled out; MongoDB IS NoSQL even if neither requirement says "NoSQL."
 
-Output exactly ONE JSON object to stdout:
+When your analysis is complete, call the `submit_contradictions` MCP tool exactly once with:
+
 ```json
 { "contradictions": [{ "requirement_a": "...", "requirement_b": "...", "summary": "..." }] }
 ```
-No commentary outside the JSON. Empty array if no contradictions.
+
+Pass an empty `contradictions` array if you find none. Do NOT print the result to stdout — the daemon reads it ONLY from the `submit_contradictions` tool call.

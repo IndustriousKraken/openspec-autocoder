@@ -1,9 +1,12 @@
 //! Documentation audit. Invokes the wrapped agent CLI (typically
 //! `claude`) with a read-only sandbox (`Read`, `Glob`, `Grep`, `Bash`)
-//! and a three-check documentation prompt (coverage, stale references,
-//! organization). Parses the agent's structured JSON output into
-//! [`Finding`]s tagged with category in `subject` and returns
-//! `AuditOutcome::Reported`.
+//! plus the `submit_findings` MCP tool (a57) and a three-check
+//! documentation prompt (coverage, stale references, organization). The
+//! agent returns its findings by calling `submit_findings`; the daemon
+//! consumes the stored submission and deserializes it into [`Finding`]s
+//! tagged with category in `subject`, returning `AuditOutcome::Reported`.
+//! `high` severity is demoted to `medium` during deserialization. A run
+//! that ends with no stored submission is an audit failure.
 //!
 //! `requires_head_change = true` — documentation drift only emerges
 //! with code or docs changes; rerunning without a HEAD shift wastes
@@ -15,14 +18,11 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
 
 use super::{
     Audit, AuditContext, AuditLogWriter, AuditOutcome, Finding, Severity, WritePolicy,
-    workspace_is_valid, workspace_unavailable_outcome, write_sandbox_settings,
+    workspace_is_valid, workspace_unavailable_outcome,
 };
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
 use crate::prompts::{PromptId, PromptLoader};
@@ -80,6 +80,10 @@ pub struct DocumentationAudit {
     /// file is written to. `None` (production) means
     /// `std::env::temp_dir()`. Tests pass a per-test TempDir.
     settings_dir: Option<PathBuf>,
+    /// Test-only injected `submit_findings` submission (a57). See
+    /// [`super::try_consume_submission`] for the production path.
+    #[cfg(test)]
+    test_submission: Option<Option<serde_json::Value>>,
 }
 
 impl DocumentationAudit {
@@ -100,6 +104,8 @@ impl DocumentationAudit {
             executor_timeout_secs: executor.timeout_secs,
             sandbox,
             settings_dir: None,
+            #[cfg(test)]
+            test_submission: None,
         }
     }
 
@@ -107,6 +113,24 @@ impl DocumentationAudit {
     pub(crate) fn with_settings_dir(mut self, dir: PathBuf) -> Self {
         self.settings_dir = Some(dir);
         self
+    }
+
+    /// Test-only override standing in for the agent's `submit_findings`
+    /// submission (a57). `Some(payload)` → consumed as the result;
+    /// `None` → the audit observes "no submission".
+    #[cfg(test)]
+    pub(crate) fn with_submission(mut self, submission: Option<serde_json::Value>) -> Self {
+        self.test_submission = Some(submission);
+        self
+    }
+
+    /// Drain the agent's `submit_findings` submission (a57).
+    async fn consume_submission(&self, workspace: &Path) -> Option<serde_json::Value> {
+        #[cfg(test)]
+        if let Some(over) = &self.test_submission {
+            return over.clone();
+        }
+        super::try_consume_submission(workspace, Self::TYPE).await
     }
 
     /// Resolve `extra.readme_max_lines` from settings, falling back to
@@ -207,14 +231,10 @@ impl Audit for DocumentationAudit {
         let mut sandbox = self.sandbox.clone();
         sandbox.allowed_tools = ALLOWED_TOOLS.iter().map(|s| (*s).to_string()).collect();
 
-        let (settings_path, _settings_guard) =
-            write_sandbox_settings(&sandbox, self.settings_dir.as_deref())
-                .context("generating documentation-audit sandbox settings file")?;
-
         let _ = ctx.log_writer.write_section(
             "documentation_audit_preamble",
             &format!(
-                "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nsettings_file: {}\nallowed_tools: {}\nreadme_max_lines: {}\npage_max_lines_without_toc: {}",
+                "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nallowed_tools: {}\nreadme_max_lines: {}\npage_max_lines_without_toc: {}",
                 self.executor_command,
                 self.executor_timeout_secs,
                 self.settings
@@ -222,7 +242,6 @@ impl Audit for DocumentationAudit {
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "<embedded default>".to_string()),
-                settings_path.display(),
                 sandbox.allowed_tools.join(","),
                 self.readme_max_lines(),
                 self.page_max_lines_without_toc(),
@@ -232,13 +251,17 @@ impl Audit for DocumentationAudit {
             .log_writer
             .write_section("documentation_audit_prompt", &prompt);
 
-        let outcome = run_subprocess(
+        // a57: run WITH MCP enabled. `submit_findings` coexists with the
+        // common `query_canonical_specs` tool (available when canonical_rag
+        // is configured); findings arrive via the submission, not stdout.
+        let outcome = super::run_audit_cli_with_submit(
             &self.executor_command,
-            &settings_path,
-            &sandbox.allowed_tools,
+            &sandbox,
             ctx.workspace,
             &prompt,
             Duration::from_secs(self.executor_timeout_secs),
+            self.settings_dir.as_deref(),
+            Self::TYPE,
         )
         .await
         .context("spawning documentation-audit CLI subprocess")?;
@@ -269,19 +292,32 @@ impl Audit for DocumentationAudit {
             return Err(err);
         }
 
-        let findings = match parse_findings(&outcome.stdout) {
+        // Drain the agent's `submit_findings` submission. The `high →
+        // medium` demotion applies during deserialization (unchanged
+        // behavior, new transport). No stored submission is an audit
+        // failure (retried next iteration).
+        let Some(payload) = self.consume_submission(ctx.workspace).await else {
+            let _ = ctx.log_writer.write_section(
+                "documentation_audit_outcome",
+                "kind: Err\nreason: no submit_findings submission recorded",
+            );
+            return Err(anyhow!(
+                "documentation_audit: agent exited with no submit_findings submission; stderr excerpt: {}",
+                excerpt(&outcome.stderr)
+            ));
+        };
+        let findings = match payload_to_findings(&payload) {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(
                     url = %ctx.repo.url,
-                    excerpt = %excerpt(&outcome.stdout),
-                    "documentation_audit: response parse failure: {e:#}"
+                    "documentation_audit: submission deserialization failure: {e}"
                 );
                 let _ = ctx.log_writer.write_section(
                     "documentation_audit_outcome",
-                    &format!("kind: Err\nreason: {e:#}"),
+                    &format!("kind: Err\nreason: {e}"),
                 );
-                return Err(e);
+                return Err(anyhow!("documentation_audit: {e}"));
             }
         };
         let _ = ctx.log_writer.write_section(
@@ -382,43 +418,32 @@ fn push_input(out: &mut Vec<GatheredInput>, workspace: &std::path::Path, path: &
     out.push(GatheredInput { display_path, body });
 }
 
-/// Parse `stdout` as `{ "findings": [...] }`. Each finding's
-/// `category` becomes the [`Finding`] `subject` so the chatops
-/// formatter can group findings by category in the thread body.
-/// Severity `high` is demoted to `medium` with a WARN log per the
-/// spec's anti-emergency-promotion rule.
-pub(crate) fn parse_findings(stdout: &str) -> Result<Vec<Finding>> {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!(
-            "documentation_audit: agent produced empty stdout (expected `{{ \"findings\": [...] }}`)"
-        ));
-    }
-    let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
-        anyhow!(
-            "documentation_audit: stdout is not valid JSON: {e}; excerpt: {}",
-            excerpt(stdout)
-        )
-    })?;
-    let arr = parsed
+/// Deserialize a `submit_findings` payload (`{ "findings": [...] }`) into
+/// [`Finding`]s (a57). Each finding's `category` becomes the [`Finding`]
+/// `subject` so the chatops formatter can group findings by category in
+/// the thread body. Severity `high` is demoted to `medium` with a WARN
+/// log per the spec's anti-emergency-promotion rule (the demotion now
+/// applies to the consumed submission — unchanged behavior, new
+/// transport). Returns `Err(reason)` (a correction-suitable string) on a
+/// malformed payload; the reason is surfaced to the agent by
+/// `record_submission`'s registered validator, which is this function
+/// with its `Ok` value discarded.
+pub(crate) fn payload_to_findings(
+    payload: &serde_json::Value,
+) -> std::result::Result<Vec<Finding>, String> {
+    let arr = payload
         .get("findings")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            anyhow!(
-                "documentation_audit: stdout JSON missing top-level `findings` array; excerpt: {}",
-                excerpt(stdout)
-            )
+            "documentation_audit: submission missing top-level `findings` array".to_string()
         })?;
     let mut findings = Vec::with_capacity(arr.len());
     for (idx, raw) in arr.iter().enumerate() {
         let entry: RawFinding = serde_json::from_value(raw.clone()).map_err(|e| {
-            anyhow!(
-                "documentation_audit: findings[{idx}] does not match the expected shape: {e}; excerpt: {}",
-                excerpt(stdout)
-            )
+            format!("documentation_audit: findings[{idx}] does not match the expected shape: {e}")
         })?;
         let category_subject = normalize_category(&entry.category).ok_or_else(|| {
-            anyhow!(
+            format!(
                 "documentation_audit: findings[{idx}] has unknown category `{}`; expected one of coverage, stale_reference, organization",
                 entry.category
             )
@@ -485,15 +510,8 @@ fn excerpt(s: &str) -> String {
     out
 }
 
-struct SubprocessOutcome {
-    timed_out: bool,
-    exit_status: Option<std::process::ExitStatus>,
-    stdout: String,
-    stderr: String,
-}
-
 fn outcome_to_terminal_err(
-    outcome: &SubprocessOutcome,
+    outcome: &crate::agentic_run::AgenticRunOutcome,
     log_writer: &mut AuditLogWriter,
     audit_type: &str,
     timeout_secs: u64,
@@ -520,78 +538,6 @@ fn outcome_to_terminal_err(
         ));
     }
     None
-}
-
-async fn run_subprocess(
-    command: &str,
-    settings_path: &std::path::Path,
-    allowed_tools: &[String],
-    workspace: &std::path::Path,
-    prompt: &str,
-    timeout: Duration,
-) -> Result<SubprocessOutcome> {
-    let mut child = super::spawn_with_etxtbsy_retry(|| {
-        let mut cmd = Command::new(command);
-        cmd.arg("--settings")
-            .arg(settings_path)
-            .arg("--allowedTools")
-            .arg(allowed_tools.join(","))
-            .arg("--permission-mode")
-            .arg("acceptEdits")
-            .current_dir(workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        cmd
-    })
-    .await
-    .with_context(|| format!("spawning documentation-audit command `{command}`"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt.as_bytes()).await;
-    }
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-
-    let sleeper = tokio::time::sleep(timeout);
-    tokio::pin!(sleeper);
-
-    let exit_status: Option<std::io::Result<std::process::ExitStatus>> = tokio::select! {
-        biased;
-        () = &mut sleeper => None,
-        res = child.wait() => Some(res),
-    };
-
-    match exit_status {
-        None => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            Ok(SubprocessOutcome {
-                timed_out: true,
-                exit_status: None,
-                stdout: String::new(),
-                stderr: "timeout".to_string(),
-            })
-        }
-        Some(Err(e)) => Err(e).context("waiting on documentation-audit child process"),
-        Some(Ok(status)) => {
-            let mut stdout_text = String::new();
-            if let Some(ref mut p) = stdout_pipe {
-                let _ = p.read_to_string(&mut stdout_text).await;
-            }
-            let mut stderr_text = String::new();
-            if let Some(ref mut p) = stderr_pipe {
-                let _ = p.read_to_string(&mut stderr_text).await;
-            }
-            Ok(SubprocessOutcome {
-                timed_out: false,
-                exit_status: Some(status),
-                stdout: stdout_text,
-                stderr: stderr_text,
-            })
-        }
-    }
 }
 
 #[cfg(test)]
@@ -674,14 +620,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_empty_findings_array() {
-        let findings = parse_findings(r#"{"findings": []}"#).expect("parses empty");
+    fn empty_findings_array_deserializes_to_no_findings() {
+        let findings =
+            payload_to_findings(&serde_json::json!({"findings": []})).expect("deserializes empty");
         assert!(findings.is_empty());
     }
 
     #[test]
-    fn parses_three_categories() {
-        let stdout = r#"{
+    fn payload_round_trips_three_categories() {
+        let payload = serde_json::json!({
             "findings": [
                 {
                     "category": "coverage",
@@ -702,8 +649,8 @@ mod tests {
                     "body": "README.md is 320 lines without a top-of-file TOC."
                 }
             ]
-        }"#;
-        let findings = parse_findings(stdout).expect("parses three categories");
+        });
+        let findings = payload_to_findings(&payload).expect("deserializes three categories");
         assert_eq!(findings.len(), 3);
         assert_eq!(findings[0].subject, COVERAGE_SUBJECT);
         assert_eq!(findings[0].severity, Severity::Medium);
@@ -715,13 +662,13 @@ mod tests {
     }
 
     #[test]
-    fn high_severity_demotes_to_medium() {
-        let stdout = r#"{
+    fn high_severity_demotes_to_medium_on_submission() {
+        let payload = serde_json::json!({
             "findings": [
                 {"category":"coverage","severity":"high","anchor":"docs/X.md","body":"b"}
             ]
-        }"#;
-        let findings = parse_findings(stdout).expect("parses");
+        });
+        let findings = payload_to_findings(&payload).expect("deserializes");
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].severity,
@@ -732,36 +679,30 @@ mod tests {
 
     #[test]
     fn unknown_category_returns_err() {
-        let stdout = r#"{
+        let payload = serde_json::json!({
             "findings": [
                 {"category":"made-up-bucket","severity":"low","anchor":"a","body":"b"}
             ]
-        }"#;
-        let err = parse_findings(stdout).expect_err("unknown category must error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("unknown category"), "got: {msg}");
-        assert!(msg.contains("made-up-bucket"), "got: {msg}");
-    }
-
-    #[test]
-    fn malformed_json_returns_err_with_excerpt() {
-        let stdout = "this is not JSON, just some prose";
-        let err = parse_findings(stdout).expect_err("non-JSON must error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("not valid JSON"), "got: {msg}");
-        assert!(msg.contains("just some prose"), "excerpt missing: {msg}");
+        });
+        let err = payload_to_findings(&payload).expect_err("unknown category must error");
+        assert!(err.contains("unknown category"), "got: {err}");
+        assert!(err.contains("made-up-bucket"), "got: {err}");
     }
 
     #[test]
     fn missing_top_level_findings_key_returns_err() {
-        let err = parse_findings(r#"{"results": []}"#).expect_err("missing key must error");
-        assert!(format!("{err:#}").contains("findings"));
+        let err = payload_to_findings(&serde_json::json!({"results": []}))
+            .expect_err("missing key must error");
+        assert!(err.contains("findings"), "got: {err}");
     }
 
     #[test]
-    fn empty_stdout_returns_err() {
-        let err = parse_findings("   \n").expect_err("empty must error");
-        assert!(format!("{err:#}").contains("empty"));
+    fn finding_missing_required_field_returns_err() {
+        let payload = serde_json::json!({
+            "findings": [{"category": "coverage", "severity": "low", "anchor": "a"}]
+        });
+        let err = payload_to_findings(&payload).expect_err("missing body must error");
+        assert!(err.contains("findings[0]"), "got: {err}");
     }
 
     #[test]
@@ -941,25 +882,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_returns_reported_with_three_findings_from_canned_stdout() {
+    async fn run_returns_reported_with_three_findings_from_submission() {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
         std::fs::create_dir_all(workspace.join(".git")).unwrap();
-        let canned = r#"{"findings":[
-            {"category":"coverage","severity":"medium","anchor":"docs/CHATOPS.md","body":"verb propose missing"},
-            {"category":"stale_reference","severity":"low","anchor":"docs/CONFIG.md:42","body":"dead field"},
-            {"category":"organization","severity":"medium","anchor":"README.md","body":"too long"}
-        ]}"#;
         let script = write_script(
             ws_dir.path(),
             "fake-claude.sh",
-            &format!("#!/bin/sh\ncat <<'EOF'\n{canned}\nEOF\nexit 0\n"),
+            "#!/bin/sh\nexit 0\n",
         );
 
         let cfg = executor_cfg(&script.to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
+        let submission = serde_json::json!({"findings":[
+            {"category":"coverage","severity":"medium","anchor":"docs/CHATOPS.md","body":"verb propose missing"},
+            {"category":"stale_reference","severity":"low","anchor":"docs/CONFIG.md:42","body":"dead field"},
+            {"category":"organization","severity":"medium","anchor":"README.md","body":"too long"}
+        ]});
         let audit = DocumentationAudit::new(&HashMap::new(), &cfg)
-            .with_settings_dir(settings_dir.path().to_path_buf());
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_submission(Some(submission));
         let repo = fixture_repo();
         let mut ctx = AuditContext {
             workspace,
@@ -994,12 +936,13 @@ mod tests {
         let script = write_script(
             ws_dir.path(),
             "fake-claude.sh",
-            "#!/bin/sh\necho '{\"findings\":[]}'\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
         );
         let cfg = executor_cfg(&script.to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
         let audit = DocumentationAudit::new(&HashMap::new(), &cfg)
-            .with_settings_dir(settings_dir.path().to_path_buf());
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_submission(Some(serde_json::json!({"findings": []})));
         let repo = fixture_repo();
         let mut ctx = AuditContext {
             workspace,
@@ -1021,20 +964,23 @@ mod tests {
         }
     }
 
+    /// a57 (task 3.4): a clean exit with no stored submission is an audit
+    /// failure (`Err`).
     #[tokio::test]
-    async fn run_returns_err_on_malformed_stdout() {
+    async fn run_returns_err_when_no_submission() {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
         std::fs::create_dir_all(workspace.join(".git")).unwrap();
         let script = write_script(
             ws_dir.path(),
-            "bad.sh",
-            "#!/bin/sh\necho 'not the JSON you are looking for'\nexit 0\n",
+            "silent.sh",
+            "#!/bin/sh\nexit 0\n",
         );
         let cfg = executor_cfg(&script.to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
         let audit = DocumentationAudit::new(&HashMap::new(), &cfg)
-            .with_settings_dir(settings_dir.path().to_path_buf());
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_submission(None);
         let repo = fixture_repo();
         let mut ctx = AuditContext {
             workspace,
@@ -1044,11 +990,11 @@ mod tests {
             max_validation_retries: 0,
         };
         let log_path = ctx.log_writer.path().to_path_buf();
-        let err = audit.run(&mut ctx).await.expect_err("bad stdout errors");
+        let err = audit.run(&mut ctx).await.expect_err("no submission errors");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("not valid JSON") || msg.contains("findings"),
-            "error must describe parse failure: {msg}"
+            msg.contains("no submit_findings submission"),
+            "error must name the missing submission: {msg}"
         );
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
@@ -1092,12 +1038,13 @@ mod tests {
         let script = write_script(
             ws_dir.path(),
             "fake-claude.sh",
-            "#!/bin/sh\necho '{\"findings\":[]}'\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
         );
         let cfg = executor_cfg(&script.to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
         let audit = DocumentationAudit::new(&HashMap::new(), &cfg)
-            .with_settings_dir(settings_dir.path().to_path_buf());
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_submission(Some(serde_json::json!({"findings": []})));
         let repo = fixture_repo();
         let mut ctx = AuditContext {
             workspace,
@@ -1108,6 +1055,12 @@ mod tests {
         };
         let log_path = ctx.log_writer.path().to_path_buf();
         let _ = audit.run(&mut ctx).await.expect("run succeeds");
+        // a57: the audit writes a `.mcp.json` during the run AND deletes it
+        // on exit, so the working tree is clean afterward.
+        assert!(
+            !workspace.join(".mcp.json").exists(),
+            "audit run must clean up the .mcp.json it wrote"
+        );
         let leftover: Vec<_> = std::fs::read_dir(settings_dir.path())
             .unwrap()
             .filter_map(|e| e.ok())

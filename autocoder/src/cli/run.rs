@@ -211,10 +211,12 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             .change_internal_contradiction_check_llm
             .as_ref()
             .expect("validate_config guarantees the llm block is set when enabled");
-        let llm: Arc<dyn crate::llm::LlmClient> = Arc::from(
-            crate::llm::build_from_contradiction_check_config(llm_cfg)
-                .context("building contradiction-check LLM client from config")?,
-        );
+        // a59: resolve the model into the a56 `(provider, model, base, key)`
+        // tuple the `claude` CLI strategy translates into `ANTHROPIC_*`. The
+        // contradiction check now runs agentically through `agentic_run`
+        // rather than over HTTP, so no `LlmClient` is built.
+        let model = crate::llm::resolve_contradiction_check_model(llm_cfg)
+            .context("resolving contradiction-check model from config")?;
         let prompt_template = crate::preflight::change_contradiction::load_prompt_template(
             cfg.executor
                 .change_internal_contradiction_check_prompt_path
@@ -224,15 +226,18 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         tracing::info!(
             provider = ?llm_cfg.provider,
             model = llm_cfg.model.as_str(),
-            "change-internal contradiction pre-flight enabled (a19)"
+            "change-internal contradiction pre-flight enabled (a19; agentic transport a59)"
         );
         let attribution =
             crate::attribution::AttributionSurface::attribution(llm_cfg);
         Some(Arc::new(
             crate::preflight::change_contradiction::ContradictionCheckCtx {
-                llm,
+                command: cfg.executor.command.clone(),
+                model,
                 prompt_template,
                 attribution: Some(attribution),
+                #[cfg(test)]
+                test_submission: None,
             },
         ))
     } else {
@@ -567,8 +572,24 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         spawn_repo: spawn_repo.clone(),
         canonical_rag_registry: canonical_rag_registry.clone(),
         outcome_store: crate::outcome_store::OutcomeStore::new(),
+        submission_store: crate::submission_store::SubmissionStore::new(),
         paths: daemon_paths.clone(),
     };
+    // a57: register the advisory audits' `submit_findings` payload schemas
+    // on the shared submission store BEFORE the listener starts handling
+    // `record_submission`, so the MCP child's submissions are validated
+    // against the role's finding schema.
+    crate::audits::register_submission_schemas(&control_state.submission_store);
+    // a58: register the agentic reviewer's `submit_review` payload schema on
+    // the same store so the reviewer MCP child's submissions are validated.
+    crate::code_reviewer::register_reviewer_submission_schema(
+        &control_state.submission_store,
+    );
+    // a59: register the contradiction check's `submit_contradictions` payload
+    // schema on the same store so its MCP child's submissions are validated.
+    crate::preflight::change_contradiction::register_contradiction_submission_schema(
+        &control_state.submission_store,
+    );
     let listener_cancel = cancel.clone();
     let control_handle: JoinHandle<()> = tokio::spawn(async move {
         if let Err(e) = control_socket::listen(control_state, listener_cancel).await {

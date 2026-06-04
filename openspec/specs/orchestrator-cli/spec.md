@@ -1530,15 +1530,18 @@ autocoder SHALL register a `dependency_update_triage` audit in the periodic-audi
   advances normally)
 
 ### Requirement: Drift audit
-autocoder SHALL register a `drift_audit` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with a read-only sandbox and a drift-detection prompt, then surfaces findings via chatops. The audit is `requires_head_change = true` and `WritePolicy::None`.
+autocoder SHALL register a `drift_audit` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with a read-only sandbox and a drift-detection prompt, then surfaces findings via chatops. The agent SHALL return its findings by calling the `submit_findings` MCP tool — validated against the drift finding schema and consumed by the daemon as the audit result — rather than by emitting JSON on stdout. The audit is `requires_head_change = true` and `WritePolicy::None`.
 
 #### Scenario: Invokes the CLI with a read-only sandbox
 - **WHEN** the audit runs
 - **THEN** autocoder spawns the configured `executor.command`
   (typically `claude`) with `--settings` pointing at a generated
   sandbox file whose `permissions.deny` excludes `Write` and
-  `Edit` and whose `allowed_tools` contains only
+  `Edit` and whose CLI tool permissions contain only
   `["Read", "Glob", "Grep", "Bash"]`
+- **AND** a generated `.mcp.json` exposes the `submit_findings`
+  MCP tool with `ORCH_MCP_ROLE` set to `drift_audit`, so the agent
+  can return findings but still cannot `Write` or `Edit`
 - **AND** the prompt is the embedded `prompts/drift-audit.md`
   template OR the operator-supplied override at
   `audits.drift_audit.prompt_path`
@@ -1555,10 +1558,10 @@ autocoder SHALL register a `drift_audit` audit in the periodic-audit framework. 
   `openspec/changes/` (in-flight changes) and
   `openspec/changes/archive/` (historical changes)
 
-#### Scenario: Outputs findings in a parseable format
-- **WHEN** the agent completes
-- **THEN** the agent's stdout SHALL be a single JSON object of
-  shape:
+#### Scenario: Returns findings via the submit_findings tool
+- **WHEN** the agent has finished its analysis
+- **THEN** it calls the `submit_findings` MCP tool with a payload
+  of shape:
   ```json
   {
     "findings": [
@@ -1572,7 +1575,11 @@ autocoder SHALL register a `drift_audit` audit in the periodic-audit framework. 
     ]
   }
   ```
-- **AND** autocoder parses this JSON to produce `Finding`
+- **AND** the daemon validates the payload against the drift
+  finding schema (via a56's `record_submission`), surfacing a
+  schema violation to the agent as a correctable tool error
+- **AND** after the audit subprocess exits the daemon
+  `consume_submission`s the stored payload to produce `Finding`
   values for the `AuditOutcome::Reported(...)` return
 
 #### Scenario: Filters out low-severity wording-only differences
@@ -1581,21 +1588,23 @@ autocoder SHALL register a `drift_audit` audit in the periodic-audit framework. 
   whose only divergence is wording, formatting, or phrasing.
   Only report divergences with behavioral consequences."
 - **AND** the agent SHOULD self-filter such findings before
-  emitting the JSON
+  submitting
 
 #### Scenario: Empty findings list produces silent outcome
-- **WHEN** the agent returns an empty `findings` array
+- **WHEN** the agent calls `submit_findings` with an empty
+  `findings` array
 - **THEN** the audit returns `AuditOutcome::Reported(vec![])`
 - **AND** per the framework-level "Reported with no findings"
   scenario, no chatops post is made unless
   `notify_on_clean: true`
 
-#### Scenario: Malformed agent output fails the audit
-- **WHEN** the agent's stdout is not parseable as the expected
-  JSON shape (missing top-level `findings`, non-array value,
-  malformed JSON, etc.)
-- **THEN** the audit returns `Err` with the parse error AND a
-  truncated stdout excerpt
+#### Scenario: No valid submission fails the audit
+- **WHEN** the agent never calls `submit_findings`, OR every
+  `submit_findings` call is rejected by the schema (malformed
+  shape, missing top-level `findings`, non-array value) and the
+  session ends with no stored submission
+- **THEN** the audit returns `Err` with a diagnostic AND a
+  truncated stdout/stderr excerpt
 - **AND** the framework treats this as audit failure: state is
   NOT updated, chatops alert posts under the existing
   audit-failure category, the next iteration retries
@@ -1786,7 +1795,7 @@ The prompt's confidence-filtering and scope guidance below is design intent veri
   normally
 
 ### Requirement: Architecture consultative audit
-autocoder SHALL register an `architecture_consultative` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with a read-only sandbox and a consultative architecture prompt; it returns 0-5 anchored architecture questions as findings via chatops. The audit is `requires_head_change = true` and `WritePolicy::None`.
+autocoder SHALL register an `architecture_consultative` audit in the periodic-audit framework. The audit invokes the wrapped agent CLI with a read-only sandbox and a consultative architecture prompt; it returns 0-5 anchored architecture questions as findings via chatops. The agent SHALL return those findings by calling the `submit_findings` MCP tool — validated against the architecture finding schema, which caps the array at 5 entries, and consumed by the daemon as the audit result — rather than by emitting JSON on stdout. The audit is `requires_head_change = true` and `WritePolicy::None`.
 
 #### Scenario: Prompt forbids "rewrite at scale" suggestions
 - **WHEN** the prompt is loaded
@@ -1820,7 +1829,8 @@ autocoder SHALL register an `architecture_consultative` audit in the periodic-au
 
 #### Scenario: Returns 0-5 findings per run
 - **WHEN** the audit runs
-- **THEN** the agent's output contains a JSON object of shape:
+- **THEN** the agent calls the `submit_findings` MCP tool with a
+  payload of shape:
   ```json
   {
     "findings": [
@@ -1833,10 +1843,13 @@ autocoder SHALL register an `architecture_consultative` audit in the periodic-au
     ]
   }
   ```
-- **AND** the `findings` array contains AT MOST 5 entries
+- **AND** the `findings` array contains AT MOST 5 entries — the
+  registered schema rejects a submission with more than 5,
+  surfacing it to the agent as a correctable tool error
 - **AND** if the audit produces 0 findings (no observations rise
-  above the prompt's quality bar), the result is
-  `AuditOutcome::Reported(vec![])` and per framework behavior no
+  above the prompt's quality bar), the agent calls
+  `submit_findings` with an empty array, the result is
+  `AuditOutcome::Reported(vec![])`, and per framework behavior no
   chatops post is sent unless `notify_on_clean: true`
 
 #### Scenario: Findings render as questions in chatops
@@ -1848,11 +1861,13 @@ autocoder SHALL register an `architecture_consultative` audit in the periodic-au
 - **AND** the full body text is preserved in the audit-run log
   (chatops only shows the subject + anchor for compactness)
 
-#### Scenario: Malformed agent output fails the audit
-- **WHEN** the agent's stdout cannot be parsed as the expected
-  JSON shape OR includes more than 5 findings
-- **THEN** the audit returns `Err` with the parse error AND a
-  truncated stdout excerpt
+#### Scenario: No valid submission fails the audit
+- **WHEN** the agent never calls `submit_findings`, OR every
+  `submit_findings` call is rejected by the schema (malformed
+  shape, or more than 5 findings) and the session ends with no
+  stored submission
+- **THEN** the audit returns `Err` with a diagnostic AND a
+  truncated stdout/stderr excerpt
 - **AND** the framework treats this as audit failure: state is
   NOT updated, chatops alert posts under the existing
   audit-failure category, the next iteration retries
@@ -4628,52 +4643,52 @@ Removal of the underlying blocking marker (e.g. via `@<bot> clear-perma-stuck`) 
 - **AND** the change re-enters `list_pending` on the next iteration (per the existing clear-perma-stuck behavior)
 
 ### Requirement: Change-internal contradiction pre-flight check (opt-in)
-autocoder SHALL provide an opt-in pre-flight check that detects semantic contradictions among the requirements WITHIN a single OpenSpec change before the executor is invoked. The check uses a configurable LLM to read the change's spec-delta files AND produce a structured JSON listing of contradictions (requirements that cannot all hold simultaneously). On non-empty findings, autocoder SHALL write `.needs-spec-revision.json` with `revision_suggestion` populated from the contradictions narrative, post the existing `AlertCategory::SpecNeedsRevision` chatops alert, AND halt the queue walk for this iteration. The executor SHALL NOT be invoked when contradictions are found.
+autocoder SHALL provide an opt-in pre-flight check that detects semantic contradictions among the requirements WITHIN a single OpenSpec change before the executor is invoked. The check runs a CLI-wrapped agentic session through the shared `agentic_run` primitive (a56) in a read-only sandbox that reads the change's spec-delta files on demand AND returns a structured listing of contradictions (requirements that cannot all hold simultaneously) via the `submit_contradictions` MCP tool. On non-empty findings, autocoder SHALL write `.needs-spec-revision.json` with `revision_suggestion` populated from the contradictions narrative, post the existing `AlertCategory::SpecNeedsRevision` chatops alert, AND halt the queue walk for this iteration. The executor SHALL NOT be invoked when contradictions are found.
 
-The check SHALL be gated by `executor.change_internal_contradiction_check` (`disabled` default, `enabled` opt-in). The LLM is configured via `executor.change_internal_contradiction_check_llm` (parallel to the `reviewer:` config block — provider, model, api_key source, optional api_base_url). Enabling the check without configuring the LLM SHALL fail at daemon startup with a fail-fast validation error.
+The check SHALL be gated by `executor.change_internal_contradiction_check` (`disabled` default, `enabled` opt-in). The model is configured via `executor.change_internal_contradiction_check_llm` (parallel to the `reviewer:` config block — provider, model, api_key source, optional api_base_url), which a56's CLI strategy translates into the wrapped CLI's model-selection mechanism. The `claude` strategy reaches only Anthropic-shaped endpoints; a model whose provider resolves to a CLI with no registered strategy makes the check fail open (per the fail-open posture below) until that strategy is registered. Enabling the check without configuring the model SHALL fail at daemon startup with a fail-fast validation error.
 
-The check SHALL fail-open: LLM transport errors, parse failures, OR malformed responses log a WARN AND treat the check as "no contradictions found." The daemon does NOT gate work on a failed check — operators see the WARN in journalctl AND can investigate; the executor proceeds.
+The check SHALL fail-open: an agentic-session error (spawn, timeout, OR a resolved CLI strategy that is not registered), a schema-rejected submission the agent never corrects, a session that ends with no submission, OR any other failure log a WARN AND treat the check as "no contradictions found." A schema-invalid `submit_contradictions` call mid-session is a correctable tool error the agent can retry (a56). The daemon does NOT gate work on a failed check — operators see the WARN in journalctl AND can investigate; the executor proceeds.
 
 The check runs AFTER `a17`'s mechanical archivability check AND BEFORE the executor. The two checks are layered: `a17` catches structural defects (header mismatches), `a19` catches semantic ones (self-contradictions). Most clean changes pass both with no LLM cost beyond the contradiction check's own.
 
-#### Scenario: Default-disabled produces no LLM call
+#### Scenario: Default-disabled produces no contradiction-check session
 - **WHEN** `executor.change_internal_contradiction_check` is unset (default `disabled`)
 - **AND** any change reaches the pre-executor pipeline
-- **THEN** no LLM call is made for the contradiction check
+- **THEN** no contradiction-check session is spawned (no LLM cost)
 - **AND** the executor is invoked normally (assuming `a17`'s archivability check passed)
 
-#### Scenario: Enabled mode invokes the LLM with the change's deltas
-- **WHEN** `executor.change_internal_contradiction_check: enabled` AND the LLM config is set
+#### Scenario: Enabled mode runs an agentic session over the change's deltas
+- **WHEN** `executor.change_internal_contradiction_check: enabled` AND the model config is set
 - **AND** a change passes `a17`'s archivability check
-- **THEN** the pipeline invokes the configured LLM with the embedded `prompts/change-contradiction-check.md` prompt + the change's concatenated spec-delta files
-- **AND** parses the response as JSON conforming to `{ contradictions: [{ requirement_a, requirement_b, summary }] }`
+- **THEN** the pipeline runs an `agentic_run` session (a56) in a read-only sandbox (`Read`/`Glob`/`Grep`, `ORCH_MCP_ROLE = contradiction_check`, the `submit_contradictions` MCP tool) with the embedded `prompts/change-contradiction-check.md` prompt (OR the configured override)
+- **AND** the agent reads the change's spec-delta files on demand AND returns contradictions by calling `submit_contradictions` with `{ contradictions: [{ requirement_a, requirement_b, summary }] }`
 
-#### Scenario: Empty contradictions array proceeds to executor
-- **WHEN** the LLM returns `{"contradictions": []}`
+#### Scenario: Empty contradictions submission proceeds to executor
+- **WHEN** the agent calls `submit_contradictions` with an empty `contradictions` array
 - **THEN** the pipeline proceeds to the executor
 - **AND** no marker is written
 - **AND** no chatops alert fires
 
-#### Scenario: Non-empty contradictions array writes marker and skips executor
-- **WHEN** the LLM returns one or more contradictions
+#### Scenario: Non-empty contradictions submission writes marker and skips executor
+- **WHEN** the agent submits one or more contradictions
 - **THEN** the pipeline writes `.needs-spec-revision.json` with `revision_suggestion` text populated from the contradictions narrative (per the documented format)
 - **AND** the marker's `unarchivable_deltas` AND `unimplementable_tasks` arrays are empty (this case is semantic, not structural)
 - **AND** the chatops alert under `AlertCategory::SpecNeedsRevision` fires (subject to the 24h throttle)
 - **AND** the executor is NOT invoked for this change OR any subsequent change in this iteration
 
-#### Scenario: LLM call failure fails open
-- **WHEN** the LLM call returns Err (network, rate-limit, transport)
+#### Scenario: Session failure fails open
+- **WHEN** the agentic session fails (spawn error, timeout, OR the resolved CLI strategy is not registered — e.g. a non-`claude` command whose strategy has not been added)
 - **THEN** the pipeline logs a WARN naming the error
 - **AND** treats the check as "no contradictions found"
 - **AND** proceeds to the executor
 - **AND** the daemon does NOT gate iteration progress on the failed check
 
-#### Scenario: Malformed LLM response fails open
-- **WHEN** the LLM returns a response that doesn't parse as the expected JSON shape
-- **THEN** the pipeline logs a WARN naming the response excerpt (truncated to 200 chars)
-- **AND** proceeds to the executor (same fail-open posture)
+#### Scenario: No valid submission fails open
+- **WHEN** the session ends with no schema-valid `submit_contradictions` call (the agent never submits, OR every submission is schema-rejected and never corrected)
+- **THEN** the pipeline logs a WARN naming a truncated session-output excerpt (200 chars)
+- **AND** treats the check as "no contradictions found" AND proceeds to the executor (the same fail-open posture)
 
-#### Scenario: Enabled without LLM config fails fast at startup
+#### Scenario: Enabled without model config fails fast at startup
 - **WHEN** `config.yaml` sets `executor.change_internal_contradiction_check: enabled`
 - **AND** `executor.change_internal_contradiction_check_llm` is unset
 - **THEN** daemon startup fails with the error `executor.change_internal_contradiction_check is enabled but executor.change_internal_contradiction_check_llm is not configured`
@@ -4683,15 +4698,15 @@ The check runs AFTER `a17`'s mechanical archivability check AND BEFORE the execu
 #### Scenario: Prompt override replaces the embedded default
 - **WHEN** `executor.change_internal_contradiction_check_prompt_path` points to an override file
 - **THEN** the pipeline reads the override file AND uses its contents as the prompt template
-- **AND** an empty override file produces an error at use time (the daemon does not feed an empty prompt to the LLM)
+- **AND** an empty override file produces an error at use time (the daemon does not feed an empty prompt to the session)
 
 #### Scenario: Marker `revision_suggestion` enumerates findings clearly
-- **WHEN** the LLM returns 2 contradictions
+- **WHEN** the agent submits 2 contradictions
 - **THEN** the marker's `revision_suggestion` text contains both findings numbered 1 AND 2, each with `requirement_a`, `requirement_b`, AND `summary` fields
 - **AND** the text ends with operator guidance (`Edit the conflicting requirements... clear via @<bot> clear-revision`)
 
 #### Scenario: Operator clearing the marker without spec edits is permitted
-- **WHEN** the operator assesses the LLM's findings as a false positive AND runs `@<bot> clear-revision <repo> <change>` without editing the spec
+- **WHEN** the operator assesses the findings as a false positive AND runs `@<bot> clear-revision <repo> <change>` without editing the spec
 - **THEN** the next polling iteration retries the change AND re-runs the contradiction check
 - **AND** the operator's tolerance for false positives shapes their decision to enable the check OR keep it disabled
 
@@ -4749,7 +4764,7 @@ The Cargo.toml `version =` field SHALL be operator-bumped only at semver-meaning
 - **AND** operators installing via `update.sh` see clean semver versions in their `🆙` notifications AND `--version` output
 
 ### Requirement: Documentation audit reports coverage, stale-reference, and organization findings
-autocoder SHALL register a `documentation_audit` audit type in the periodic-audit framework. The audit is LLM-driven, declares `WritePolicy::None`, `requires_head_change = true`, AND a sandbox profile allowing `Read`, `Glob`, `Grep`, AND `Bash` (read-only). It produces `AuditOutcome::Reported(findings)` covering three categories of documentation defect:
+autocoder SHALL register a `documentation_audit` audit type in the periodic-audit framework. The audit is LLM-driven, declares `WritePolicy::None`, `requires_head_change = true`, AND a sandbox profile allowing `Read`, `Glob`, `Grep`, AND `Bash` (read-only) plus the `submit_findings` MCP tool through which the agent returns its findings — validated against the documentation finding schema (`category`, `severity`, `anchor`, `body`) and consumed by the daemon as the audit result, rather than emitted as JSON on stdout. It produces `AuditOutcome::Reported(findings)` covering three categories of documentation defect:
 
 1. **Coverage** — code or canonical-spec features that user-facing docs (`README.md`, `docs/*.md`) don't mention. Heuristic: any canonical-spec requirement whose body mentions operator-visible artifacts (`@<bot>` verbs, config keys, CLI flags, file paths the operator interacts with) is in scope. Pure-internal capabilities are NOT flagged.
 2. **Stale references** — docs references to code symbols (function names in code blocks, CLI verbs, config fields, file paths under `src/`) that don't exist in the current code or canonical specs. Catches dead references from removed features.
@@ -4819,6 +4834,17 @@ When `a21`'s canonical-spec RAG is enabled in the same workspace, the audit's pr
 - **AND** the triage produces a doc-fix PR (changes to `README.md` / `docs/*.md` files)
 - **AND** the triage does NOT produce a spec PR (documentation is not OpenSpec material)
 - **AND** the doc-fix PR participates in the standard `@<bot> revise <text>` revision loop
+
+#### Scenario: Returns findings via the submit_findings tool
+- **WHEN** the agent has finished its analysis
+- **THEN** it calls the `submit_findings` MCP tool with the documentation findings (`category`, `severity` of `low` | `medium`, `anchor`, `body`)
+- **AND** the daemon validates the payload (via a56's `record_submission`) and, after the subprocess exits, `consume_submission`s it to produce the `Reported` findings — a `high` severity in the submission is demoted to `medium` per the existing demotion scenario
+- **AND** a schema-invalid submission is surfaced to the agent as a correctable tool error
+
+#### Scenario: No valid submission fails the audit
+- **WHEN** the agent never calls `submit_findings` AND the session ends with no stored submission
+- **THEN** the audit returns `Err`
+- **AND** the framework treats this as audit failure: state is NOT updated, the chatops audit-failure alert posts, the next iteration retries
 
 ### Requirement: `brownfield` chatops verb queues a brownfield-draft executor request
 The chatops listener SHALL submit a `BrownfieldAction` (per the chatops-manager requirement) which the daemon's control-socket handler converts into an entry on the resolved repo's `pending_brownfield_requests: VecDeque<RequestId>` queue. The daemon SHALL persist a per-request state file `<workspace>/.state/brownfield_requests/<request_id>.json` containing the request's `repo_url`, `capability_name`, `guidance: Option<String>`, `channel`, `thread_ts`, AND `status` (`Pending` | `InProgress` | `Acted` | `Failed` | `Aborted`).
@@ -6840,4 +6866,24 @@ The registry also defines the `provider → default CLI` rule that the agentic-r
 - **THEN** an `anthropic` entry resolves to the `claude` CLI
 - **AND** an `ollama` OR `openai_compatible` entry resolves to the `opencode` CLI
 - **AND** an entry with an explicit `cli: claude` resolves to `claude` regardless of its provider
+
+### Requirement: Control socket exposes record_submission AND consume_submission actions
+The daemon's Unix-domain control socket SHALL expose `record_submission` AND `consume_submission` actions for execution-scoped structured submissions, paralleling the existing `record_outcome` / `consume_outcome` actions. `record_submission` SHALL accept a workspace-basename routing key, a change/execution key, a role name, AND a payload; it SHALL validate the payload against the role's registered schema AND store it keyed by execution, returning `{ ok: true }` on success OR `{ ok: false, error: <reason> }` on a schema/validation failure (which the MCP relay surfaces to the agent as a correctable tool error). `consume_submission` SHALL return the stored submission for an execution AND clear it, so the role's daemon-side caller owns the result.
+
+This change establishes the actions AND the execution-scoped storage. The per-role payload schemas are registered by the changes that add each role's `submit_*` tool (4/5/6/8); this requirement defines the transport AND lifecycle the schemas plug into.
+
+#### Scenario: Submission round-trips through the control socket
+- **WHEN** an MCP child sends a valid `record_submission` for an execution
+- **THEN** the daemon stores it AND returns `{ ok: true }`
+- **AND** a subsequent `consume_submission` for that execution returns the stored payload AND clears it
+
+#### Scenario: Schema-invalid submission is rejected
+- **WHEN** a `record_submission` payload fails its role's registered schema
+- **THEN** the daemon returns `{ ok: false, error: <reason> }` without storing it
+- **AND** the reason is suitable for the MCP relay to surface to the agent for correction
+
+#### Scenario: Consume with no stored submission is empty, not an error
+- **WHEN** `consume_submission` is called for an execution with no stored submission
+- **THEN** it returns an empty result (no submission) rather than failing
+- **AND** the caller treats absence as "the role did not submit"
 

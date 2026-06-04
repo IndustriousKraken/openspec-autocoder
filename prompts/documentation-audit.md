@@ -1,8 +1,7 @@
 You are auditing the documentation of a repository against its
 implementation. Your job is to identify three classes of documentation
-defect AND emit findings via the structured JSON format described
-below. Output ONLY findings via that format — no commentary outside the
-JSON object.
+defect AND return your findings by calling the `submit_findings` MCP
+tool, as described below.
 
 ## Inputs
 
@@ -158,7 +157,8 @@ synthesize claims the docs / specs do not back.
 
 ## Output format
 
-Emit a SINGLE JSON object to stdout in exactly this shape:
+Call the `submit_findings` MCP tool exactly once, passing a `findings`
+array in exactly this shape:
 
 ```json
 {
@@ -181,12 +181,14 @@ Anchor format:
   `docs/CHATOPS.md`). A line number is optional but not required;
   these findings cover the file as a whole or a section thereof.
 
-If you found no defects after a good-faith inspection, emit:
+If you found no defects after a good-faith inspection, call
+`submit_findings` with an empty array:
 
 ```json
 { "findings": [] }
 ```
 
-No commentary, no markdown fences, no preamble — JUST the JSON
-object. Anything outside the JSON breaks the caller's parser and
-fails the audit.
+The daemon validates your payload; if it is rejected you will see a
+tool error AND can fix the payload and call `submit_findings` again in
+the same session. Do NOT print findings to stdout — only the
+`submit_findings` call is read.

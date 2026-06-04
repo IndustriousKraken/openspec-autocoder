@@ -106,6 +106,8 @@ mod tests {
             max_code_reviews_per_pr: None,
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         }
     }
 

@@ -1316,3 +1316,139 @@ This closes a self-hosting hazard: `prompts/implementer-revision.md` itself cont
 - **THEN** each placeholder is substituted exactly once
 - **AND** the rendered prompt is byte-identical to the prior chained-`.replace` output
 
+### Requirement: Shared agentic-run primitive
+The daemon SHALL provide a single agentic-run primitive that wraps a CLI as a subprocess, hands it a prompt, and runs an agentic session to completion. Every CLI-wrapping role — the executor AND every audit, AND the agentic roles added by later changes — SHALL use this primitive; the per-module `run_subprocess` functions AND their duplicated `SubprocessOutcome` structs SHALL be removed.
+
+The primitive SHALL accept the workspace, a `CliStrategy`, the prompt (delivered on stdin), the sandbox configuration (allowed-tools list AND disallowed bash/read patterns), an optional MCP configuration (which tools to expose AND the control-socket relay environment), an output mode (streaming-JSON OR simple-capture), AND a timeout. It SHALL spawn the child in its own process group, enforce the timeout via the existing select-and-kill pattern, AND return a unified `AgenticRunOutcome` carrying `timed_out`, `exit_status`, `stdout`, `stderr`, an optional `final_answer`, an optional `session_id`, AND whether a streamed log was written. The streaming-JSON event parsing (`final_answer`, `session_id`, incremental log) SHALL run ONLY in streaming mode; simple-capture mode reads stdout/stderr at exit.
+
+The refactor SHALL be behavior-neutral: the executor retains streaming-JSON + MCP + the recovery/session-reuse path; each audit retains simple-capture + no-MCP + its existing read-only tool list AND its ETXTBSY retry.
+
+#### Scenario: Executor path is behavior-identical through the primitive
+- **WHEN** the executor runs a canned change through the primitive in streaming mode with MCP enabled
+- **THEN** the streamed per-change log, the parsed `final_answer`, AND the outcome classification are identical to the pre-refactor `run_subprocess` for the same inputs
+
+#### Scenario: Audit path is behavior-identical through the primitive
+- **WHEN** an audit runs through the primitive in simple-capture mode with no MCP AND its existing allowed-tools list
+- **THEN** the returned `stdout` AND `exit_status` are identical to the pre-refactor audit `run_subprocess`
+- **AND** no `.mcp.json` is written for that run
+
+#### Scenario: Single source of truth
+- **WHEN** the codebase is searched after this change
+- **THEN** no `run_subprocess` or `SubprocessOutcome` definition exists outside the agentic-run module
+
+### Requirement: CliStrategy trait with the claude implementation
+The agentic-run primitive SHALL select its CLI invocation through a `CliStrategy` trait so a model's provider can determine the CLI without role code changing. The trait SHALL do two jobs: build the invocation (binary, flags, the allowed-tools/sandbox-settings format, AND the MCP-config-file format) AND translate a resolved `(provider, model, api_base_url, api_key)` into that CLI's model-selection mechanism. A role's strategy SHALL be resolved from the model's provider via the model registry's `provider → default CLI` rule.
+
+This change SHALL implement the `claude` strategy AND reproduce today's invocation exactly: `--settings <sandbox-file>`, `--allowedTools <combined>`, `--permission-mode acceptEdits`, AND — in streaming mode — `--verbose --output-format stream-json`, with MCP delivered via `.mcp.json`. The `claude` strategy SHALL select the model via `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` ONLY when a model is configured; when no model is configured it SHALL set none of them, preserving the executor's current CLI-default behavior. A role whose provider resolves to a CLI with no registered strategy SHALL return a clear error naming that CLI; this change registers only the `claude` strategy, so any non-`claude` resolution errors until that CLI's strategy is added (the `opencode` strategy is added by a later change).
+
+#### Scenario: Claude strategy with no model preserves CLI-default behavior
+- **WHEN** the `claude` strategy builds an invocation with `model: None` (the executor's current state)
+- **THEN** none of `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` is set
+- **AND** the invocation is byte-identical to the pre-refactor executor command
+
+#### Scenario: Claude strategy with a model sets the selection env
+- **WHEN** the `claude` strategy builds an invocation with a resolved model `(anthropic, claude-opus-4-8, base, key)`
+- **THEN** `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, AND `ANTHROPIC_MODEL` are set from the resolved tuple
+
+#### Scenario: A CLI with no registered strategy returns a clear error
+- **WHEN** a role's model resolves (via the registry rule) to a CLI that has no registered strategy (e.g. `opencode`, before its strategy is added)
+- **THEN** strategy resolution returns an error naming the CLI
+- **AND** no subprocess is spawned
+
+### Requirement: Per-execution MCP child exposes a per-role submission tool via control-socket relay
+The per-execution MCP child SHALL support a per-role structured-submission tool family that relays a schema-validated payload to the daemon over the control socket, paralleling the existing `outcome_*` / `record_outcome` relay. The MCP child SHALL read an `ORCH_MCP_ROLE` value from its environment (written into `.mcp.json` by the config writer) AND advertise only that role's `submit_*` tool alongside the common tools; a child with no role advertises no submission tool.
+
+This change establishes the framework AND the relay helper only. The concrete per-role tools (`submit_findings`, `submit_review`, `submit_contradictions`, `submit_verdict`) AND their schemas SHALL be added by the changes that consume them, each following this pattern. The relay SHALL send a control-socket request naming the role AND the payload, AND SHALL surface a tool error to the agent when the daemon rejects the submission (e.g. schema-invalid), so the agent can correct AND retry in the same session.
+
+#### Scenario: Role-scoped advertisement
+- **WHEN** the MCP child starts with `ORCH_MCP_ROLE` set to a role that has a registered submission tool
+- **THEN** the `tools/list` response advertises that role's `submit_*` tool AND the common tools (e.g. `query_canonical_specs`)
+- **AND** it does NOT advertise submission tools for other roles
+
+#### Scenario: Submission relays to the daemon
+- **WHEN** an agent calls its role's `submit_*` tool with a valid payload
+- **THEN** the MCP child relays a `record_submission` request over the control socket naming the role AND the payload
+- **AND** a daemon rejection (e.g. schema-invalid) is surfaced to the agent as a correctable tool error
+
+### Requirement: submit_findings MCP tool returns advisory-audit findings
+The per-execution MCP child SHALL advertise a `submit_findings` tool — built on a56's per-role submission framework — whenever `ORCH_MCP_ROLE` names an advisory audit (`drift_audit`, `architecture_consultative`, OR `documentation_audit`). The tool's payload schema is the audit-specific finding shape registered for that role: drift findings carry `{capability, requirement, severity, code_anchors, divergence}`; architecture findings carry `{subject, body, anchor, severity}` with the array capped at 5 entries; documentation findings carry `{category, severity, anchor, body}`. A non-advisory role (the executor `implementer`, the specs-writing audits `missing_tests` / `security_bug`) SHALL NOT advertise `submit_findings`.
+
+The three advisory audits SHALL run through a56's `agentic_run` primitive WITH MCP enabled (capture mode retained, existing read-only allowed-tools list) so the tool is reachable; this supersedes a56's interim "audits run with no MCP" for these three roles ONLY. The agent returns findings by calling `submit_findings`; after the audit subprocess exits the daemon `consume_submission`s the stored payload (a56) to produce the `AuditOutcome::Reported` findings. A `submit_findings` call whose payload fails the role schema is rejected by `record_submission` AND surfaced to the agent as a correctable tool error it can retry in the same session; an audit run that ends with NO stored submission is an audit failure.
+
+#### Scenario: Advertised only for advisory roles
+- **WHEN** the MCP child starts with `ORCH_MCP_ROLE = architecture_consultative`
+- **THEN** the `tools/list` response advertises `submit_findings` with the architecture finding schema alongside the common tools
+- **WHEN** the MCP child starts with `ORCH_MCP_ROLE = implementer`, `missing_tests`, OR `security_bug`
+- **THEN** `submit_findings` is NOT advertised
+
+#### Scenario: Submission becomes the audit result
+- **WHEN** an advisory audit's agent calls `submit_findings` with a schema-valid payload
+- **THEN** the MCP child relays it via `record_submission` (a56)
+- **AND** after the subprocess exits the daemon `consume_submission`s the stored payload into `Finding` values for `AuditOutcome::Reported`
+
+#### Scenario: Schema-invalid submission is correctable, not fatal
+- **WHEN** a `submit_findings` payload violates the role schema (a missing required field, OR more than 5 architecture findings)
+- **THEN** `record_submission` rejects it (a56) AND the agent observes a correctable tool error it can retry in the same session
+- **AND** a single rejection does NOT fail the audit on its own — a subsequent valid submission in the same execution is accepted
+
+#### Scenario: No submission fails the audit
+- **WHEN** an advisory-audit subprocess exits with no stored submission for the execution
+- **THEN** the audit returns `Err` (audit failure: state not updated, chatops audit-failure alert posts, the next iteration retries)
+
+#### Scenario: Advisory audits gain MCP; specs-writing audits do not
+- **WHEN** a `drift_audit`, `architecture_consultative`, OR `documentation_audit` run is built
+- **THEN** it invokes `agentic_run` with MCP enabled (the `submit_findings` tool + `ORCH_MCP_ROLE`), in capture mode, with the audit's existing read-only allowed-tools list
+- **WHEN** a `missing_tests` OR `security_bug` run is built
+- **THEN** it invokes `agentic_run` with NO MCP (unchanged from a56), producing its on-disk proposal as before
+
+### Requirement: submit_review MCP tool returns the reviewer verdict
+The per-execution MCP child SHALL advertise a `submit_review` tool — built on a56's per-role submission framework — whenever `ORCH_MCP_ROLE = reviewer`, AND SHALL NOT advertise it for any other role. The tool's payload schema SHALL be `{ verdict: "Approve" | "Block", summary: string, concerns: [{ title: string, detail: string, anchor: string, should_request_revision: bool, actionable_request: string|null }] }`. The schema SHALL enforce the `verdict` enum AND SHALL require a non-empty `actionable_request` whenever `should_request_revision` is `true`. The tool relays through a56's `relay_submission` → `record_submission`.
+
+A schema-invalid `submit_review` payload (a verdict outside the enum, a `should_request_revision` concern with no `actionable_request`, a malformed shape) SHALL be rejected by `record_submission` AND surfaced to the agent as a correctable tool error it can retry in the same session. After the reviewer session exits the daemon `consume_submission`s the stored payload into a `ReviewResult` (`verdict`, `per_concern`, `raw_output`). A reviewer session that ends with NO stored submission SHALL cause the caller to discard the review AND alert the operator (it SHALL NOT be treated as an implicit `Approve`). This is the structural retirement of the malformed-verdict-defaults-to-approve behavior: the verdict can only enter the daemon through the schema-validated tool.
+
+#### Scenario: Advertised only for the reviewer role
+- **WHEN** the MCP child starts with `ORCH_MCP_ROLE = reviewer`
+- **THEN** the `tools/list` response advertises `submit_review` with the review schema alongside the common tools
+- **WHEN** the MCP child starts with any other role (`implementer`, an advisory audit, a specs-writing audit)
+- **THEN** `submit_review` is NOT advertised
+
+#### Scenario: Valid submission becomes the ReviewResult
+- **WHEN** the reviewer agent calls `submit_review` with a schema-valid payload
+- **THEN** the MCP child relays it via `record_submission` (a56)
+- **AND** after the session exits the daemon `consume_submission`s the payload into a `ReviewResult` whose `verdict` AND `per_concern` come from the submission
+
+#### Scenario: Schema-invalid submission is correctable, not fatal
+- **WHEN** a `submit_review` payload has a `verdict` outside `{Approve, Block}`, OR a concern with `should_request_revision: true` AND an empty `actionable_request`
+- **THEN** `record_submission` rejects it (a56) AND the agent observes a correctable tool error it can retry in the same session
+- **AND** a single rejection does NOT discard the review on its own — a subsequent valid submission in the same execution is accepted
+
+#### Scenario: No submission discards the review, never auto-approves
+- **WHEN** a reviewer session exits with no stored submission for the execution
+- **THEN** the caller discards the review (writes no verdict) AND posts the reviewer-failure operator alert
+- **AND** the outcome is NOT an implicit `Approve`
+
+### Requirement: submit_contradictions MCP tool returns change-internal contradictions
+The per-execution MCP child SHALL advertise a `submit_contradictions` tool — built on a56's per-role submission framework — whenever `ORCH_MCP_ROLE = contradiction_check`, AND SHALL NOT advertise it for any other role. The tool's payload schema SHALL be `{ contradictions: [{ requirement_a: string, requirement_b: string, summary: string }] }`. The tool relays through a56's `relay_submission` → `record_submission`; a schema-invalid payload is rejected AND surfaced to the agent as a correctable tool error it can retry in the same session.
+
+Because the contradiction check is fail-open (per the orchestrator-cli requirement), a session that ends with no stored submission SHALL be consumed as an empty result rather than an error — the fail-open WARN-and-proceed decision lives in the orchestrator-cli caller, not in this tool. A non-empty consumed submission carries the contradictions the caller turns into the `.needs-spec-revision.json` marker.
+
+#### Scenario: Advertised only for the contradiction-check role
+- **WHEN** the MCP child starts with `ORCH_MCP_ROLE = contradiction_check`
+- **THEN** the `tools/list` response advertises `submit_contradictions` with the contradictions schema alongside the common tools
+- **WHEN** the MCP child starts with any other role (`implementer`, `reviewer`, an advisory audit)
+- **THEN** `submit_contradictions` is NOT advertised
+
+#### Scenario: Valid submission is consumed by the caller
+- **WHEN** the agent calls `submit_contradictions` with a schema-valid payload
+- **THEN** the MCP child relays it via `record_submission` (a56)
+- **AND** after the session exits the daemon `consume_submission`s the stored payload for the orchestrator-cli caller to act on
+
+#### Scenario: Schema-invalid submission is correctable
+- **WHEN** a `submit_contradictions` payload fails the schema (missing field, non-array `contradictions`)
+- **THEN** `record_submission` rejects it (a56) AND the agent observes a correctable tool error it can retry in the same session
+
+#### Scenario: Missing submission consumed as empty, not an error
+- **WHEN** a contradiction-check session exits with no stored submission for the execution
+- **THEN** `consume_submission` returns an empty result (no contradictions)
+- **AND** the tool layer does NOT raise an error — the orchestrator-cli caller's fail-open policy decides the WARN-and-proceed outcome
+

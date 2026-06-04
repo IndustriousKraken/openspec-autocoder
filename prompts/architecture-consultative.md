@@ -100,8 +100,8 @@ problems within whichever parts you examine.
 
 ## Output format
 
-Emit a SINGLE JSON object to stdout in EXACTLY this shape. No
-preamble, no markdown fences, no commentary.
+Call the `submit_findings` MCP tool exactly once, passing a `findings`
+array in EXACTLY this shape:
 
 ```json
 {
@@ -123,9 +123,12 @@ preamble, no markdown fences, no commentary.
 - `severity` is `low` or `medium`. There is no `high` for a
   consultative audit — these are questions, not emergencies.
 
-The `findings` array MUST contain AT MOST 5 entries. Aim for 3.
+The `findings` array MUST contain AT MOST 5 entries. Aim for 3. A
+submission with more than 5 entries is rejected by the schema; you will
+see a tool error AND can resubmit a trimmed list in the same session.
 
-If nothing rises above this prompt's quality bar, emit:
+If nothing rises above this prompt's quality bar, call `submit_findings`
+with an empty array:
 
 ```json
 { "findings": [] }
@@ -138,5 +141,5 @@ Silence is the correct answer when you have nothing high-quality to say.
 - Do NOT use the `Write` or `Edit` tools.
 - Do NOT create files. Do NOT modify the workspace.
 - Do NOT post chatops messages, run git commits, or push branches.
-- Anything outside the JSON object breaks the caller's parser and
-  fails the audit. Output the JSON object and ONLY the JSON object.
+- Return findings ONLY via the `submit_findings` tool — content printed
+  to stdout is not read.

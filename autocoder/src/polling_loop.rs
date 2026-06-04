@@ -1117,41 +1117,87 @@ pub async fn execute_one_pass(
             None => (None, false, Vec::new()),
             Some(r) => {
                 let _ = guard.set_stage(busy_marker::Stage::Review);
-                let outcome = match r.mode() {
-                    crate::config::ReviewerMode::Bundled => {
-                        let ctx = build_review_context(workspace, repo, &processed)?;
-                        r.review(&ctx).await
+                match r.kind() {
+                    // a58: agentic transport — run the read-only CLI-wrapped
+                    // session(s) and consume the schema-validated verdict. A
+                    // session that records no valid submission DISCARDS the
+                    // review (no verdict written, NOT an implicit Approve) AND
+                    // posts the reviewer-failure operator alert.
+                    crate::config::ReviewerKind::Agentic => {
+                        let ctx = build_review_context(workspace, repo, &processed, r.kind())?;
+                        match crate::code_reviewer::run_agentic_review(r, &ctx, workspace).await {
+                            Ok(crate::code_reviewer::AgenticReviewOutcome::Reviewed(result)) => {
+                                let mut report = result.into_review_report();
+                                let draft = matches!(report.verdict, ReviewVerdict::Block);
+                                let taken = if r.auto_revise() {
+                                    partition_and_annotate_reviewer_revisions(
+                                        &mut report,
+                                        revision_cap,
+                                    )
+                                } else {
+                                    Vec::new()
+                                };
+                                (Some(report), draft, taken)
+                            }
+                            Ok(crate::code_reviewer::AgenticReviewOutcome::Discarded { reason }) => {
+                                tracing::error!(url = %repo.url, "agentic reviewer discarded: {reason}");
+                                post_reviewer_discarded_alert(chatops_ctx, repo, &reason).await;
+                                (None, false, Vec::new())
+                            }
+                            Err(e) => {
+                                tracing::error!(url = %repo.url, "agentic reviewer failed: {e:#}");
+                                post_reviewer_discarded_alert(
+                                    chatops_ctx,
+                                    repo,
+                                    &format!("agentic reviewer failed: {e}"),
+                                )
+                                .await;
+                                (None, false, Vec::new())
+                            }
+                        }
                     }
-                    crate::config::ReviewerMode::PerChange => {
-                        let contexts =
-                            build_per_change_contexts(workspace, repo, &processed)?;
-                        r.review_per_change(&contexts).await.map(|per_change| {
-                            crate::code_reviewer::synthesize_per_change_report(per_change)
-                        })
-                    }
-                };
-                match outcome {
-                    Ok(mut report) => {
-                        let draft = matches!(report.verdict, ReviewVerdict::Block);
-                        let taken = if r.auto_revise() {
-                            partition_and_annotate_reviewer_revisions(&mut report, revision_cap)
-                        } else {
-                            Vec::new()
+                    crate::config::ReviewerKind::Oneshot => {
+                        let outcome = match r.mode() {
+                            crate::config::ReviewerMode::Bundled => {
+                                let ctx =
+                                    build_review_context(workspace, repo, &processed, r.kind())?;
+                                r.review(&ctx).await
+                            }
+                            crate::config::ReviewerMode::PerChange => {
+                                let contexts =
+                                    build_per_change_contexts(workspace, repo, &processed)?;
+                                r.review_per_change(&contexts).await.map(|per_change| {
+                                    crate::code_reviewer::synthesize_per_change_report(per_change)
+                                })
+                            }
                         };
-                        (Some(report), draft, taken)
-                    }
-                    Err(e) => {
-                        tracing::error!("reviewer failed: {e:#}");
-                        let synthetic = ReviewReport {
-                            verdict: ReviewVerdict::Concerns,
-                            markdown: format!("(reviewer failed: {e})"),
-                            concerns: Vec::new(),
-                            per_change_sections: Vec::new(),
-                            // Reviewer failed before producing a verdict; no
-                            // model output to attribute (a49).
-                            attribution: None,
-                        };
-                        (Some(synthetic), false, Vec::new())
+                        match outcome {
+                            Ok(mut report) => {
+                                let draft = matches!(report.verdict, ReviewVerdict::Block);
+                                let taken = if r.auto_revise() {
+                                    partition_and_annotate_reviewer_revisions(
+                                        &mut report,
+                                        revision_cap,
+                                    )
+                                } else {
+                                    Vec::new()
+                                };
+                                (Some(report), draft, taken)
+                            }
+                            Err(e) => {
+                                tracing::error!("reviewer failed: {e:#}");
+                                let synthetic = ReviewReport {
+                                    verdict: ReviewVerdict::Concerns,
+                                    markdown: format!("(reviewer failed: {e})"),
+                                    concerns: Vec::new(),
+                                    per_change_sections: Vec::new(),
+                                    // Reviewer failed before producing a verdict;
+                                    // no model output to attribute (a49).
+                                    attribution: None,
+                                };
+                                (Some(synthetic), false, Vec::new())
+                            }
+                        }
                     }
                 }
             }
@@ -1252,29 +1298,53 @@ pub(crate) fn build_review_context(
     workspace: &Path,
     repo: &RepositoryConfig,
     processed: &[String],
+    reviewer_kind: crate::config::ReviewerKind,
 ) -> Result<crate::code_reviewer::ReviewContext> {
     let diff = git::diff_three_dot(workspace, &repo.base_branch, &repo.agent_branch)?;
     let file_list =
         git::diff_files_changed(workspace, &repo.base_branch, &repo.agent_branch)?;
 
+    // a58 revision: the agentic reviewer reads files on demand through its
+    // read-only sandbox — `render_agentic_review_prompt` lists only the
+    // changed-file PATHS and never inlines contents. So for the agentic
+    // transport, skip the eager full-file `read_to_string` of every touched
+    // file: those reads are wasted I/O AND the dominant memory allocation on
+    // large passes, partially defeating the agentic reviewer's whole point.
+    // The oneshot path still pre-dumps contents into its prompt, so it keeps
+    // reading them. Deleted files (absent on disk) stay excluded from the
+    // path list in BOTH transports, matching the prior behavior.
+    let include_file_contents =
+        matches!(reviewer_kind, crate::config::ReviewerKind::Oneshot);
+
     let mut changed_files = Vec::with_capacity(file_list.len());
     for path in &file_list {
         let abs = workspace.join(path);
-        match std::fs::read_to_string(&abs) {
-            Ok(contents) => changed_files.push(crate::code_reviewer::ChangedFile {
-                path: path.clone(),
-                contents,
-            }),
-            // Deleted files appear in the diff but have no current
-            // content. Their removal is captured by the diff itself.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                tracing::warn!(
-                    path = %path,
-                    "skipping changed-file read for reviewer: {e}"
-                );
-                continue;
+        if include_file_contents {
+            match std::fs::read_to_string(&abs) {
+                Ok(contents) => changed_files.push(crate::code_reviewer::ChangedFile {
+                    path: path.clone(),
+                    contents,
+                }),
+                // Deleted files appear in the diff but have no current
+                // content. Their removal is captured by the diff itself.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path,
+                        "skipping changed-file read for reviewer: {e}"
+                    );
+                    continue;
+                }
             }
+        } else if abs.exists() {
+            // Agentic transport: list the path with empty contents (the agent
+            // reads on demand). A cheap existence check still excludes deleted
+            // files so the agent is not pointed at a path that no longer
+            // exists — but no file body is read into memory.
+            changed_files.push(crate::code_reviewer::ChangedFile {
+                path: path.clone(),
+                contents: String::new(),
+            });
         }
     }
 
@@ -2595,15 +2665,14 @@ async fn handle_contradiction_preflight(
     change: &str,
     cc_ctx: &crate::preflight::change_contradiction::ContradictionCheckCtx,
 ) -> Result<Option<QueueStep>> {
-    let findings =
-        crate::preflight::change_contradiction::check_change_internal_contradictions(
-            workspace,
-            change,
-            cc_ctx.llm.as_ref(),
-            &cc_ctx.prompt_template,
-        )
-        .await
-        .with_context(|| format!("contradiction-check pre-flight for `{change}`"))?;
+    // a59: the check runs agentically through `agentic_run` AND is fail-open
+    // by contract — it returns an empty `Vec` (with a WARN) on any session
+    // error, missing submission, OR re-validation failure, so there is no
+    // `Result` to propagate here.
+    let findings = crate::preflight::change_contradiction::run_agentic_contradiction_check(
+        cc_ctx, workspace, change,
+    )
+    .await;
     if findings.is_empty() {
         return Ok(None);
     }
@@ -3490,6 +3559,33 @@ pub(crate) async fn maybe_post_code_review_complete_alert(
             pr_number = pr_number,
             comment_id = %comment_id,
             "failed to persist code-review-complete notification state: {e:#}"
+        );
+    }
+}
+
+/// Post the reviewer-failure operator alert for the pre-PR INITIAL agentic
+/// review (a58). Unlike [`maybe_post_code_review_failed_alert`] (which is
+/// PR-scoped, for the operator-triggered rerun), the initial review runs
+/// BEFORE the PR exists, so this best-effort notification names only the
+/// repo. Gated on `failure_alerts_enabled`; a missing chatops backend OR a
+/// post error degrades to the ERROR log line the caller already emitted.
+pub(crate) async fn post_reviewer_discarded_alert(
+    chatops_ctx: Option<&ChatOpsContext>,
+    repo: &RepositoryConfig,
+    reason: &str,
+) {
+    let Some(ctx) = chatops_ctx else { return };
+    if !ctx.failure_alerts_enabled {
+        return;
+    }
+    let text = format!(
+        "✗ `{repo_url}`: code review discarded (no verdict written): {reason}",
+        repo_url = repo.url,
+    );
+    if let Err(e) = ctx.chatops.post_notification(&ctx.channel, &text).await {
+        tracing::warn!(
+            url = %repo.url,
+            "reviewer-discarded chatops notification post failed: {e:#}"
         );
     }
 }
@@ -9821,7 +9917,7 @@ mod tests {
             // Now exercise the reviewer step's compose path manually,
             // mirroring what execute_one_pass does between
             // `run_pass_through_commits` and `open_pull_request`.
-            let ctx = build_review_context(&ws, &fixture_repo(&ws), &processed)
+            let ctx = build_review_context(&ws, &fixture_repo(&ws), &processed, reviewer.kind())
                 .expect("build_review_context succeeds");
             let (report, draft) = match reviewer.review(&ctx).await {
                 Ok(report) => {
@@ -9897,6 +9993,63 @@ mod tests {
             "reviewer failed",
         )
         .await;
+    }
+
+    /// a58 revision: `build_review_context` reads full file contents only for
+    /// the `Oneshot` transport (which pre-dumps them into its prompt). For the
+    /// `Agentic` transport it lists the same changed-file paths but leaves
+    /// `contents` empty — the agent reads on demand — avoiding the wasted I/O
+    /// and memory the reviewer flagged. The unified diff is produced in both.
+    #[test]
+    fn build_review_context_skips_file_reads_for_agentic_transport() {
+        use crate::config::ReviewerKind;
+        fn git(ws: &Path, args: &[&str]) {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(ws)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?} failed");
+        }
+        let (_dir, ws) = fixture_workspace_with_remote();
+        // Branch off `main` and add a changed file with a known body.
+        git(&ws, &["checkout", "-q", "-b", "agent-q"]);
+        let body = "fn demo() { /* BUILD_CTX_FIXTURE_BODY */ }\n";
+        std::fs::write(ws.join("demo_changed.rs"), body).unwrap();
+        git(&ws, &["add", "-A"]);
+        git(&ws, &["commit", "-q", "-m", "demo: add changed file"]);
+
+        let repo = fixture_repo(&ws);
+        let processed: Vec<String> = Vec::new();
+
+        // Oneshot: the full file body is read into `ChangedFile.contents`.
+        let oneshot = build_review_context(&ws, &repo, &processed, ReviewerKind::Oneshot)
+            .expect("oneshot context builds");
+        let f = oneshot
+            .changed_files
+            .iter()
+            .find(|f| f.path == "demo_changed.rs")
+            .expect("changed file listed in oneshot context");
+        assert_eq!(f.contents, body, "oneshot reads the full file contents");
+
+        // Agentic: the same path is listed, but no contents are read from disk.
+        let agentic = build_review_context(&ws, &repo, &processed, ReviewerKind::Agentic)
+            .expect("agentic context builds");
+        let f = agentic
+            .changed_files
+            .iter()
+            .find(|f| f.path == "demo_changed.rs")
+            .expect("changed file still listed in agentic context");
+        assert!(
+            f.contents.is_empty(),
+            "agentic skips the eager file read (contents left empty): {:?}",
+            f.contents
+        );
+        // The unified diff is still produced in both transports.
+        assert!(
+            agentic.diff.contains("demo_changed.rs"),
+            "diff includes the changed file"
+        );
     }
 
     /// 13.4.7 / git-workflow-manager baseline: empty pass produces no
@@ -12467,32 +12620,25 @@ mod tests {
     // Change-internal contradiction pre-flight (a19)
     // ============================================================
 
-    /// A test LlmClient that returns a fixed body OR a fixed error.
-    struct CcFixedLlm {
-        body: std::sync::Mutex<Option<String>>,
-        error: std::sync::Mutex<Option<String>>,
-    }
-    impl CcFixedLlm {
-        fn ok(body: &str) -> std::sync::Arc<dyn crate::llm::LlmClient> {
-            std::sync::Arc::new(Self {
-                body: std::sync::Mutex::new(Some(body.into())),
-                error: std::sync::Mutex::new(None),
-            })
-        }
-        fn err(msg: &str) -> std::sync::Arc<dyn crate::llm::LlmClient> {
-            std::sync::Arc::new(Self {
-                body: std::sync::Mutex::new(None),
-                error: std::sync::Mutex::new(Some(msg.into())),
-            })
-        }
-    }
-    #[async_trait::async_trait]
-    impl crate::llm::LlmClient for CcFixedLlm {
-        async fn complete(&self, _prompt: &str) -> Result<String> {
-            if let Some(msg) = self.error.lock().unwrap().clone() {
-                return Err(anyhow!(msg));
-            }
-            Ok(self.body.lock().unwrap().clone().unwrap_or_default())
+    /// a59: build a contradiction-check context whose agentic session is
+    /// short-circuited by an injected `submit_contradictions` submission
+    /// (`Some(payload)`), a no-submission session (`None`), bypassing the
+    /// CLI subprocess AND the control socket entirely.
+    fn cc_test_ctx(
+        submission: Option<serde_json::Value>,
+        attribution: Option<String>,
+    ) -> crate::preflight::change_contradiction::ContradictionCheckCtx {
+        crate::preflight::change_contradiction::ContradictionCheckCtx {
+            command: "claude".into(),
+            model: crate::agentic_run::ResolvedModel {
+                provider: crate::config::LlmProvider::Anthropic,
+                model: "claude-test".into(),
+                api_base_url: "https://example.invalid".into(),
+                api_key: "sk-test".into(),
+            },
+            prompt_template: "TEST_PROMPT".into(),
+            attribution,
+            test_submission: Some(submission),
         }
     }
 
@@ -12534,14 +12680,10 @@ mod tests {
     /// reached (the check is a no-op outcome-wise).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn contradiction_preflight_empty_findings_proceeds_to_executor() {
-        let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
-            llm: CcFixedLlm::ok(r#"{"contradictions": []}"#),
-            prompt_template: "TEST_PROMPT".into(),
-            attribution: None,
-        };
+        let ctx = cc_test_ctx(Some(serde_json::json!({ "contradictions": [] })), None);
         let (_dir, ws) = fixture_workspace_with_remote();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
-        // Change has a spec delta so build_spec_input has something to send,
+        // Change has a spec delta so the session has something to read,
         // but archivability check passes (no canonical to fight with).
         add_committed_change_with_spec(
             &ws,
@@ -12585,21 +12727,17 @@ mod tests {
     /// the executor is NOT invoked.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn contradiction_preflight_findings_write_marker_and_skip_executor() {
-        let body = r#"{
-          "contradictions": [
-            { "requirement_a": "All secrets in env vars",
-              "requirement_b": "API key in config.yaml",
-              "summary": "A forbids what B requires" },
-            { "requirement_a": "Cap operations at 60s",
-              "requirement_b": "Run the 5-minute workflow",
-              "summary": "B exceeds A's cap" }
-          ]
-        }"#;
-        let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
-            llm: CcFixedLlm::ok(body),
-            prompt_template: "TEST_PROMPT".into(),
-            attribution: Some("anthropic/claude-opus-4-8".into()),
-        };
+        let submission = serde_json::json!({
+            "contradictions": [
+                { "requirement_a": "All secrets in env vars",
+                  "requirement_b": "API key in config.yaml",
+                  "summary": "A forbids what B requires" },
+                { "requirement_a": "Cap operations at 60s",
+                  "requirement_b": "Run the 5-minute workflow",
+                  "summary": "B exceeds A's cap" }
+            ]
+        });
+        let ctx = cc_test_ctx(Some(submission), Some("anthropic/claude-opus-4-8".into()));
         let (_dir, ws) = fixture_workspace_with_remote();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
         add_committed_change_with_spec(
@@ -12672,15 +12810,13 @@ mod tests {
         );
     }
 
-    /// Enabled mode + LLM transport error → fail open, executor IS
-    /// invoked, no marker written.
+    /// Enabled mode + a session that records NO submission → fail open,
+    /// executor IS invoked, no marker written (a59).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn contradiction_preflight_llm_error_fails_open() {
-        let ctx = crate::preflight::change_contradiction::ContradictionCheckCtx {
-            llm: CcFixedLlm::err("simulated transport error"),
-            prompt_template: "TEST_PROMPT".into(),
-            attribution: None,
-        };
+    async fn contradiction_preflight_no_submission_fails_open() {
+        // `Some(None)` = the agentic session ran but recorded no
+        // `submit_contradictions` submission.
+        let ctx = cc_test_ctx(None, None);
         let (_dir, ws) = fixture_workspace_with_remote();
         let (_td_paths, paths) = crate::testing::test_daemon_paths();
         add_committed_change_with_spec(
@@ -12716,7 +12852,7 @@ mod tests {
         assert_eq!(
             invocations.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "fail-open: executor must be invoked despite the transport error"
+            "fail-open: executor must be invoked when the session records no submission"
         );
         assert!(
             !ws.join("openspec/changes/transport-err/.needs-spec-revision.json")

@@ -279,48 +279,59 @@ fn resolve_reviewer_api_key(cfg: &ReviewerConfig) -> Result<String> {
     }
 }
 
-/// Construct an `LlmClient` for the change-internal contradiction
-/// pre-flight (a19). Parallel surface to [`build_from_config`] but reads
-/// from `ContradictionCheckLlmConfig` so the contradiction check can be
-/// configured with a cheaper model than the reviewer.
-pub fn build_from_contradiction_check_config(
+/// Resolve the change-internal contradiction pre-flight's LLM config (a19)
+/// into a [`crate::agentic_run::ResolvedModel`] (a56) for the agentic
+/// transport (a59). The `claude` CLI strategy reads the resulting tuple to
+/// set `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL`;
+/// its `provider` selects which CLI strategy runs.
+///
+/// A non-Anthropic provider still resolves a tuple here (Anthropic is the
+/// only registered strategy until a60), but its CLI has no registered
+/// strategy yet, so the contradiction-check session fails open at
+/// strategy-resolution time — never spawning a process. The api_key is
+/// resolved only for the key-bearing providers; Ollama (no auth) gets an
+/// empty key it never uses.
+pub fn resolve_contradiction_check_model(
     cfg: &ContradictionCheckLlmConfig,
-) -> Result<Box<dyn LlmClient>> {
+) -> Result<crate::agentic_run::ResolvedModel> {
     let provider = cfg
         .provider
         .expect("change_internal_contradiction_check_llm.provider resolved at config-load");
     let model = cfg.model.clone();
-    let base = cfg.api_base_url.clone();
-
-    match provider {
-        LlmProvider::Ollama => {
-            let base = base.ok_or_else(|| {
-                anyhow!(
-                    "executor.change_internal_contradiction_check_llm.api_base_url is required when provider=ollama"
-                )
-            })?;
-            Ok(Box::new(OllamaChatClient::new(base, model)))
-        }
+    let api_base_url = match provider {
+        LlmProvider::Anthropic => cfg
+            .api_base_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
+        // Defense-in-depth: config-load validation already requires
+        // `api_base_url` for these providers, but resolve it through an
+        // explicit error rather than silently defaulting to `""` — so a
+        // bypassed OR buggy validator surfaces a clear message here instead
+        // of an opaque CLI spawn failure downstream. Mirrors the reviewer's
+        // `build_from_config` AND the pre-a59 `build_from_contradiction_check_config`.
+        LlmProvider::OpenAiCompatible => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!(
+                "executor.change_internal_contradiction_check_llm.api_base_url is required when provider=openai_compatible"
+            )
+        })?,
+        LlmProvider::Ollama => cfg.api_base_url.clone().ok_or_else(|| {
+            anyhow!(
+                "executor.change_internal_contradiction_check_llm.api_base_url is required when provider=ollama"
+            )
+        })?,
+    };
+    let api_key = match provider {
+        LlmProvider::Ollama => String::new(),
         LlmProvider::Anthropic | LlmProvider::OpenAiCompatible => {
-            let api_key = resolve_contradiction_check_api_key(cfg)?;
-            Ok(match provider {
-                LlmProvider::Anthropic => Box::new(AnthropicClient::new(
-                    base.unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE.to_string()),
-                    api_key,
-                    model,
-                )),
-                LlmProvider::OpenAiCompatible => {
-                    let base = base.ok_or_else(|| {
-                        anyhow!(
-                            "executor.change_internal_contradiction_check_llm.api_base_url is required when provider=openai_compatible"
-                        )
-                    })?;
-                    Box::new(OpenAiCompatibleClient::new(base, api_key, model))
-                }
-                LlmProvider::Ollama => unreachable!("handled above"),
-            })
+            resolve_contradiction_check_api_key(cfg)?
         }
-    }
+    };
+    Ok(crate::agentic_run::ResolvedModel {
+        provider,
+        model,
+        api_base_url,
+        api_key,
+    })
 }
 
 fn resolve_contradiction_check_api_key(
@@ -371,6 +382,8 @@ mod tests {
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let err = match build_from_config(&cfg) {
             Ok(_) => panic!("no key source must error"),
@@ -412,6 +425,8 @@ mod tests {
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let client = build_from_config(&cfg)
             .expect("inline api_key with no api_key_env should succeed");
@@ -460,6 +475,8 @@ mod tests {
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let client = build_from_config(&cfg).expect("inline build should succeed");
         let _ = client.complete("hi").await.expect("complete succeeds");
@@ -822,6 +839,8 @@ mod tests {
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let client = build_from_config(&cfg)
             .expect("ollama reviewer must build without api_key");

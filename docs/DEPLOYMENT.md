@@ -325,6 +325,21 @@ The version string surfaced by `autocoder --version` and the `🆙` startup noti
 
 Binary-release operators (using `update.sh`) always see clean `vX.Y.Z` strings in their `🆙` notifications and `--version` output because the release workflow builds at tagged commits. Source-build operators see the `-N-gSHA` form whenever their checkout sits past a tag — which is the common case on master.
 
+## Updating on demand
+
+`update.sh` (repo root) is the updater — run it directly to move to the latest release at any time, not only from cron. It resolves the installed version, fetches the latest non-prerelease tag, downloads + checksum-verifies the binary, runs `autocoder check-config` against the downloaded binary as a preflight, atomically swaps the running binary aside to `/usr/local/bin/autocoder.previous`, restarts the systemd unit, and **rolls back automatically** if the daemon does not reach `active` within 30 seconds. That auto-rollback is why running `update.sh` is safer than re-running `install.sh` for an in-place upgrade.
+
+```bash
+# Update now to the latest release:
+sudo /home/autocoder/update.sh
+# Preview the version resolution + preflight without swapping:
+sudo /home/autocoder/update.sh --dry-run
+# Pin a specific tag instead of "latest":
+sudo /home/autocoder/update.sh --version v0.7.2
+```
+
+If it isn't already on the host, stage it with the `curl` command in the next section. `update.sh` assumes a systemd-managed install (it calls `systemctl`); for a non-standard layout pass `--config-dir <path>` (and set `AUTOCODER_BINARY_PATH` if the binary is not at `/usr/local/bin/autocoder`). Running it when already current is a no-op (`already on <tag>; nothing to do`). To run it on a schedule, see [Unattended updates via cron](#unattended-updates-via-cron) just below.
+
 ## Unattended updates via cron
 
 For single-host SBC, indie VPS, and homelab deployments where set-and-forget is the explicit goal, `update.sh` ships at the repo root as a cron-friendly companion to `install.sh`. The script resolves the installed version, fetches the latest non-prerelease tag, downloads + checksum-verifies the binary, runs `autocoder check-config` against the downloaded binary as a preflight, atomically swaps the binary aside to `/usr/local/bin/autocoder.previous`, restarts the systemd unit, and rolls back automatically if the daemon does not reach `active` within 30 seconds.

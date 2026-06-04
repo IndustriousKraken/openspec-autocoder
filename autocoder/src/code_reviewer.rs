@@ -3,13 +3,17 @@
 //! and parses the response into a `ReviewReport`. Scope is deliberately
 //! code-quality only; spec compliance is a separate verification concern.
 
-use crate::config::ReviewerConfig;
+use crate::config::{LlmProvider, ReviewerConfig, ReviewerKind};
 use crate::llm::{self, LlmClient};
 use crate::prompts::{PromptId, PromptLoader};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::path::Path;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 /// Built-in default prompt template, embedded at compile time so the
 /// binary runs without requiring `prompts/` on the filesystem. The
@@ -166,6 +170,15 @@ pub struct CodeReviewer {
     /// [`CodeReviewer::from_config`]; `None` for the test-only
     /// [`CodeReviewer::new`] path (no config, no model to attribute).
     attribution: Option<String>,
+    /// a58: reviewer transport. `Oneshot` (default) keeps the existing HTTP
+    /// path; `Agentic` routes through the shared `agentic_run` primitive.
+    kind: ReviewerKind,
+    /// a58: the CLI binary the agentic path wraps (default `claude`).
+    command: String,
+    /// a58: the reviewer's LLM provider, used to resolve the agentic CLI
+    /// strategy via the a55 `provider → CLI` rule. Anthropic for the
+    /// test-only [`CodeReviewer::new`] path.
+    provider: LlmProvider,
 }
 
 impl CodeReviewer {
@@ -180,7 +193,35 @@ impl CodeReviewer {
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
             attribution: None,
+            kind: ReviewerKind::Oneshot,
+            command: "claude".to_string(),
+            provider: LlmProvider::Anthropic,
         }
+    }
+
+    /// Builder-style setter for the reviewer transport (`oneshot` vs
+    /// `agentic`). `from_config` sets this from `reviewer.kind`.
+    pub fn with_kind(mut self, kind: ReviewerKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Read the configured reviewer transport.
+    pub fn kind(&self) -> ReviewerKind {
+        self.kind
+    }
+
+    /// Builder-style setter for the agentic CLI command (`reviewer.command`).
+    pub fn with_command(mut self, command: String) -> Self {
+        self.command = command;
+        self
+    }
+
+    /// Builder-style setter for the reviewer's LLM provider, used to resolve
+    /// the agentic CLI strategy via the a55 `provider → CLI` rule.
+    pub fn with_provider(mut self, provider: LlmProvider) -> Self {
+        self.provider = provider;
+        self
     }
 
     /// Builder-style setter for the redaction-safe model attribution (a49).
@@ -297,6 +338,12 @@ impl CodeReviewer {
             .with_max_code_reviews_per_pr(cfg.max_code_reviews_per_pr)
             .with_suggest_rereview_threshold(cfg.suggest_rereview_threshold)
             .with_skip_spec_only_prs(cfg.skip_spec_only_prs)
+            .with_kind(cfg.kind)
+            .with_command(cfg.command.clone())
+            // After `Config::load_from`, `provider` is always resolved; the
+            // unwrap default mirrors the field's documented post-load
+            // invariant.
+            .with_provider(cfg.provider.unwrap_or(LlmProvider::Anthropic))
             .with_attribution(Some(crate::attribution::AttributionSurface::attribution(cfg))))
     }
 
@@ -494,6 +541,503 @@ pub async fn review_pr_at_state_with(
         attribution: report.attribution.clone(),
         concerns: report.concerns,
     })
+}
+
+// =====================================================================
+// Agentic reviewer transport (a58)
+// =====================================================================
+
+/// The MCP role AND submission routing key the agentic reviewer uses. The
+/// per-execution MCP child advertises `submit_review` ONLY when
+/// `ORCH_MCP_ROLE` equals this value; the daemon-side schema validator is
+/// registered under the same key.
+pub const REVIEWER_ROLE: &str = "reviewer";
+
+/// Read-only CLI tool permissions for the agentic reviewer sandbox. NO
+/// `Bash`, NO `Write`, NO `Edit` — the reviewer reads files on demand AND
+/// returns its verdict through the `submit_review` MCP tool.
+pub const AGENTIC_REVIEW_ALLOWED_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
+
+/// Wall-clock cap for one agentic reviewer session. The oneshot path has
+/// no analogous timeout (the HTTP client owns it); this bounds the wrapped
+/// CLI subprocess the way the audits bound theirs.
+const AGENTIC_REVIEW_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// The full `--allowedTools` list the agentic reviewer sandbox grants:
+/// the read-only file tools PLUS the qualified `submit_review` MCP tool.
+/// Notably absent: `Bash`, `Write`, `Edit`. Exposed so tests can assert
+/// the advertised surface (task 4.2).
+pub fn agentic_review_allowed_tools() -> Vec<String> {
+    let mut tools: Vec<String> = AGENTIC_REVIEW_ALLOWED_TOOLS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    if let Some(t) = crate::mcp_askuser_server::submission_tool_name_for_role(REVIEWER_ROLE) {
+        tools.push(crate::mcp_askuser_server::qualified_tool_name(t));
+    }
+    tools
+}
+
+/// One reviewer submission concern, as it arrives in the `submit_review`
+/// payload. The daemon-side validator [`payload_to_review_result`]
+/// deserializes the payload into this shape; a missing required field is a
+/// deserialize error surfaced to the agent as a correctable tool error.
+#[derive(Debug, Clone, Deserialize)]
+struct RawReviewConcern {
+    title: String,
+    detail: String,
+    anchor: String,
+    should_request_revision: bool,
+    #[serde(default)]
+    actionable_request: Option<String>,
+}
+
+/// The `submit_review` payload shape.
+#[derive(Debug, Clone, Deserialize)]
+struct RawReviewSubmission {
+    verdict: String,
+    summary: String,
+    #[serde(default)]
+    concerns: Vec<RawReviewConcern>,
+}
+
+/// Validate AND map a consumed `submit_review` payload into a
+/// [`ReviewResult`] (a58). This is BOTH the daemon-side schema validator
+/// (registered via [`register_reviewer_submission_schema`] with its `Ok`
+/// value discarded) AND the consume-time mapper — so a payload that
+/// records successfully is exactly one that maps, and the two can never
+/// drift (mirrors the advisory audits' `payload_to_findings`).
+///
+/// Returns `Err(reason)` (a correction-suitable string) when the verdict
+/// is outside `{Approve, Block}`, when a concern sets
+/// `should_request_revision: true` without a non-empty `actionable_request`,
+/// OR when the payload does not match the expected shape. `record_submission`
+/// surfaces the reason to the agent as a correctable tool error.
+///
+/// On success the `raw_output` AND `markdown` are the rendered summary +
+/// concerns markdown used for the PR-body `## Code Review` block;
+/// `attribution` is left `None` for the caller to stamp from the reviewer's
+/// configured model.
+pub(crate) fn payload_to_review_result(
+    payload: &Value,
+) -> std::result::Result<ReviewResult, String> {
+    let sub: RawReviewSubmission = serde_json::from_value(payload.clone()).map_err(|e| {
+        format!("submit_review: payload does not match the expected shape: {e}")
+    })?;
+    let verdict = match sub.verdict.as_str() {
+        "Approve" => Verdict::Approve,
+        "Block" => Verdict::Block,
+        other => {
+            return Err(format!(
+                "submit_review: verdict must be one of Approve | Block; got `{other}`"
+            ));
+        }
+    };
+    let mut concerns: Vec<ReviewConcern> = Vec::with_capacity(sub.concerns.len());
+    for (idx, c) in sub.concerns.iter().enumerate() {
+        if c.should_request_revision {
+            let has_request = c
+                .actionable_request
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !has_request {
+                return Err(format!(
+                    "submit_review: concerns[{idx}] (`{title}`) sets should_request_revision: true \
+                     but has an empty actionable_request; provide the concrete revision instruction",
+                    title = c.title
+                ));
+            }
+        }
+        concerns.push(ReviewConcern {
+            summary: c.title.clone(),
+            actionable_request: c.actionable_request.clone(),
+            should_request_revision: c.should_request_revision,
+            change_slug: None,
+        });
+    }
+    let raw_output = render_review_submission_markdown(&sub.summary, &sub.concerns);
+    let per_concern = concerns.iter().map(ConcernEntry::from).collect();
+    Ok(ReviewResult {
+        verdict,
+        per_concern,
+        raw_output: raw_output.clone(),
+        markdown: raw_output,
+        per_change_sections: Vec::new(),
+        concerns,
+        attribution: None,
+    })
+}
+
+/// Render a `submit_review` payload's summary + concerns into the markdown
+/// body the PR-body `## Code Review` block carries. Wording is not
+/// asserted by tests (per the project-documentation requirement "Tests
+/// assert behavior or derivation, never message wording").
+fn render_review_submission_markdown(summary: &str, concerns: &[RawReviewConcern]) -> String {
+    let mut out = String::new();
+    if !summary.trim().is_empty() {
+        out.push_str(summary.trim_end());
+    }
+    if !concerns.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("## Concerns");
+        for c in concerns {
+            out.push_str(&format!("\n\n- **{}**", c.title));
+            if !c.anchor.trim().is_empty() {
+                out.push_str(&format!(" ({})", c.anchor.trim()));
+            }
+            if !c.detail.trim().is_empty() {
+                out.push_str(&format!("\n  {}", c.detail.trim()));
+            }
+            if c.should_request_revision
+                && let Some(req) = c.actionable_request.as_deref()
+                && !req.trim().is_empty()
+            {
+                out.push_str(&format!("\n  - Requested revision: {}", req.trim()));
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push_str("(no concerns)");
+    }
+    out
+}
+
+/// Render the agentic reviewer's prompt from a [`ReviewContext`] (a58):
+/// the change briefs, the changed-file PATH list (NOT full contents), AND
+/// the unified diff. The agent reads whatever files it needs on demand via
+/// `Read`, so `reviewer.prompt_budget_chars` is NOT consulted here AND no
+/// `## Skipped (budget exhausted)` truncation occurs.
+pub fn render_agentic_review_prompt(ctx: &ReviewContext, preamble: &str) -> String {
+    let mut out = String::new();
+    if !preamble.trim().is_empty() {
+        out.push_str(preamble.trim_end());
+        out.push_str("\n\n");
+    }
+    out.push_str(
+        "You are reviewing a code change for quality (security, error handling, naming, \
+         style, language idioms, obvious bugs). Do NOT assess whether the diff implements \
+         any spec — that is a separate concern.\n\n",
+    );
+
+    out.push_str("# Change briefs\n\n");
+    if ctx.archived_changes.is_empty() {
+        out.push_str("(no archived-change briefs for this pass)\n\n");
+    } else {
+        for brief in &ctx.archived_changes {
+            out.push_str(&format!("## Change: {}\n\n", brief.name));
+            out.push_str(brief.proposal.trim_end());
+            if let Some(design) = brief.design.as_deref() {
+                out.push_str("\n\n");
+                out.push_str(design.trim_end());
+            }
+            out.push_str("\n\n");
+            out.push_str(brief.tasks.trim_end());
+            out.push_str("\n\n");
+        }
+    }
+
+    out.push_str("# Changed files\n\n");
+    out.push_str(
+        "These files were modified by this pass. Their full contents are NOT inlined — use \
+         the `Read`, `Glob`, AND `Grep` tools to read whatever you need on demand.\n\n",
+    );
+    if ctx.changed_files.is_empty() {
+        out.push_str("(no changed files reported)\n");
+    } else {
+        for f in &ctx.changed_files {
+            out.push_str(&format!("- {}\n", f.path));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("# Unified diff\n\n");
+    if ctx.diff.trim().is_empty() {
+        out.push_str("(no diff produced this pass)\n\n");
+    } else {
+        out.push_str("```diff\n");
+        out.push_str(&ctx.diff);
+        if !ctx.diff.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("```\n\n");
+    }
+
+    out.push_str(
+        "When your analysis is complete, call the `submit_review` MCP tool exactly once with \
+         your verdict (Approve | Block), a summary, AND any concerns. Each concern that should \
+         drive a revision MUST set `should_request_revision: true` with a non-empty \
+         `actionable_request`. Do NOT print the verdict to stdout — the daemon reads it ONLY \
+         from `submit_review`.\n",
+    );
+    out
+}
+
+/// Outcome of an agentic review pass (a58). `Reviewed` carries the
+/// schema-validated [`ReviewResult`]; `Discarded` means a session ended
+/// with no valid `submit_review` submission, so the caller writes NO
+/// verdict (it does NOT default to `Approve`) AND posts the reviewer-
+/// failure operator alert.
+#[derive(Debug, Clone)]
+pub enum AgenticReviewOutcome {
+    Reviewed(ReviewResult),
+    Discarded { reason: String },
+}
+
+/// Abstracts "run ONE agentic reviewer session AND drain its submission"
+/// so the orchestration ([`run_agentic_review_with_runner`]) is unit-
+/// testable without spawning a CLI. Production is
+/// [`CliReviewSessionRunner`]; tests inject canned submissions.
+#[async_trait]
+trait ReviewSessionRunner: Send + Sync {
+    /// Run one session against `prompt` AND return the consumed
+    /// `submit_review` payload, or `None` when the agent recorded no valid
+    /// submission. `slug` labels the session (empty for bundled).
+    async fn run_session(&self, slug: &str, prompt: &str) -> Result<Option<Value>>;
+}
+
+/// Production session runner: writes the per-execution MCP config
+/// (`ORCH_MCP_ROLE = reviewer`), runs the wrapped CLI through
+/// [`crate::agentic_run::agentic_run`] in a read-only capture sandbox, AND
+/// drains the stored submission via the control socket. Mirrors the
+/// advisory audits' `run_audit_cli_with_submit` + `try_consume_submission`.
+struct CliReviewSessionRunner<'a> {
+    workspace: &'a Path,
+    strategy: &'a dyn crate::agentic_run::CliStrategy,
+    settings_dir: Option<&'a Path>,
+    timeout: Duration,
+}
+
+#[async_trait]
+impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
+    async fn run_session(&self, _slug: &str, prompt: &str) -> Result<Option<Value>> {
+        // Write the per-execution MCP config advertising `submit_review`.
+        // `change == REVIEWER_ROLE` keys the submission-store entry; this
+        // runner consumes the same key after exit.
+        crate::executor::claude_cli::ClaudeCliExecutor::write_mcp_config(
+            self.workspace,
+            REVIEWER_ROLE,
+            Some(REVIEWER_ROLE),
+        )
+        .context("writing reviewer MCP config")?;
+
+        let result = crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+            workspace: self.workspace,
+            change: REVIEWER_ROLE,
+            strategy: self.strategy,
+            prompt,
+            sandbox: crate::agentic_run::SandboxConfig {
+                allowed_tools: agentic_review_allowed_tools(),
+                disallowed_bash_patterns: Vec::new(),
+                disallowed_read_paths: Vec::new(),
+                deny_writes: true,
+            },
+            model: None,
+            output_mode: crate::agentic_run::OutputMode::Capture,
+            timeout: self.timeout,
+            paths: None,
+            settings_dir: self.settings_dir,
+            include_autocoder_tools: true,
+            emit_stream_json_in_capture: false,
+            resume_session_id: None,
+            track_subprocess_marker: false,
+            etxtbsy_retry_spawn: true,
+        })
+        .await;
+
+        // Always remove the config we wrote, regardless of run outcome.
+        crate::executor::claude_cli::ClaudeCliExecutor::delete_mcp_config(self.workspace);
+
+        let outcome = result.context("spawning agentic reviewer subprocess")?;
+        if outcome.timed_out {
+            return Err(anyhow!(
+                "agentic reviewer session timed out after {}s",
+                self.timeout.as_secs()
+            ));
+        }
+        Ok(crate::audits::try_consume_submission(self.workspace, REVIEWER_ROLE).await)
+    }
+}
+
+/// Resolve the agentic reviewer's CLI strategy from its provider via the
+/// a55/a56 `provider → CLI` rule. Anthropic → the `claude` strategy; any
+/// other provider resolves to a CLI with no registered strategy yet (a60)
+/// AND returns a clear error naming it, with no session spawned.
+fn resolve_reviewer_strategy(
+    reviewer: &CodeReviewer,
+) -> Result<Box<dyn crate::agentic_run::CliStrategy>> {
+    crate::agentic_run::strategy_for_provider(
+        reviewer.provider,
+        reviewer.command.clone(),
+        Vec::new(),
+    )
+}
+
+/// Run the agentic reviewer against `ctx` (a58). Production entry point for
+/// both the polling-loop initial review AND the operator-triggered rerun
+/// composer. Resolves the CLI strategy (erroring before any spawn when the
+/// reviewer command has no registered strategy), then dispatches one
+/// session per `reviewer.mode()`.
+pub async fn run_agentic_review(
+    reviewer: &CodeReviewer,
+    ctx: &ReviewContext,
+    workspace: &Path,
+) -> Result<AgenticReviewOutcome> {
+    let strategy = resolve_reviewer_strategy(reviewer)?;
+    let runner = CliReviewSessionRunner {
+        workspace,
+        strategy: strategy.as_ref(),
+        settings_dir: None,
+        timeout: AGENTIC_REVIEW_TIMEOUT,
+    };
+    run_agentic_review_with_runner(reviewer, ctx, &runner).await
+}
+
+/// Mode-aware orchestration shared by production AND tests. Honors
+/// `reviewer.mode()` identically to the one-shot path: `Bundled` → one
+/// session for the whole `ReviewContext`; `PerChange` → one session per
+/// archived change (split via [`split_per_change_contexts`]), synthesized
+/// into a single [`ReviewResult`] with one `per_change_sections` entry per
+/// change. A session that records no valid submission discards the WHOLE
+/// review (returns `Discarded`) — it never defaults to `Approve`.
+async fn run_agentic_review_with_runner(
+    reviewer: &CodeReviewer,
+    ctx: &ReviewContext,
+    runner: &dyn ReviewSessionRunner,
+) -> Result<AgenticReviewOutcome> {
+    // Build the per-session work list. Bundled is always exactly one
+    // session even when the pass has zero archived changes.
+    let sessions: Vec<(Option<String>, ReviewContext, String)> = match reviewer.mode() {
+        crate::config::ReviewerMode::Bundled => vec![(None, ctx.clone(), String::new())],
+        crate::config::ReviewerMode::PerChange => split_per_change_contexts(ctx)
+            .into_iter()
+            .map(|p| (Some(p.change_slug), p.context, p.cross_change_preamble))
+            .collect(),
+    };
+
+    let mut reviews: Vec<(Option<String>, ReviewResult)> = Vec::with_capacity(sessions.len());
+    for (slug, session_ctx, preamble) in &sessions {
+        let prompt = render_agentic_review_prompt(session_ctx, preamble);
+        let consumed = runner
+            .run_session(slug.as_deref().unwrap_or(""), &prompt)
+            .await?;
+        match consumed {
+            None => {
+                let reason = match slug {
+                    Some(s) => format!(
+                        "agentic reviewer session for `{s}` recorded no valid submit_review submission"
+                    ),
+                    None => "agentic reviewer session recorded no valid submit_review submission"
+                        .to_string(),
+                };
+                return Ok(AgenticReviewOutcome::Discarded { reason });
+            }
+            Some(payload) => {
+                // The payload already passed `record_submission`'s validator,
+                // so this re-map cannot drift; a failure here is an internal
+                // invariant violation.
+                let result = payload_to_review_result(&payload).map_err(|e| {
+                    anyhow!("recorded submit_review payload failed re-validation: {e}")
+                })?;
+                reviews.push((slug.clone(), result));
+            }
+        }
+    }
+
+    let outcome = match reviewer.mode() {
+        crate::config::ReviewerMode::Bundled => {
+            let mut result = reviews
+                .pop()
+                .map(|(_, r)| r)
+                .expect("bundled mode always runs exactly one session");
+            result.attribution = reviewer.attribution.clone();
+            result
+        }
+        crate::config::ReviewerMode::PerChange => {
+            synthesize_agentic_per_change(reviews, reviewer.attribution.clone())
+        }
+    };
+    Ok(AgenticReviewOutcome::Reviewed(outcome))
+}
+
+/// Aggregate per-change agentic [`ReviewResult`]s into one result whose
+/// `per_change_sections` drives the composer to emit one
+/// `## Code Review: <slug>` section per change — the same disposition the
+/// one-shot per-change path produces. The aggregate verdict is `Block` when
+/// ANY change blocked, else `Approve`; the flat `concerns` vec is the union
+/// of each change's concerns tagged with their `change_slug`.
+fn synthesize_agentic_per_change(
+    reviews: Vec<(Option<String>, ReviewResult)>,
+    attribution: Option<String>,
+) -> ReviewResult {
+    let mut verdict = Verdict::Approve;
+    let mut concerns: Vec<ReviewConcern> = Vec::new();
+    let mut sections: Vec<PerChangeSection> = Vec::with_capacity(reviews.len());
+    for (slug, result) in reviews {
+        let slug = slug.unwrap_or_default();
+        if matches!(result.verdict, Verdict::Block) {
+            verdict = Verdict::Block;
+        }
+        for concern in &result.concerns {
+            let mut tagged = concern.clone();
+            tagged.change_slug = Some(slug.clone());
+            concerns.push(tagged);
+        }
+        let section_body = format!(
+            "VERDICT: {}\n\n{}",
+            result.verdict.label(),
+            result.raw_output
+        );
+        sections.push(PerChangeSection {
+            change_slug: slug,
+            markdown: section_body,
+        });
+    }
+    let per_concern = concerns.iter().map(ConcernEntry::from).collect();
+    ReviewResult {
+        verdict,
+        per_concern,
+        raw_output: String::new(),
+        markdown: String::new(),
+        per_change_sections: sections,
+        concerns,
+        attribution,
+    }
+}
+
+/// Register the reviewer's `submit_review` payload schema (a58) with the
+/// daemon's submission store, under [`REVIEWER_ROLE`]. The validator IS
+/// [`payload_to_review_result`] with its `Ok` value discarded, so a
+/// payload that records successfully is exactly one that maps. Called once
+/// at daemon startup alongside the advisory audits' schema registration.
+pub fn register_reviewer_submission_schema(store: &crate::submission_store::SubmissionStore) {
+    use std::sync::Arc;
+    store.register_schema(
+        REVIEWER_ROLE,
+        Arc::new(|p: &Value| payload_to_review_result(p).map(|_| ())),
+    );
+}
+
+impl ReviewResult {
+    /// Convert an agentic [`ReviewResult`] into the [`ReviewReport`] the
+    /// polling-loop's post-review pipeline consumes (draft decision,
+    /// reviewer-revision partitioning, PR-body composition). The two-state
+    /// agentic verdict maps `Approve → Pass` AND `Block → Block`.
+    pub fn into_review_report(self) -> ReviewReport {
+        let verdict = match self.verdict {
+            Verdict::Approve => ReviewVerdict::Pass,
+            Verdict::Block => ReviewVerdict::Block,
+        };
+        ReviewReport {
+            verdict,
+            markdown: self.markdown,
+            concerns: self.concerns,
+            per_change_sections: self.per_change_sections,
+            attribution: self.attribution,
+        }
+    }
 }
 
 /// Split a bundled [`ReviewContext`] into one [`PerChangeContext`] per
@@ -1242,6 +1786,8 @@ this is not yaml: at all: ::: {{{ broken
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let r_default = CodeReviewer::from_config(&cfg_default)
             .expect("default-config builds");
@@ -1268,6 +1814,8 @@ this is not yaml: at all: ::: {{{ broken
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: true,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let r_true = CodeReviewer::from_config(&cfg_true)
             .expect("skip=true builds");
@@ -1338,6 +1886,8 @@ this is not yaml: at all: ::: {{{ broken
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let r = CodeReviewer::from_config(&cfg).expect("config builds");
         unsafe { std::env::remove_var("REVIEWER_TEST_SKIP_FALSE_GATE") };
@@ -1374,6 +1924,8 @@ this is not yaml: at all: ::: {{{ broken
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("should load custom template");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_OVERRIDE") };
@@ -1415,6 +1967,8 @@ this is not yaml: at all: ::: {{{ broken
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let reviewer = CodeReviewer::from_config(&cfg)
             .expect("missing template must fall back to embedded default");
@@ -1457,6 +2011,8 @@ this is not yaml: at all: ::: {{{ broken
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let reviewer = CodeReviewer::from_config(&cfg)
             .expect("nested override resolves");
@@ -1484,6 +2040,8 @@ this is not yaml: at all: ::: {{{ broken
             max_code_reviews_per_pr: Some(5),
             suggest_rereview_threshold: None,
             skip_spec_only_prs: false,
+            kind: crate::config::ReviewerKind::Oneshot,
+            command: "claude".to_string(),
         };
         let reviewer = CodeReviewer::from_config(&cfg).expect("default template loads");
         unsafe { std::env::remove_var("REVIEWER_TEST_KEY_DEFAULT") };
@@ -2066,6 +2624,364 @@ this is not yaml: at all: ::: {{{ broken
             "prompt size {} must be bounded by section sizes + template = {bound} \
              (no multiplicative blowup)",
             prompt.len()
+        );
+    }
+
+    // =================================================================
+    // a58: agentic reviewer transport
+    // =================================================================
+
+    use serde_json::json;
+    use std::collections::VecDeque;
+
+    fn brief(name: &str) -> ChangeBrief {
+        ChangeBrief {
+            name: name.into(),
+            proposal: "## Why\nbecause reasons".into(),
+            design: None,
+            tasks: "- [x] do the thing".into(),
+        }
+    }
+
+    fn valid_review_payload(verdict: &str) -> serde_json::Value {
+        json!({ "verdict": verdict, "summary": "looks ok", "concerns": [] })
+    }
+
+    /// Test session runner: records the slugs + prompts it saw AND returns
+    /// canned submissions (front-of-queue), bypassing any CLI spawn.
+    struct CannedRunner {
+        submissions: Mutex<VecDeque<Option<serde_json::Value>>>,
+        slugs: Mutex<Vec<String>>,
+        prompts: Mutex<Vec<String>>,
+    }
+    impl CannedRunner {
+        fn new(subs: Vec<Option<serde_json::Value>>) -> Self {
+            Self {
+                submissions: Mutex::new(subs.into_iter().collect()),
+                slugs: Mutex::new(Vec::new()),
+                prompts: Mutex::new(Vec::new()),
+            }
+        }
+        fn session_count(&self) -> usize {
+            self.slugs.lock().unwrap().len()
+        }
+    }
+    #[async_trait]
+    impl ReviewSessionRunner for CannedRunner {
+        async fn run_session(&self, slug: &str, prompt: &str) -> Result<Option<Value>> {
+            self.slugs.lock().unwrap().push(slug.to_string());
+            self.prompts.lock().unwrap().push(prompt.to_string());
+            let next = self.submissions.lock().unwrap().pop_front();
+            Ok(next.unwrap_or(None))
+        }
+    }
+
+    /// 4.1: `kind: oneshot` is the default AND its prompt + parsed output
+    /// are byte-identical to the pre-change one-shot path (the agentic
+    /// branch is never taken).
+    #[tokio::test]
+    async fn oneshot_kind_is_default_and_byte_identical() {
+        let (client, captured) = stub_with_capture("VERDICT: Pass\n\nthe review body");
+        let reviewer = CodeReviewer::new(client, "{{diff}}".to_string());
+        assert_eq!(reviewer.kind(), ReviewerKind::Oneshot, "default kind is oneshot");
+        let ctx = ctx_with_diff("DIFFTEXT");
+        let result = review_pr_at_state_with(&reviewer, &ctx).await.unwrap();
+        // The one-shot prompt is the unchanged render: the bare diff for a
+        // `{{diff}}`-only template — no agentic briefs/file-list framing.
+        let prompt = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(prompt, "DIFFTEXT");
+        assert_eq!(result.verdict, Verdict::Approve);
+        assert_eq!(result.markdown, "the review body");
+    }
+
+    /// 4.2: the agentic sandbox advertises Read/Glob/Grep + `submit_review`
+    /// AND does NOT advertise Bash/Write/Edit.
+    #[test]
+    fn agentic_sandbox_advertises_readonly_tools_plus_submit_review() {
+        let tools = agentic_review_allowed_tools();
+        for required in ["Read", "Glob", "Grep"] {
+            assert!(
+                tools.iter().any(|t| t == required),
+                "must advertise {required}: {tools:?}"
+            );
+        }
+        assert!(
+            tools.iter().any(|t| t.contains("submit_review")),
+            "must advertise submit_review: {tools:?}"
+        );
+        for forbidden in ["Bash", "Write", "Edit"] {
+            assert!(
+                !tools.iter().any(|t| t == forbidden),
+                "must NOT advertise {forbidden}: {tools:?}"
+            );
+        }
+    }
+
+    /// 4.2 (defense in depth): the agentic sandbox settings file denies
+    /// `Write`/`Edit` (the read-only `deny_writes` backstop).
+    #[test]
+    fn agentic_sandbox_settings_deny_writes() {
+        let sandbox = crate::config::ResolvedSandbox {
+            allowed_tools: AGENTIC_REVIEW_ALLOWED_TOOLS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            disallowed_bash_patterns: Vec::new(),
+            disallowed_read_paths: Vec::new(),
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let (path, _guard) =
+            crate::audits::write_sandbox_settings(&sandbox, Some(dir.path()), true).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("Write(*)"), "deny list must contain Write(*): {raw}");
+        assert!(raw.contains("Edit(*)"), "deny list must contain Edit(*): {raw}");
+    }
+
+    /// The agentic prompt lists changed-file PATHS (not their contents),
+    /// includes the diff, AND produces no budget-exhaustion footer — the
+    /// agent reads files on demand, so `prompt_budget_chars` does not apply.
+    #[test]
+    fn agentic_prompt_lists_paths_not_contents() {
+        let ctx = ReviewContext {
+            archived_changes: vec![brief("demo")],
+            changed_files: vec![ChangedFile {
+                path: "src/big.rs".into(),
+                contents: "SECRET_FILE_BODY".repeat(1000),
+            }],
+            diff: "DIFFBODY".into(),
+        };
+        let prompt = render_agentic_review_prompt(&ctx, "");
+        assert!(prompt.contains("src/big.rs"), "path must be listed");
+        assert!(
+            !prompt.contains("SECRET_FILE_BODY"),
+            "full file contents must NOT be inlined (read on demand)"
+        );
+        assert!(prompt.contains("DIFFBODY"), "diff must be included");
+        assert!(
+            !prompt.contains("Skipped (budget exhausted)"),
+            "no budget-exhaustion footer in the agentic prompt"
+        );
+        assert!(prompt.contains("submit_review"), "must instruct submit_review");
+    }
+
+    /// 4.3: a schema-valid `submit_review` payload round-trips
+    /// `record_submission` → `consume_submission` → the expected
+    /// `ReviewResult` (verdict + concerns + raw_output).
+    #[test]
+    fn submit_review_payload_round_trips_to_review_result() {
+        use crate::submission_store::SubmissionStore;
+        let store = SubmissionStore::new();
+        register_reviewer_submission_schema(&store);
+        let payload = json!({
+            "verdict": "Block",
+            "summary": "found a real issue",
+            "concerns": [{
+                "title": "sql injection",
+                "detail": "user input is concatenated into the query",
+                "anchor": "src/db.rs:42",
+                "should_request_revision": true,
+                "actionable_request": "use parameterized queries"
+            }]
+        });
+        store
+            .record("repo".into(), REVIEWER_ROLE.into(), REVIEWER_ROLE, payload)
+            .expect("valid payload records");
+        let consumed = store.consume("repo", REVIEWER_ROLE).expect("entry present");
+        let result = payload_to_review_result(&consumed).expect("maps to ReviewResult");
+        assert_eq!(result.verdict, Verdict::Block);
+        assert_eq!(result.concerns.len(), 1);
+        assert!(result.concerns[0].should_request_revision);
+        assert_eq!(
+            result.concerns[0].actionable_request.as_deref(),
+            Some("use parameterized queries")
+        );
+        assert_eq!(result.per_concern.len(), 1);
+        assert!(result.raw_output.contains("found a real issue"));
+        assert!(result.raw_output.contains("sql injection"));
+        // Drained: a second consume returns nothing.
+        assert!(store.consume("repo", REVIEWER_ROLE).is_none());
+    }
+
+    /// 4.4: a non-enum verdict AND a `should_request_revision` concern with
+    /// an empty `actionable_request` are each rejected as a correctable
+    /// error; a subsequent valid submission in the same execution succeeds.
+    #[test]
+    fn submit_review_rejects_bad_verdict_and_missing_request() {
+        let bad_verdict = json!({ "verdict": "LookGoodToMe", "summary": "s", "concerns": [] });
+        let e = payload_to_review_result(&bad_verdict).expect_err("non-enum verdict rejected");
+        assert!(e.contains("verdict"), "reason names the verdict: {e}");
+
+        let bad_concern = json!({
+            "verdict": "Block",
+            "summary": "s",
+            "concerns": [{
+                "title": "t", "detail": "d", "anchor": "a",
+                "should_request_revision": true,
+                "actionable_request": ""
+            }]
+        });
+        let e2 = payload_to_review_result(&bad_concern)
+            .expect_err("should_request_revision without actionable_request rejected");
+        assert!(e2.contains("actionable_request"), "reason names the field: {e2}");
+
+        // A subsequent valid submission succeeds.
+        let good = json!({ "verdict": "Approve", "summary": "s", "concerns": [] });
+        assert!(payload_to_review_result(&good).is_ok());
+    }
+
+    /// 4.4 (store-level): a rejected `submit_review` payload stores nothing,
+    /// AND a subsequent valid submission for the same execution is accepted.
+    #[test]
+    fn submit_review_rejection_does_not_store_then_valid_accepted() {
+        use crate::submission_store::SubmissionStore;
+        let store = SubmissionStore::new();
+        register_reviewer_submission_schema(&store);
+        let bad = json!({ "verdict": "Maybe", "summary": "s", "concerns": [] });
+        assert!(
+            store
+                .record("r".into(), REVIEWER_ROLE.into(), REVIEWER_ROLE, bad)
+                .is_err(),
+            "schema-invalid payload is rejected"
+        );
+        assert!(store.consume("r", REVIEWER_ROLE).is_none(), "nothing stored");
+        store
+            .record(
+                "r".into(),
+                REVIEWER_ROLE.into(),
+                REVIEWER_ROLE,
+                valid_review_payload("Approve"),
+            )
+            .expect("subsequent valid payload accepted");
+        assert!(store.consume("r", REVIEWER_ROLE).is_some());
+    }
+
+    /// 4.5: an agentic session that ends with no valid submission discards
+    /// the review (no verdict written, no auto-approve).
+    #[tokio::test]
+    async fn agentic_no_submission_discards_review() {
+        let (client, _) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "t".to_string());
+        let runner = CannedRunner::new(vec![None]);
+        let outcome = run_agentic_review_with_runner(&reviewer, &ReviewContext::default(), &runner)
+            .await
+            .unwrap();
+        match outcome {
+            AgenticReviewOutcome::Discarded { reason } => {
+                assert!(reason.contains("no valid submit_review"), "reason: {reason}");
+            }
+            AgenticReviewOutcome::Reviewed(_) => {
+                panic!("a missing submission must discard, never produce a verdict")
+            }
+        }
+        assert_eq!(runner.session_count(), 1);
+    }
+
+    /// A schema-valid submission drives a bundled `Reviewed` outcome whose
+    /// verdict + concerns come from the payload, AND the reviewer's
+    /// attribution is stamped onto the result.
+    #[tokio::test]
+    async fn agentic_valid_submission_produces_reviewed_outcome() {
+        let (client, _) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "t".to_string())
+            .with_attribution(Some("anthropic/claude-opus-4-8".to_string()));
+        let payload = json!({
+            "verdict": "Approve",
+            "summary": "all good",
+            "concerns": []
+        });
+        let runner = CannedRunner::new(vec![Some(payload)]);
+        let outcome = run_agentic_review_with_runner(&reviewer, &ReviewContext::default(), &runner)
+            .await
+            .unwrap();
+        match outcome {
+            AgenticReviewOutcome::Reviewed(r) => {
+                assert_eq!(r.verdict, Verdict::Approve);
+                assert!(r.per_change_sections.is_empty(), "bundled has no per-change sections");
+                assert_eq!(r.attribution.as_deref(), Some("anthropic/claude-opus-4-8"));
+            }
+            AgenticReviewOutcome::Discarded { .. } => panic!("expected a reviewed outcome"),
+        }
+    }
+
+    /// 4.7: `reviewer.mode: per_change` dispatches one agentic session per
+    /// change; the per-change results synthesize into one `ReviewResult`
+    /// with one section per change AND the worst-of verdict (any Block →
+    /// Block), feeding the same disposition the one-shot path produces.
+    #[tokio::test]
+    async fn agentic_per_change_runs_one_session_per_change() {
+        let (client, _) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "t".to_string())
+            .with_mode(crate::config::ReviewerMode::PerChange);
+        let ctx = ReviewContext {
+            archived_changes: vec![brief("a-one"), brief("b-two"), brief("c-three")],
+            changed_files: Vec::new(),
+            diff: "d".into(),
+        };
+        let runner = CannedRunner::new(vec![
+            Some(valid_review_payload("Approve")),
+            Some(valid_review_payload("Block")),
+            Some(valid_review_payload("Approve")),
+        ]);
+        let outcome = run_agentic_review_with_runner(&reviewer, &ctx, &runner)
+            .await
+            .unwrap();
+        assert_eq!(runner.session_count(), 3, "one session per change");
+        match outcome {
+            AgenticReviewOutcome::Reviewed(r) => {
+                assert_eq!(r.per_change_sections.len(), 3);
+                assert_eq!(r.verdict, Verdict::Block, "any Block change blocks the PR");
+                let slugs: Vec<&str> = r
+                    .per_change_sections
+                    .iter()
+                    .map(|s| s.change_slug.as_str())
+                    .collect();
+                assert_eq!(slugs, vec!["a-one", "b-two", "c-three"]);
+            }
+            AgenticReviewOutcome::Discarded { .. } => panic!("expected a reviewed outcome"),
+        }
+    }
+
+    /// 4.7 (per-change discard): if ANY per-change session records no valid
+    /// submission, the whole review is discarded (never partially approved).
+    #[tokio::test]
+    async fn agentic_per_change_one_missing_submission_discards_all() {
+        let (client, _) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "t".to_string())
+            .with_mode(crate::config::ReviewerMode::PerChange);
+        let ctx = ReviewContext {
+            archived_changes: vec![brief("a-one"), brief("b-two")],
+            changed_files: Vec::new(),
+            diff: "d".into(),
+        };
+        let runner = CannedRunner::new(vec![Some(valid_review_payload("Approve")), None]);
+        let outcome = run_agentic_review_with_runner(&reviewer, &ctx, &runner)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AgenticReviewOutcome::Discarded { .. }));
+    }
+
+    /// A reviewer command resolving (via the a55 provider→CLI rule) to a CLI
+    /// with no registered strategy returns a clear error naming it; an
+    /// Anthropic reviewer resolves the `claude` strategy.
+    #[test]
+    fn agentic_strategy_resolution_errors_for_unregistered_cli() {
+        let (c1, _) = stub_with_capture("");
+        let opencode_reviewer = CodeReviewer::new(c1, "t".to_string())
+            .with_provider(LlmProvider::OpenAiCompatible)
+            .with_command("opencode".to_string());
+        let err = resolve_reviewer_strategy(&opencode_reviewer)
+            .err()
+            .expect("opencode has no registered strategy yet");
+        assert!(
+            format!("{err:#}").contains("opencode"),
+            "error must name the CLI: {err:#}"
+        );
+
+        let (c2, _) = stub_with_capture("");
+        let claude_reviewer = CodeReviewer::new(c2, "t".to_string());
+        assert!(
+            resolve_reviewer_strategy(&claude_reviewer).is_ok(),
+            "Anthropic reviewer resolves the claude strategy"
         );
     }
 }

@@ -4,7 +4,7 @@
 TBD - created by archiving change reviewer-integration. Update Purpose after archive.
 ## Requirements
 ### Requirement: AI-driven code-quality review
-The code-reviewer SHALL accept a structured `ReviewContext` containing the archived-change briefs, full contents of every file modified by the pass, and the unified diff, then send a rendered prompt to a configured LLM API and return a `ReviewReport { verdict, markdown }`. The review SHALL focus on code quality (security, error handling, naming, style, language idioms, obvious bugs) and SHALL NOT assess whether the diff correctly implements any spec — that is a separate verification concern handled in its own change. The reviewer's prompt-budget cap (the threshold past which touched-file context is truncated with a `## Skipped (budget exhausted): ...` footer) SHALL read from `reviewer.prompt_budget_chars` in `config.yaml`. The default value SHALL be `2000000` characters, preserving today's behavior verbatim for operators who do not set the field. There is no hard upper bound — the operator is responsible for matching the value to their LLM provider's actual context window.
+This requirement governs the `oneshot` reviewer transport (`reviewer.kind: oneshot`); the `agentic` transport — AND the `reviewer.kind` field's default — is specified by the **Agentic reviewer mode** requirement. The code-reviewer SHALL accept a structured `ReviewContext` containing the archived-change briefs, full contents of every file modified by the pass, and the unified diff, then send a rendered prompt to a configured LLM API and return a `ReviewReport { verdict, markdown }`. The review SHALL focus on code quality (security, error handling, naming, style, language idioms, obvious bugs) and SHALL NOT assess whether the diff correctly implements any spec — that is a separate verification concern handled in its own change. The reviewer's prompt-budget cap (the threshold past which touched-file context is truncated with a `## Skipped (budget exhausted): ...` footer) SHALL read from `reviewer.prompt_budget_chars` in `config.yaml`. The default value SHALL be `2000000` characters, preserving today's behavior verbatim for operators who do not set the field. There is no hard upper bound — the operator is responsible for matching the value to their LLM provider's actual context window.
 
 #### Scenario: Successful review with parseable verdict (env-var key)
 - **WHEN** `code_reviewer.review(context)` is called AND the
@@ -483,4 +483,45 @@ The reviewer SHALL assemble its prompt using the single-pass substitution helper
 - **WHEN** a `ReviewContext` whose values contain no placeholder tokens is rendered
 - **THEN** each of the four placeholders is substituted exactly once
 - **AND** the rendered prompt is byte-identical to the prior chained-`.replace` rendering
+
+### Requirement: Agentic reviewer mode
+The reviewer SHALL support an `agentic` transport selected by `reviewer.kind: agentic` (the field defaults to `oneshot`, the existing HTTP path governed by the **AI-driven code-quality review** requirement). In agentic mode the reviewer runs through the shared `agentic_run` primitive (a56) as a CLI-wrapped session that reads files on demand and returns its verdict via the `submit_review` MCP tool, instead of pre-dumping every touched file into one prompt and scraping a `VERDICT:` line from the response.
+
+The agentic session SHALL run in a read-only sandbox whose CLI tool permissions are `["Read", "Glob", "Grep"]` ONLY — NO `Bash`, NO `Write`, NO `Edit` — plus the `submit_review` MCP tool, with `ORCH_MCP_ROLE = reviewer`. The rendered prompt SHALL carry the change briefs, the unified diff, AND the list of changed file paths; it SHALL NOT pre-dump full file contents — the agent reads whatever files it needs via `Read`. Because there is no touched-file pre-dump, `reviewer.prompt_budget_chars` does NOT apply in agentic mode AND no `## Skipped (budget exhausted)` truncation occurs.
+
+The agentic path SHALL produce the same `ReviewResult { verdict, per_concern, raw_output }` the one-shot path produces, so per_change dispatch, `auto_revise` revision comments, the operator re-review verb, AND the revision/re-review caps all operate unchanged. The path SHALL honor `reviewer.mode` (per_change → one session per change; bundled → one session per PR) identically to one-shot. `reviewer.command` (default `claude`) selects the CLI; a non-`claude` command resolves its strategy via the a55/a56 `provider → CLI` rule, AND a CLI with no registered strategy SHALL return a clear error naming it. The default `reviewer.kind` is `oneshot` because the `claude` strategy reaches only Anthropic-shaped endpoints; agentic review for other providers becomes available once their CLI strategy is registered.
+
+#### Scenario: Agentic session runs in a read-only, no-Bash sandbox
+- **WHEN** `reviewer.kind: agentic` AND a review runs
+- **THEN** the session is spawned through `agentic_run` with a sandbox whose CLI tool permissions are exactly `["Read", "Glob", "Grep"]` plus the `submit_review` MCP tool, AND `ORCH_MCP_ROLE = reviewer`
+- **AND** `Bash`, `Write`, AND `Edit` are NOT permitted
+
+#### Scenario: Reads files on demand with no budget truncation
+- **WHEN** the agentic reviewer renders its prompt from a `ReviewContext`
+- **THEN** the prompt contains the change briefs, the unified diff, AND the changed-file path list, but NOT the full contents of those files
+- **AND** the agent obtains file context by calling `Read` during the session
+- **AND** `reviewer.prompt_budget_chars` is NOT consulted AND no `## Skipped (budget exhausted)` footer is produced
+
+#### Scenario: Verdict and concerns return via submit_review
+- **WHEN** the agentic reviewer finishes its analysis
+- **THEN** it calls the `submit_review` MCP tool with `{ verdict: Approve | Block, summary, concerns: [...] }`
+- **AND** after the session exits the daemon `consume_submission`s the payload (a56) into a `ReviewResult` whose `verdict` AND `per_concern` come from the submission AND whose `raw_output` is the rendered summary + concerns used for the PR-body `## Code Review` block
+
+#### Scenario: No valid submission discards the review and alerts
+- **WHEN** the agentic session ends without a schema-valid `submit_review` call (the agent never submits, OR every submission is schema-rejected)
+- **THEN** the daemon DISCARDS the review: it writes NO verdict AND does NOT default to `Approve`
+- **AND** it posts the reviewer-failure chatops alert so the operator can intervene
+- **AND** this supersedes the one-shot rerun composer's verdict-default behavior for the agentic path
+
+#### Scenario: Honors reviewer.mode identically to one-shot
+- **WHEN** `reviewer.kind: agentic` AND `reviewer.mode: per_change` AND a PR bundles multiple changes
+- **THEN** the reviewer runs one `agentic_run` session per change
+- **AND** each session's `ReviewResult` feeds the same per_change disposition code the one-shot path uses
+- **WHEN** `reviewer.mode` is the bundled default
+- **THEN** the reviewer runs one session for the whole PR
+
+#### Scenario: A reviewer command with no registered strategy returns a clear error
+- **WHEN** `reviewer.kind: agentic` AND `reviewer.command` resolves (via the a55/a56 `provider → CLI` rule) to a CLI with no registered strategy
+- **THEN** strategy resolution returns an error naming the CLI
+- **AND** no review session is spawned
 

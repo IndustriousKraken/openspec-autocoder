@@ -1605,10 +1605,34 @@ pub struct ReviewerConfig {
     /// (preserves canonical behavior: reviewer runs against every PR).
     #[serde(default)]
     pub skip_spec_only_prs: bool,
+    /// a58: reviewer transport. `oneshot` (default) is the existing
+    /// single-shot HTTP path that pre-dumps every touched file into one
+    /// prompt and scrapes a `VERDICT:` line. `agentic` runs the reviewer
+    /// through the shared `agentic_run` primitive (a56) as a CLI-wrapped,
+    /// read-only session that reads files on demand AND returns its
+    /// verdict via the `submit_review` MCP tool. The default stays
+    /// `oneshot`: the agentic path runs through the `claude` strategy,
+    /// which only reaches Anthropic-shaped endpoints, so non-Anthropic
+    /// reviewers cannot go agentic until the opencode strategy lands
+    /// (a60). Hot-applicable via the existing `reviewer:` reload path.
+    #[serde(default)]
+    pub kind: ReviewerKind,
+    /// a58: the CLI binary the agentic reviewer wraps. Default `"claude"`.
+    /// A non-`claude` command resolves its strategy via the a55/a56
+    /// `provider → CLI` rule AND currently returns a clear "strategy not
+    /// yet implemented" error (only `claude` is registered until a60).
+    /// Ignored when `kind: oneshot`. Hot-applicable via the `reviewer:`
+    /// reload path.
+    #[serde(default = "default_reviewer_command")]
+    pub command: String,
 }
 
 fn default_prompt_budget_chars() -> usize {
     2_000_000
+}
+
+fn default_reviewer_command() -> String {
+    "claude".to_string()
 }
 
 /// Upper bound on `reviewer.max_code_reviews_per_pr`. Anything above this
@@ -1637,6 +1661,23 @@ pub enum ReviewerMode {
     #[default]
     Bundled,
     PerChange,
+}
+
+/// a58: reviewer transport selector (`reviewer.kind`).
+///
+/// `Oneshot` (default) is the existing HTTP single-shot path governed by
+/// the `AI-driven code-quality review` requirement. `Agentic` runs the
+/// reviewer through the shared `agentic_run` primitive (a56) — a read-only
+/// CLI-wrapped session that reads files on demand AND returns its verdict
+/// via the `submit_review` MCP tool. The default stays `Oneshot` because
+/// the `claude` strategy reaches only Anthropic-shaped endpoints (a60
+/// lifts that restriction).
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerKind {
+    #[default]
+    Oneshot,
+    Agentic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

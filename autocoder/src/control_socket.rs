@@ -375,6 +375,13 @@ pub struct ControlState {
     /// action when the executor's classifier runs after subprocess
     /// exit. Keyed by `(workspace_basename, change)`.
     pub outcome_store: crate::outcome_store::OutcomeStore,
+    /// Execution-scoped structured-submission store (a56). Populated by the
+    /// `record_submission` action when the per-execution MCP child relays a
+    /// role's `submit_*` tool call; drained by the `consume_submission`
+    /// action when the role's daemon-side caller runs after subprocess
+    /// exit. Keyed by `(workspace_basename, change)`. The per-role payload
+    /// schemas are registered by the changes that add each `submit_*` tool.
+    pub submission_store: crate::submission_store::SubmissionStore,
     /// Daemon-wide resolved `DaemonPaths`, threaded from the entrypoint
     /// per the canonical `Production paths SHALL be threaded` requirement
     /// (constructor-field pattern). Every handler that resolves a
@@ -546,6 +553,8 @@ pub async fn dispatch_request(line: &str, state: &ControlState) -> Value {
         "query_canonical_specs" => handle_query_canonical_specs(&parsed, state).await,
         "record_outcome" => handle_record_outcome(&parsed, state),
         "consume_outcome" => handle_consume_outcome(&parsed, state),
+        "record_submission" => handle_record_submission(&parsed, state),
+        "consume_submission" => handle_consume_submission(&parsed, state),
         other => json!({"ok": false, "error": format!("unknown action: {other}")}),
     }
 }
@@ -2363,6 +2372,69 @@ fn handle_consume_outcome(parsed: &Value, state: &ControlState) -> Value {
     json!({"ok": true, "outcome": outcome_value})
 }
 
+/// Handle the `record_submission` action (a56). Accepts a
+/// `workspace_basename` routing key, a `change`/execution key, a `role`
+/// name, AND a `payload`; validates the payload against the role's
+/// registered schema (a no-op until a later change registers one) AND
+/// stores it keyed by execution. Returns `{"ok":true}` on success OR
+/// `{"ok":false,"error":<reason>}` on a schema/validation failure (which
+/// the MCP relay surfaces to the agent as a correctable tool error).
+/// Parallels [`handle_record_outcome`].
+fn handle_record_submission(parsed: &Value, state: &ControlState) -> Value {
+    let workspace_basename = match require_str(parsed, "workspace_basename") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let role = match require_str(parsed, "role") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let payload = match parsed.get("payload") {
+        Some(v) => v.clone(),
+        None => return json!({"ok": false, "error": "missing `payload` field"}),
+    };
+    match state
+        .submission_store
+        .record(workspace_basename.clone(), change.clone(), &role, payload)
+    {
+        Ok(()) => {
+            tracing::info!(
+                workspace_basename = %workspace_basename,
+                change = %change,
+                role = %role,
+                "submission recorded via submit tool"
+            );
+            json!({"ok": true})
+        }
+        Err(reason) => json!({"ok": false, "error": reason}),
+    }
+}
+
+/// Handle the `consume_submission` action (a56). Atomically reads AND
+/// removes the stored submission for `(workspace_basename, change)`.
+/// Returns `{"ok":true,"submission":null}` when no entry exists (absence
+/// is "the role did not submit", not an error). Parallels
+/// [`handle_consume_outcome`].
+fn handle_consume_submission(parsed: &Value, state: &ControlState) -> Value {
+    let workspace_basename = match require_str(parsed, "workspace_basename") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let change = match require_str(parsed, "change") {
+        Ok(s) => s,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let submission = state
+        .submission_store
+        .consume(&workspace_basename, &change)
+        .unwrap_or(Value::Null);
+    json!({"ok": true, "submission": submission})
+}
+
 /// Read the daemon's config path, parse + validate, diff against the
 /// last-applied snapshot, hot-apply safe sections, and return the result.
 pub async fn handle_reload(state: &ControlState) -> Value {
@@ -2759,6 +2831,7 @@ mod tests {
             spawn_repo: spawn,
             canonical_rag_registry: crate::rag::CanonicalRagRegistry::new(),
             outcome_store: crate::outcome_store::OutcomeStore::new(),
+            submission_store: crate::submission_store::SubmissionStore::new(),
             paths: Arc::new(paths),
         }
     }
@@ -4671,6 +4744,88 @@ github:
         )
         .await;
         assert_eq!(cb["outcome"]["final_answer"], "B");
+        cancel.cancel();
+    }
+
+    // a56: record_submission → consume_submission round-trips the payload
+    // AND clears it (the executor-side relay's `record_submission` target).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_submission_then_consume_round_trips_and_clears() {
+        let (_dir, socket, _state, _cfg, cancel) = fixture_listener(BASE_YAML).await;
+        let rec = serde_json::json!({
+            "action": "record_submission",
+            "workspace_basename": "repo",
+            "change": "a56-foo",
+            "role": "reviewer",
+            "payload": {"verdict": "approve", "notes": "ok"},
+        });
+        let resp = send_request(&socket, &rec.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "resp: {resp}");
+
+        let con = r#"{"action":"consume_submission","workspace_basename":"repo","change":"a56-foo"}"#;
+        let resp = send_request(&socket, con).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true));
+        assert_eq!(resp["submission"]["verdict"], "approve");
+        assert_eq!(resp["submission"]["notes"], "ok");
+
+        // Second consume drains to null — the prior call cleared the store.
+        let resp2 = send_request(&socket, con).await;
+        assert_eq!(resp2["ok"], serde_json::Value::Bool(true));
+        assert_eq!(resp2["submission"], serde_json::Value::Null);
+        cancel.cancel();
+    }
+
+    // a56: consume with no stored submission is empty, not an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consume_submission_with_no_entry_is_empty_not_error() {
+        let (_dir, socket, _state, _cfg, cancel) = fixture_listener(BASE_YAML).await;
+        let resp = send_request(
+            &socket,
+            r#"{"action":"consume_submission","workspace_basename":"repo","change":"never"}"#,
+        )
+        .await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true));
+        assert_eq!(resp["submission"], serde_json::Value::Null);
+        cancel.cancel();
+    }
+
+    // a56: a payload that fails the role's registered schema is rejected
+    // (nothing stored) with a reason suitable for the relay to surface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_submission_rejects_schema_invalid_payload() {
+        let (_dir, socket, state, _cfg, cancel) = fixture_listener(BASE_YAML).await;
+        // The listener serves a clone of `state` sharing the same Arc-backed
+        // store, so a validator registered here is visible to the handler.
+        state.submission_store.register_schema(
+            "reviewer",
+            std::sync::Arc::new(|p: &serde_json::Value| {
+                if p.get("verdict").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+                    Ok(())
+                } else {
+                    Err("verdict must be a non-empty string".to_string())
+                }
+            }),
+        );
+        let rec = serde_json::json!({
+            "action": "record_submission",
+            "workspace_basename": "repo",
+            "change": "a56-foo",
+            "role": "reviewer",
+            "payload": {"verdict": ""},
+        });
+        let resp = send_request(&socket, &rec.to_string()).await;
+        assert_eq!(resp["ok"], serde_json::Value::Bool(false), "resp: {resp}");
+        assert!(
+            resp["error"].as_str().unwrap_or_default().contains("verdict"),
+            "error names the offending field: {resp}"
+        );
+        // Nothing was stored.
+        let resp = send_request(
+            &socket,
+            r#"{"action":"consume_submission","workspace_basename":"repo","change":"a56-foo"}"#,
+        )
+        .await;
+        assert_eq!(resp["submission"], serde_json::Value::Null);
         cancel.cancel();
     }
 }

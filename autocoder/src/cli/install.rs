@@ -381,7 +381,7 @@ fn write_file_with_mode(path: &Path, contents: &[u8], _mode: u32) -> std::io::Re
 // ----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubprocessOutcome {
+pub struct InstallCommandOutcome {
     pub status: i32,
     pub stdout: String,
     pub stderr: String,
@@ -404,7 +404,7 @@ pub enum LoadState {
 #[async_trait]
 pub trait SystemActions: Send + Sync {
     async fn which(&self, command: &str) -> Option<PathBuf>;
-    async fn run_subprocess(&self, cmd: &str, args: &[&str]) -> Result<SubprocessOutcome>;
+    async fn run_install_command(&self, cmd: &str, args: &[&str]) -> Result<InstallCommandOutcome>;
     async fn create_user(&self, name: &str, home_dir: &Path, shell: &str) -> Result<()>;
     async fn chown(&self, path: &Path, owner: &str, group: &str) -> Result<()>;
     async fn chmod(&self, path: &Path, mode: u32) -> Result<()>;
@@ -432,13 +432,13 @@ impl SystemActions for RealSystemActions {
         if s.is_empty() { None } else { Some(PathBuf::from(s)) }
     }
 
-    async fn run_subprocess(&self, cmd: &str, args: &[&str]) -> Result<SubprocessOutcome> {
+    async fn run_install_command(&self, cmd: &str, args: &[&str]) -> Result<InstallCommandOutcome> {
         let out = tokio::process::Command::new(cmd)
             .args(args)
             .output()
             .await
             .with_context(|| format!("failed to run `{cmd}`"))?;
-        Ok(SubprocessOutcome {
+        Ok(InstallCommandOutcome {
             status: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).to_string(),
@@ -716,12 +716,12 @@ impl SystemActions for RecordingActions {
         }
         None
     }
-    async fn run_subprocess(&self, cmd: &str, args: &[&str]) -> Result<SubprocessOutcome> {
+    async fn run_install_command(&self, cmd: &str, args: &[&str]) -> Result<InstallCommandOutcome> {
         self.record(RecordedCall::RunSubprocess {
             cmd: cmd.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
         });
-        Ok(SubprocessOutcome { status: 0, stdout: String::new(), stderr: String::new() })
+        Ok(InstallCommandOutcome { status: 0, stdout: String::new(), stderr: String::new() })
     }
     async fn create_user(&self, name: &str, home_dir: &Path, shell: &str) -> Result<()> {
         self.record(RecordedCall::CreateUser {
@@ -1472,6 +1472,8 @@ pub fn assemble_config(answers: &WizardAnswers) -> Result<Config> {
                 max_code_reviews_per_pr: None,
                 suggest_rereview_threshold: None,
                 skip_spec_only_prs: false,
+                kind: crate::config::ReviewerKind::Oneshot,
+                command: "claude".to_string(),
             })
         }
     };
@@ -1696,7 +1698,7 @@ pub(crate) async fn execute_inner(
             io.confirm("Install Claude Code CLI now?", true).await?
         };
         if should_install {
-            actions.run_subprocess("bash", &["-c", &format!("curl -fsSL {CLAUDE_INSTALL_URL} | bash")]).await?;
+            actions.run_install_command("bash", &["-c", &format!("curl -fsSL {CLAUDE_INSTALL_URL} | bash")]).await?;
         }
     }
 
@@ -2260,6 +2262,8 @@ pub(crate) async fn reconfigure_reviewer(
                 max_code_reviews_per_pr: None,
                 suggest_rereview_threshold: None,
                 skip_spec_only_prs: false,
+                kind: crate::config::ReviewerKind::Oneshot,
+                command: "claude".to_string(),
             });
             reviewer.provider = Some(provider);
             reviewer.model = model;

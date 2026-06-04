@@ -425,11 +425,17 @@ impl Drop for SandboxSettingsGuard {
 }
 
 /// Write a one-shot Claude Code `--settings` file mirroring the same
-/// `permissions.deny` structure used by [`crate::executor::claude_cli`].
-/// The deny list is built from the sandbox's `disallowed_bash_patterns`
-/// and `disallowed_read_paths` plus explicit `Write(*)` and `Edit(*)`
-/// entries so audits whose `WritePolicy` is `None` have a defense-in-
-/// depth backstop ahead of the post-hoc diff check.
+/// `permissions.deny` structure shared by the agentic-run primitive AND
+/// every audit. The deny list is built from the sandbox's
+/// `disallowed_bash_patterns` and `disallowed_read_paths`, plus — when
+/// `deny_writes` is set — explicit `Write(*)` and `Edit(*)` entries so
+/// read-only audits (`WritePolicy::None`) have a defense-in-depth backstop
+/// ahead of the post-hoc diff check.
+///
+/// `deny_writes` MUST be `true` for the audits (preserving today's
+/// read-only settings) AND `false` for the executor path through
+/// [`crate::agentic_run::agentic_run`] (which allows `Write`/`Edit` so the
+/// agent can implement code — preserving the executor's current settings).
 ///
 /// `settings_dir` selects the directory the file is written to. Pass
 /// `None` to use `std::env::temp_dir()`; tests pass a per-test
@@ -440,10 +446,13 @@ impl Drop for SandboxSettingsGuard {
 pub fn write_sandbox_settings(
     sandbox: &ResolvedSandbox,
     settings_dir: Option<&Path>,
+    deny_writes: bool,
 ) -> Result<(PathBuf, SandboxSettingsGuard)> {
     let mut deny: Vec<String> = Vec::new();
-    deny.push("Write(*)".to_string());
-    deny.push("Edit(*)".to_string());
+    if deny_writes {
+        deny.push("Write(*)".to_string());
+        deny.push("Edit(*)".to_string());
+    }
     for pat in &sandbox.disallowed_bash_patterns {
         deny.push(format!("Bash({pat})"));
     }
@@ -950,6 +959,230 @@ where
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Run the wrapped agent CLI for an audit through the shared agentic-run
+/// primitive ([`crate::agentic_run::agentic_run`]). Encodes the audit
+/// profile: simple-capture (no streaming-JSON), NO MCP, the audit's
+/// `sandbox.allowed_tools` list, `Write`/`Edit` denied in the settings
+/// file, the ETXTBSY-retry spawn, AND no busy-marker sidecar. This is the
+/// single seam through which every audit reaches the primitive; the
+/// per-module `run_subprocess` copies are gone.
+pub(crate) async fn run_audit_cli(
+    command: &str,
+    sandbox: &ResolvedSandbox,
+    workspace: &Path,
+    prompt: &str,
+    timeout: std::time::Duration,
+    settings_dir: Option<&Path>,
+) -> Result<crate::agentic_run::AgenticRunOutcome> {
+    let strategy = crate::agentic_run::ClaudeStrategy::new(command.to_string(), Vec::new());
+    crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+        workspace,
+        // Capture mode never consults `change` (it is only used for the
+        // streaming structured-log path); a stable placeholder is fine.
+        change: "audit",
+        strategy: &strategy,
+        prompt,
+        sandbox: crate::agentic_run::SandboxConfig {
+            allowed_tools: sandbox.allowed_tools.clone(),
+            disallowed_bash_patterns: sandbox.disallowed_bash_patterns.clone(),
+            disallowed_read_paths: sandbox.disallowed_read_paths.clone(),
+            deny_writes: true,
+        },
+        model: None,
+        output_mode: crate::agentic_run::OutputMode::Capture,
+        timeout,
+        paths: None,
+        settings_dir,
+        include_autocoder_tools: false,
+        emit_stream_json_in_capture: false,
+        resume_session_id: None,
+        track_subprocess_marker: false,
+        etxtbsy_retry_spawn: true,
+    })
+    .await
+}
+
+/// Run an advisory audit's wrapped CLI WITH MCP enabled (a57). Identical
+/// to [`run_audit_cli`] except a per-execution `.mcp.json` is written into
+/// the workspace advertising the role's `submit_findings` tool
+/// (`ORCH_MCP_ROLE = role`, `ORCH_MCP_CHANGE = role`), AND that tool's
+/// qualified name is added to the allowed-tools list so the CLI permits
+/// the call. The agent returns its findings through `submit_findings`
+/// rather than on stdout; the caller drains the stored submission via
+/// [`try_consume_submission`] after this returns.
+///
+/// `role` is the audit type (`drift_audit`, `architecture_consultative`,
+/// `documentation_audit`); it doubles as the submission routing `change`
+/// key so the recorder (MCP child) AND the consumer (this module) agree.
+/// The MCP config is deleted on every exit path so the read-only
+/// `WritePolicy::None` post-hoc diff check sees a clean tree.
+pub(crate) async fn run_audit_cli_with_submit(
+    command: &str,
+    sandbox: &ResolvedSandbox,
+    workspace: &Path,
+    prompt: &str,
+    timeout: std::time::Duration,
+    settings_dir: Option<&Path>,
+    role: &str,
+) -> Result<crate::agentic_run::AgenticRunOutcome> {
+    // Allow the role's submit tool in addition to the read-only tools AND
+    // the auto-included autocoder MCP tools (`ask_user` /
+    // `query_canonical_specs` / `outcome_*`). `query_canonical_specs` is
+    // thereby available to the documentation audit when `canonical_rag`
+    // is configured.
+    let mut allowed_tools = sandbox.allowed_tools.clone();
+    if let Some(tool) = crate::mcp_askuser_server::submission_tool_name_for_role(role) {
+        allowed_tools.push(crate::mcp_askuser_server::qualified_tool_name(tool));
+    }
+
+    // Write the per-execution MCP config advertising the role's submit
+    // tool. `change == role` keys the submission-store entry the agent
+    // records into; this module consumes the same key after exit.
+    crate::executor::claude_cli::ClaudeCliExecutor::write_mcp_config(workspace, role, Some(role))
+        .context("writing audit MCP config")?;
+
+    let strategy = crate::agentic_run::ClaudeStrategy::new(command.to_string(), Vec::new());
+    let result = crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+        workspace,
+        change: role,
+        strategy: &strategy,
+        prompt,
+        sandbox: crate::agentic_run::SandboxConfig {
+            allowed_tools,
+            disallowed_bash_patterns: sandbox.disallowed_bash_patterns.clone(),
+            disallowed_read_paths: sandbox.disallowed_read_paths.clone(),
+            deny_writes: true,
+        },
+        model: None,
+        output_mode: crate::agentic_run::OutputMode::Capture,
+        timeout,
+        paths: None,
+        settings_dir,
+        include_autocoder_tools: true,
+        emit_stream_json_in_capture: false,
+        resume_session_id: None,
+        track_subprocess_marker: false,
+        etxtbsy_retry_spawn: true,
+    })
+    .await;
+
+    // Always remove the config we wrote, regardless of run outcome.
+    crate::executor::claude_cli::ClaudeCliExecutor::delete_mcp_config(workspace);
+
+    result
+}
+
+/// Drain the stored `submit_findings` submission for an advisory audit
+/// (a57) via the daemon's `consume_submission` control-socket action.
+/// Returns the recorded payload (`{ "findings": [...] }`) or `None` when
+/// the agent never submitted (the audit treats `None` as failure). The
+/// socket path is read from `ORCH_DAEMON_CONTROL_SOCKET`, set daemon-wide
+/// at startup; a missing/unreachable socket yields `None`. The
+/// `workspace_basename` routing key is the workspace directory's file
+/// name, matching what `write_mcp_config` propagates to the MCP child.
+/// Mirrors the executor's `try_consume_outcome`.
+pub(crate) async fn try_consume_submission(
+    workspace: &Path,
+    change: &str,
+) -> Option<serde_json::Value> {
+    let socket = std::env::var(crate::mcp_askuser_server::ENV_CONTROL_SOCKET).ok()?;
+    let socket_path = std::path::PathBuf::from(socket);
+    if !socket_path.exists() {
+        return None;
+    }
+    let basename = workspace
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+    let request = serde_json::json!({
+        "action": "consume_submission",
+        "workspace_basename": basename,
+        "change": change,
+    });
+    let resp = match send_control_request(&socket_path, request).await {
+        Ok(v) => v,
+        Err(e) => {
+            // no-url: control-socket relay helper, no AuditContext/repo URL in scope (keyed by workspace basename + change).
+            tracing::warn!(
+                workspace_basename = %basename,
+                change = %change,
+                "consume_submission relay failed: {e:#}"
+            );
+            return None;
+        }
+    };
+    if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let submission = resp.get("submission")?;
+    if submission.is_null() {
+        return None;
+    }
+    Some(submission.clone())
+}
+
+/// One-shot UDS round trip: send the JSON request followed by a newline,
+/// read the single-line JSON response. Bounded by a 10-second timeout
+/// matching the MCP child's relay primitive. Used by
+/// [`try_consume_submission`].
+async fn send_control_request(
+    socket_path: &Path,
+    request: serde_json::Value,
+) -> Result<serde_json::Value> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let timeout = std::time::Duration::from_secs(10);
+    let stream = tokio::time::timeout(timeout, tokio::net::UnixStream::connect(socket_path))
+        .await
+        .map_err(|_| anyhow::anyhow!("control socket connect timed out"))??;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut bytes = serde_json::to_vec(&request)?;
+    bytes.push(b'\n');
+    tokio::time::timeout(timeout, write_half.write_all(&bytes))
+        .await
+        .map_err(|_| anyhow::anyhow!("control socket write timed out"))??;
+    tokio::time::timeout(timeout, write_half.shutdown())
+        .await
+        .map_err(|_| anyhow::anyhow!("control socket shutdown timed out"))??;
+    let mut reader = tokio::io::BufReader::new(read_half);
+    let mut line = String::new();
+    tokio::time::timeout(timeout, reader.read_line(&mut line))
+        .await
+        .map_err(|_| anyhow::anyhow!("control socket read timed out"))??;
+    let value: serde_json::Value = serde_json::from_str(line.trim())
+        .with_context(|| format!("decoding consume_submission response: {line:?}"))?;
+    Ok(value)
+}
+
+/// Register the advisory audits' per-role `submit_findings` payload
+/// schemas with the daemon's [`crate::submission_store::SubmissionStore`]
+/// (a57). Each role's validator IS that audit's `payload_to_findings`
+/// deserializer with its `Ok` value discarded, so a payload that records
+/// successfully is exactly one that deserializes — the schema check AND
+/// the consume-time deserialization can never drift apart. A schema
+/// violation is returned by `record_submission` AND surfaced to the agent
+/// as a correctable tool error.
+///
+/// Called once at daemon startup (`cli::run::execute`). The same store is
+/// shared with the control socket's `record_submission` handler, so the
+/// MCP child's submissions are validated against these schemas.
+pub fn register_submission_schemas(store: &crate::submission_store::SubmissionStore) {
+    use std::sync::Arc;
+    store.register_schema(
+        drift::DriftAudit::TYPE,
+        Arc::new(|p: &serde_json::Value| drift::payload_to_findings(p).map(|_| ())),
+    );
+    store.register_schema(
+        architecture_consultative::ArchitectureConsultativeAudit::TYPE,
+        Arc::new(|p: &serde_json::Value| {
+            architecture_consultative::payload_to_findings(p).map(|_| ())
+        }),
+    );
+    store.register_schema(
+        documentation_audit::DocumentationAudit::TYPE,
+        Arc::new(|p: &serde_json::Value| documentation_audit::payload_to_findings(p).map(|_| ())),
+    );
 }
 
 /// Cheap precondition every audit runs at the top of its `run` method.
@@ -2719,5 +2952,169 @@ mod tests {
                 a.audit_type()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod a57_submission_round_trip_tests {
+    //! a57 (tasks 3.2 / 3.3): the advisory audits' `submit_findings`
+    //! payloads round-trip through the daemon's submission store —
+    //! `record` (with the registered schema) → `consume` → the audit's
+    //! `payload_to_findings` deserializer → the expected `Finding` values
+    //! AND an `AuditOutcome::Reported`.
+    use super::*;
+    use crate::submission_store::SubmissionStore;
+
+    fn store_with_schemas() -> SubmissionStore {
+        let store = SubmissionStore::new();
+        register_submission_schemas(&store);
+        store
+    }
+
+    // 3.2: drift payload round-trips to the expected Finding + Reported.
+    #[test]
+    fn drift_submission_round_trips_to_reported() {
+        let store = store_with_schemas();
+        let payload = serde_json::json!({
+            "findings": [{
+                "capability": "orchestrator-cli",
+                "requirement": "Per-repository asynchronous polling loop",
+                "severity": "high",
+                "code_anchors": ["autocoder/src/polling_loop.rs:45-95"],
+                "divergence": "Spec requires X; code does Y."
+            }]
+        });
+        store
+            .record("repo".into(), "drift_audit".into(), "drift_audit", payload)
+            .expect("valid drift payload accepted by schema");
+        let consumed = store.consume("repo", "drift_audit").expect("submission present");
+        let findings = drift::payload_to_findings(&consumed).expect("deserializes");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::High);
+        assert!(findings[0].subject.contains("orchestrator-cli"));
+        // The audit would wrap these in a Reported outcome.
+        match AuditOutcome::reported(findings) {
+            AuditOutcome::Reported { findings, .. } => assert_eq!(findings.len(), 1),
+            other => panic!("expected Reported, got {other:?}"),
+        }
+    }
+
+    // 3.2: architecture payload round-trips.
+    #[test]
+    fn architecture_submission_round_trips_to_reported() {
+        let store = store_with_schemas();
+        let payload = serde_json::json!({
+            "findings": [{
+                "subject": "Should the parser move into its own module?",
+                "body": "context",
+                "anchor": "src/parser.rs:1-200",
+                "severity": "medium"
+            }]
+        });
+        store
+            .record(
+                "repo".into(),
+                "architecture_consultative".into(),
+                "architecture_consultative",
+                payload,
+            )
+            .expect("valid architecture payload accepted");
+        let consumed = store
+            .consume("repo", "architecture_consultative")
+            .expect("submission present");
+        let findings =
+            architecture_consultative::payload_to_findings(&consumed).expect("deserializes");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Medium);
+        assert_eq!(findings[0].anchor.as_deref(), Some("src/parser.rs:1-200"));
+    }
+
+    // 3.2: documentation payload round-trips, with high→medium demotion.
+    #[test]
+    fn documentation_submission_round_trips_with_demotion() {
+        let store = store_with_schemas();
+        let payload = serde_json::json!({
+            "findings": [{
+                "category": "coverage",
+                "severity": "medium",
+                "anchor": "docs/CHATOPS.md",
+                "body": "verb propose undocumented"
+            }]
+        });
+        store
+            .record(
+                "repo".into(),
+                "documentation_audit".into(),
+                "documentation_audit",
+                payload,
+            )
+            .expect("valid documentation payload accepted");
+        let consumed = store
+            .consume("repo", "documentation_audit")
+            .expect("submission present");
+        let findings =
+            documentation_audit::payload_to_findings(&consumed).expect("deserializes");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].subject, documentation_audit::COVERAGE_SUBJECT);
+    }
+
+    // 3.3: a 6-finding architecture payload is rejected by record_submission
+    // (the registered schema) AND nothing is stored; a subsequent valid
+    // (≤5) submission for the same key is accepted AND consumes.
+    #[test]
+    fn architecture_six_findings_rejected_then_five_accepted() {
+        let store = store_with_schemas();
+        let six = serde_json::json!({
+            "findings": (0..6).map(|i| serde_json::json!({
+                "subject": format!("q{i}?"), "body": "b", "anchor": "a:1", "severity": "low"
+            })).collect::<Vec<_>>()
+        });
+        let err = store
+            .record(
+                "repo".into(),
+                "architecture_consultative".into(),
+                "architecture_consultative",
+                six,
+            )
+            .expect_err("six findings must be rejected");
+        assert!(err.contains("caps at 5"), "rejection reason: {err}");
+        // Nothing stored — a rejected submission does not become the result.
+        assert!(store.consume("repo", "architecture_consultative").is_none());
+
+        // A subsequent valid submission in the same execution is accepted.
+        let five = serde_json::json!({
+            "findings": (0..5).map(|i| serde_json::json!({
+                "subject": format!("q{i}?"), "body": "b", "anchor": "a:1", "severity": "low"
+            })).collect::<Vec<_>>()
+        });
+        store
+            .record(
+                "repo".into(),
+                "architecture_consultative".into(),
+                "architecture_consultative",
+                five,
+            )
+            .expect("five findings accepted after the rejection");
+        let consumed = store
+            .consume("repo", "architecture_consultative")
+            .expect("the valid submission is stored");
+        let findings =
+            architecture_consultative::payload_to_findings(&consumed).expect("deserializes");
+        assert_eq!(findings.len(), 5);
+    }
+
+    // A payload missing a required field is rejected by the registered
+    // schema (the deserializer doubling as validator).
+    #[test]
+    fn drift_payload_missing_field_rejected_by_schema() {
+        let store = store_with_schemas();
+        let bad = serde_json::json!({
+            "findings": [{"capability": "cap", "requirement": "req", "severity": "high"}]
+        });
+        let err = store
+            .record("repo".into(), "drift_audit".into(), "drift_audit", bad)
+            .expect_err("missing divergence must be rejected");
+        assert!(err.contains("findings[0]"), "rejection reason: {err}");
+        assert!(store.consume("repo", "drift_audit").is_none());
     }
 }

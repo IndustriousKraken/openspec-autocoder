@@ -13,22 +13,18 @@
 //!      clarification regex, the executor synthesizes an AskUser from the
 //!      first matching sentence.
 
-use super::event_log::{self, ActionKind, StructuredLogWriter};
-use super::json_event::{self, AssistantBlock, JsonEvent, UserBlock};
 use super::{
     BrownfieldDraftContext, ChangelogContext, ChatTriageContext, Executor, ExecutorOutcome,
     ResumeHandle, ScoutContext, TriageContext, UnimplementableTask,
 };
+use crate::agentic_run::AgenticRunOutcome;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
 
 const MCP_CONFIG_FILENAME: &str = ".mcp.json";
 const ASKUSER_MARKER_FILENAME: &str = ".askuser-pending.json";
@@ -492,7 +488,22 @@ impl ClaudeCliExecutor {
     /// to the daemon's `CanonicalRagStore`. Absent → the child sees no
     /// such env vars AND the tool returns the documented
     /// "rag not configured for this execution" hint.
-    fn write_mcp_config(workspace: &Path, change: &str) -> Result<PathBuf> {
+    ///
+    /// `role` (a56): when `Some`, `ORCH_MCP_ROLE` is written into the MCP
+    /// child's env so it advertises that role's `submit_*` tool. The
+    /// executor itself reports via the `outcome_*` tools (not a `submit_*`
+    /// tool), so it passes `None`; the agentic roles added by later changes
+    /// pass their role name.
+    ///
+    /// `pub(crate)` so the advisory audits (a57) can write the same
+    /// `.mcp.json` shape — they pass their audit type as both `change`
+    /// (the submission routing key) AND `role` (the `submit_findings`
+    /// advertisement gate).
+    pub(crate) fn write_mcp_config(
+        workspace: &Path,
+        change: &str,
+        role: Option<&str>,
+    ) -> Result<PathBuf> {
         // We may be running from a non-autocoder binary (e.g. cargo test).
         // `current_exe` returns the actual running binary; in production
         // this is the `autocoder` binary and the MCP subcommand exists.
@@ -502,6 +513,10 @@ impl ClaudeCliExecutor {
             crate::mcp_askuser_server::ENV_WORKSPACE: workspace.to_string_lossy(),
             crate::mcp_askuser_server::ENV_CHANGE: change,
         });
+        if let Some(role) = role {
+            env[crate::mcp_askuser_server::ENV_ROLE] =
+                serde_json::Value::String(role.to_string());
+        }
         // Plumb the daemon's control-socket path and workspace basename
         // through to the MCP child only when the daemon has explicitly
         // set them in the parent process env (i.e., `canonical_rag` is
@@ -536,8 +551,9 @@ impl ClaudeCliExecutor {
         Ok(path)
     }
 
-    /// Idempotently remove the `.mcp.json` we wrote.
-    fn delete_mcp_config(workspace: &Path) {
+    /// Idempotently remove the `.mcp.json` we wrote. `pub(crate)` so the
+    /// advisory audits (a57) can clean up the config they wrote.
+    pub(crate) fn delete_mcp_config(workspace: &Path) {
         let path = workspace.join(MCP_CONFIG_FILENAME);
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -616,341 +632,58 @@ impl ClaudeCliExecutor {
         }
     }
 
-    /// Write the per-iteration Claude Code settings file to OS temp dir
-    /// (NOT the workspace, to avoid contaminating the diff). Returns the
-    /// path; the caller is responsible for deletion via `TempFileGuard`.
-    fn write_sandbox_settings(&self) -> Result<PathBuf> {
-        let mut deny: Vec<String> = Vec::new();
-        for pat in &self.sandbox.disallowed_bash_patterns {
-            deny.push(format!("Bash({pat})"));
-        }
-        for pat in &self.sandbox.disallowed_read_paths {
-            deny.push(format!("Read({pat})"));
-        }
-        let json = serde_json::json!({
-            "permissions": {
-                "allow": Vec::<String>::new(),
-                "deny": deny,
-            }
-        });
-
-        // Unique-named file under the configured settings directory
-        // (production: OS temp; tests: per-test isolated dir). UUIDish via
-        // process id + nanos.
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let pid = std::process::id();
-        let dir = self
-            .settings_dir
-            .clone()
-            .unwrap_or_else(std::env::temp_dir);
-        let path = dir.join(format!("autocoder-claude-settings-{pid}-{stamp}.json"));
-        std::fs::write(&path, serde_json::to_string_pretty(&json)?)
-            .with_context(|| format!("writing sandbox settings to {}", path.display()))?;
-        Ok(path)
-    }
-
-    /// Spawn the wrapped CLI, write `prompt` on its stdin, wait with the
-    /// configured timeout, return collected stdout/stderr + exit status.
-    async fn run_subprocess(
+    /// Spawn the wrapped CLI for one implementer / triage / etc. session
+    /// through the shared agentic-run primitive
+    /// ([`crate::agentic_run::agentic_run`]). Streaming-JSON when the
+    /// executor's output format is `Json` (parsing `final_answer` /
+    /// `session_id` + writing the structured log), simple-capture
+    /// otherwise. MCP is enabled — the caller wrote the workspace's
+    /// `.mcp.json`, which the CLI auto-discovers — AND the autocoder MCP
+    /// provided-tool names are auto-allowed. The busy-marker subprocess
+    /// sidecar is written so stuck-state recovery can `killpg` the child's
+    /// process group.
+    async fn spawn_agentic_session(
         &self,
         workspace: &Path,
         change: &str,
         prompt: &str,
-    ) -> Result<SubprocessOutcome> {
-        let settings_path = self
-            .write_sandbox_settings()
-            .context("generating sandbox settings file")?;
-        let _settings_guard = TempFileGuard(settings_path.clone());
-
+    ) -> Result<AgenticRunOutcome> {
         let json_mode = matches!(
             self.output_format,
             crate::config::ExecutorOutputFormat::Json
         );
-
-        let mut cmd = Command::new(&self.command);
-        cmd.args(&self.args)
-            .arg("--settings")
-            .arg(&settings_path)
-            .arg("--allowedTools")
-            .arg(build_allowed_tools_arg(&self.sandbox.allowed_tools))
-            .arg("--permission-mode")
-            .arg("acceptEdits");
-        if json_mode {
-            // `--verbose` is required by Claude CLI alongside
-            // `stream-json` for non-interactive sessions; without it the
-            // CLI emits the legacy single result envelope rather than
-            // streaming events as they happen.
-            cmd.arg("--verbose")
-                .arg("--output-format")
-                .arg("stream-json");
-        }
-        let mut child = cmd
-            .current_dir(workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Launch the child in its own process group so the busy-marker
-            // stuck-state recovery path can `killpg` the entire subprocess
-            // tree (claude + any MCP server / helper children it spawns)
-            // with a single signal. `process_group(0)` is stable Rust.
-            .process_group(0)
-            .spawn()
-            .with_context(|| format!("spawning executor command `{}`", self.command))?;
-
-        // Record the spawned child's PID to a sidecar file so the busy-
-        // marker's stuck-state recovery has a kill target that actually
-        // covers Claude's process group (the marker's own `pgid` records
-        // autocoder's group, not Claude's). The guard cleans the file up
-        // on every exit path of this function.
-        let _subprocess_marker_guard = if let Some(pid) = child.id() {
-            if let Err(e) = crate::busy_marker::write_subprocess_marker(&self.paths, workspace, pid) {
-                tracing::warn!(
-                    workspace = %workspace.display(),
-                    pid,
-                    "failed to write subprocess sidecar marker (run continues): {e:#}"
-                );
-                None
-            } else {
-                Some(SubprocessMarkerGuard {
-                    paths: self.paths.clone(),
-                    workspace: workspace.to_path_buf(),
-                })
-            }
-        } else {
-            None
-        };
-
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(prompt.as_bytes()).await;
-        }
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-
-        if json_mode {
-            // Streaming path: build the structured log incrementally so
-            // that on a timeout-kill, every event the child wrote before
-            // the kill is durably on disk.
-            self.run_subprocess_streaming(
-                child,
-                stdout_pipe,
-                stderr_pipe,
-                workspace,
-                change,
-                prompt,
-            )
-            .await
-        } else {
-            // Legacy at-exit capture: today's behavior preserved for
-            // `output_format: text`.
-            self.run_subprocess_legacy(child, stdout_pipe, stderr_pipe).await
-        }
-    }
-
-    /// Legacy capture: wait for child exit (or timeout) then read
-    /// stdout + stderr in one shot. Returns the populated
-    /// `SubprocessOutcome` without writing the log file (the caller
-    /// invokes `persist_run_log` for that). Used in `output_format: text`.
-    async fn run_subprocess_legacy(
-        &self,
-        mut child: tokio::process::Child,
-        mut stdout_pipe: Option<tokio::process::ChildStdout>,
-        mut stderr_pipe: Option<tokio::process::ChildStderr>,
-    ) -> Result<SubprocessOutcome> {
-        let sleeper = tokio::time::sleep(self.timeout);
-        tokio::pin!(sleeper);
-
-        let exit_status: Option<std::io::Result<std::process::ExitStatus>> = tokio::select! {
-            biased;
-            () = &mut sleeper => None,
-            res = child.wait() => Some(res),
-        };
-
-        match exit_status {
-            None => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                Ok(SubprocessOutcome {
-                    timed_out: true,
-                    exit_status: None,
-                    stdout: String::new(),
-                    stderr: "timeout".to_string(),
-                    final_answer: None,
-                    streamed_log: false,
-                    session_id: None,
-                })
-            }
-            Some(Err(e)) => Err(e).context("waiting on executor child process"),
-            Some(Ok(status)) => {
-                let mut stdout_text = String::new();
-                if let Some(ref mut p) = stdout_pipe {
-                    let _ = p.read_to_string(&mut stdout_text).await;
-                }
-                let mut stderr_text = String::new();
-                if let Some(ref mut p) = stderr_pipe {
-                    let _ = p.read_to_string(&mut stderr_text).await;
-                }
-                Ok(SubprocessOutcome {
-                    timed_out: false,
-                    exit_status: Some(status),
-                    stdout: stdout_text,
-                    stderr: stderr_text,
-                    final_answer: None,
-                    streamed_log: false,
-                    session_id: None,
-                })
-            }
-        }
-    }
-
-    /// Streaming capture: open the structured log writer, spawn one
-    /// task that reads stdout line-by-line and dispatches parsed events
-    /// to the log + one task that reads stderr into the writer's
-    /// buffer, then race `child.wait()` against the configured timeout.
-    /// On timeout-kill the partial action stream is already on disk —
-    /// the writer is `finalize`d unconditionally.
-    async fn run_subprocess_streaming(
-        &self,
-        mut child: tokio::process::Child,
-        stdout_pipe: Option<tokio::process::ChildStdout>,
-        stderr_pipe: Option<tokio::process::ChildStderr>,
-        workspace: &Path,
-        change: &str,
-        prompt: &str,
-    ) -> Result<SubprocessOutcome> {
-        use std::sync::Arc;
-        use tokio::io::{AsyncBufReadExt, BufReader};
-
-        let log_path = run_log_path(&self.paths, workspace, change);
-        let writer = match event_log::open(&log_path) {
-            Ok(w) => Arc::new(w),
-            Err(e) => {
-                tracing::warn!(
-                    log_file = %log_path.display(),
-                    "could not open structured log; falling back to legacy capture: {e:#}"
-                );
-                return self
-                    .run_subprocess_legacy(child, stdout_pipe, stderr_pipe)
-                    .await;
-            }
-        };
-        if let Err(e) = writer.write_prompt(prompt) {
-            tracing::warn!(
-                log_file = %log_path.display(),
-                "writing prompt header to structured log failed: {e:#}"
-            );
-        }
-
-        // Stdout reader: parse one JSON event per line; dispatch each to
-        // the structured log. Accumulates the raw lines too so the
-        // caller's `outcome.stdout` still reflects what was emitted —
-        // legacy callsites (sentinel extraction, the Layer-2 heuristic)
-        // expect a non-empty string for non-empty output.
-        let stdout_writer = writer.clone();
-        let stdout_handle: tokio::task::JoinHandle<String> = match stdout_pipe {
-            Some(pipe) => tokio::spawn(async move {
-                let mut buf = String::new();
-                let mut reader = BufReader::new(pipe).lines();
-                loop {
-                    match reader.next_line().await {
-                        Ok(Some(line)) => {
-                            buf.push_str(&line);
-                            buf.push('\n');
-                            dispatch_event_to_log(&stdout_writer, &line);
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            tracing::warn!("stdout reader error: {e}");
-                            break;
-                        }
-                    }
-                }
-                buf
-            }),
-            None => tokio::spawn(async { String::new() }),
-        };
-
-        // Stderr reader: stream bytes into the writer's buffer so the
-        // STDERR section's annotation reflects the true byte count and
-        // the bytes themselves land in the log.
-        let stderr_writer = writer.clone();
-        let stderr_handle: tokio::task::JoinHandle<String> = match stderr_pipe {
-            Some(mut pipe) => tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut buf = String::new();
-                let mut chunk = [0u8; 4096];
-                loop {
-                    match pipe.read(&mut chunk).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
-                            let _ = stderr_writer.append_stderr(&chunk[..n]);
-                        }
-                        Err(e) => {
-                            tracing::warn!("stderr reader error: {e}");
-                            break;
-                        }
-                    }
-                }
-                buf
-            }),
-            None => tokio::spawn(async { String::new() }),
-        };
-
-        let sleeper = tokio::time::sleep(self.timeout);
-        tokio::pin!(sleeper);
-
-        let exit_status: Option<std::io::Result<std::process::ExitStatus>> = tokio::select! {
-            biased;
-            () = &mut sleeper => None,
-            res = child.wait() => Some(res),
-        };
-
-        let timed_out = exit_status.is_none();
-        let status_opt: Option<std::process::ExitStatus> = match exit_status {
-            None => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                None
-            }
-            Some(Err(e)) => return Err(e).context("waiting on executor child process"),
-            Some(Ok(s)) => Some(s),
-        };
-
-        // The reader tasks return when their pipe hits EOF, which
-        // happens when the child closes its end. After `child.wait()` /
-        // `child.start_kill()` returned the child is reaped; awaiting
-        // the readers is safe.
-        let stdout_text = stdout_handle.await.unwrap_or_default();
-        let stderr_text = stderr_handle.await.unwrap_or_default();
-
-        // Flush the structured log AFTER readers finished so the FINAL
-        // ANSWER section reflects whatever set_final_answer captured.
-        if let Err(e) = writer.finalize() {
-            tracing::warn!(
-                log_file = %log_path.display(),
-                "finalizing structured log failed: {e:#}"
-            );
-        }
-        let final_answer = writer.final_answer();
-        let session_id = writer.session_id();
-
-        Ok(SubprocessOutcome {
-            timed_out,
-            exit_status: status_opt,
-            stdout: stdout_text,
-            stderr: if timed_out && stderr_text.is_empty() {
-                "timeout".to_string()
-            } else {
-                stderr_text
+        let strategy =
+            crate::agentic_run::ClaudeStrategy::new(self.command.clone(), self.args.clone());
+        crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+            workspace,
+            change,
+            strategy: &strategy,
+            prompt,
+            sandbox: crate::agentic_run::SandboxConfig {
+                allowed_tools: self.sandbox.allowed_tools.clone(),
+                disallowed_bash_patterns: self.sandbox.disallowed_bash_patterns.clone(),
+                disallowed_read_paths: self.sandbox.disallowed_read_paths.clone(),
+                // The executor implements code, so it allows Write/Edit:
+                // its settings file must NOT deny them (preserving the
+                // pre-refactor executor settings exactly).
+                deny_writes: false,
             },
-            final_answer,
-            streamed_log: true,
-            session_id,
+            model: None,
+            output_mode: if json_mode {
+                crate::agentic_run::OutputMode::Streaming
+            } else {
+                crate::agentic_run::OutputMode::Capture
+            },
+            timeout: self.timeout,
+            paths: Some(&self.paths),
+            settings_dir: self.settings_dir.as_deref(),
+            include_autocoder_tools: true,
+            emit_stream_json_in_capture: false,
+            resume_session_id: None,
+            track_subprocess_marker: true,
+            etxtbsy_retry_spawn: false,
         })
+        .await
     }
 
     /// Classify a subprocess outcome into an `ExecutorOutcome`, applying
@@ -964,7 +697,7 @@ impl ClaudeCliExecutor {
         &self,
         workspace: &Path,
         change: &str,
-        outcome: SubprocessOutcome,
+        outcome: AgenticRunOutcome,
     ) -> Result<ExecutorOutcome> {
         Ok(self
             .classify_outcome_with_meta(workspace, change, outcome)
@@ -981,7 +714,7 @@ impl ClaudeCliExecutor {
         &self,
         workspace: &Path,
         change: &str,
-        outcome: SubprocessOutcome,
+        outcome: AgenticRunOutcome,
     ) -> Result<ClassifiedOutcome> {
         // Tool-recorded outcome lookup (a27a0). The per-execution MCP
         // child relays outcome tool calls to the daemon via
@@ -1030,7 +763,7 @@ impl ClaudeCliExecutor {
         let status = outcome.exit_status.expect("non-timeout path has status");
         // a39: detect a SIGTERM-killed subprocess. The daemon spawns the
         // wrapped CLI directly in its own process group (see
-        // `run_subprocess`), so when a daemon shutdown's SIGTERM cascade
+        // `crate::agentic_run::agentic_run`), so when a daemon shutdown's SIGTERM cascade
         // reaches it — systemd's `KillMode=control-group` delivers
         // SIGTERM to every process in the unit's cgroup — the child is
         // terminated *by the signal*. The reaped `ExitStatus` then
@@ -1139,7 +872,7 @@ impl ClaudeCliExecutor {
             .join(change)
             .join(ASKUSER_MARKER_FILENAME);
         let _ = std::fs::remove_file(&stale_marker);
-        let _mcp_path = Self::write_mcp_config(workspace, change)?;
+        let _mcp_path = Self::write_mcp_config(workspace, change, None)?;
 
         let outcome_result = self
             .run_recovery_subprocess(workspace, change, &recovery_prompt, session_id.as_deref())
@@ -1180,78 +913,44 @@ impl ClaudeCliExecutor {
         change: &str,
         prompt: &str,
         session_id: Option<&str>,
-    ) -> Result<SubprocessOutcome> {
-        let settings_path = self
-            .write_sandbox_settings()
-            .context("generating sandbox settings file for recovery turn")?;
-        let _settings_guard = TempFileGuard(settings_path.clone());
-
+    ) -> Result<AgenticRunOutcome> {
         let json_mode = matches!(
             self.output_format,
             crate::config::ExecutorOutputFormat::Json
         );
-
-        let mut cmd = Command::new(&self.command);
-        cmd.args(&self.args)
-            .arg("--settings")
-            .arg(&settings_path)
-            .arg("--allowedTools")
-            .arg(self.sandbox.allowed_tools.join(","))
-            .arg("--permission-mode")
-            .arg("acceptEdits");
-        if let Some(sid) = session_id {
-            cmd.arg("--resume").arg(sid);
-        }
-        if json_mode {
-            cmd.arg("--verbose")
-                .arg("--output-format")
-                .arg("stream-json");
-        }
-        let mut child = cmd
-            .current_dir(workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .with_context(|| {
-                format!("spawning recovery-turn command `{}`", self.command)
-            })?;
-
-        let _subprocess_marker_guard = if let Some(pid) = child.id() {
-            if let Err(e) = crate::busy_marker::write_subprocess_marker(&self.paths, workspace, pid) {
-                tracing::warn!(
-                    workspace = %workspace.display(),
-                    pid,
-                    "failed to write subprocess sidecar marker for recovery turn (run continues): {e:#}"
-                );
-                None
-            } else {
-                Some(SubprocessMarkerGuard {
-                    paths: self.paths.clone(),
-                    workspace: workspace.to_path_buf(),
-                })
-            }
-        } else {
-            None
-        };
-
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(prompt.as_bytes()).await;
-        }
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-
-        // Recovery turns capture stdout/stderr at-exit (no structured
-        // log writer is allocated — we append directly into the
-        // existing log files after classification). This keeps the
-        // recovery path simpler AND mirrors what append_recovery_to_log
-        // expects to read from the returned outcome. The session_id
-        // capture isn't needed on the recovery turn (no second loop is
-        // permitted) so we skip the JSON-event dispatcher entirely.
-        let _ = change;
-        self.run_subprocess_legacy(child, stdout_pipe, stderr_pipe)
-            .await
+        let strategy =
+            crate::agentic_run::ClaudeStrategy::new(self.command.clone(), self.args.clone());
+        // Recovery turns capture stdout/stderr at-exit (no structured log
+        // writer — append_recovery_to_log appends into the existing log
+        // files after classification). The command still emits stream-json
+        // when `json_mode` (preserving the pre-refactor recovery command),
+        // but the bytes are read raw at exit; the session-id capture isn't
+        // needed (no second loop is permitted). The autocoder MCP
+        // provided-tool names are NOT auto-appended here, matching the
+        // pre-refactor recovery `--allowedTools` value.
+        crate::agentic_run::agentic_run(crate::agentic_run::AgenticRunOpts {
+            workspace,
+            change,
+            strategy: &strategy,
+            prompt,
+            sandbox: crate::agentic_run::SandboxConfig {
+                allowed_tools: self.sandbox.allowed_tools.clone(),
+                disallowed_bash_patterns: self.sandbox.disallowed_bash_patterns.clone(),
+                disallowed_read_paths: self.sandbox.disallowed_read_paths.clone(),
+                deny_writes: false,
+            },
+            model: None,
+            output_mode: crate::agentic_run::OutputMode::Capture,
+            timeout: self.timeout,
+            paths: Some(&self.paths),
+            settings_dir: self.settings_dir.as_deref(),
+            include_autocoder_tools: false,
+            emit_stream_json_in_capture: json_mode,
+            resume_session_id: session_id,
+            track_subprocess_marker: true,
+            etxtbsy_retry_spawn: false,
+        })
+        .await
     }
 }
 
@@ -1334,7 +1033,7 @@ fn append_recovery_to_log(
     paths: &crate::paths::DaemonPaths,
     workspace: &Path,
     change: &str,
-    outcome: &SubprocessOutcome,
+    outcome: &AgenticRunOutcome,
 ) {
     use std::io::Write;
     let summary_path = run_log_path(paths, workspace, change);
@@ -1466,28 +1165,6 @@ beyond that are auto-failed.\n\
         iteration_number = marker.iteration_number,
         cap = ITERATION_REQUEST_CAP,
     )
-}
-
-/// Build the `--allowedTools` argument value passed to Claude CLI: the
-/// operator's configured `executor.sandbox.allowed_tools` plus the
-/// autocoder MCP tools (in `mcp__<server>__<tool>` form). The autocoder
-/// tools are auto-included so operators don't have to enumerate them
-/// per-name in their sandbox config — they're part of the daemon's
-/// contract with the agent, not operator-configurable surface. Without
-/// auto-inclusion, the agent's outcome-tool calls hit Claude CLI's
-/// permission gate AND fail with `permission denied`, which classifies
-/// the run as Failed even when the agent did real work.
-///
-/// Source of truth for the autocoder tool list is
-/// `crate::mcp_askuser_server::PROVIDED_TOOL_NAMES`. Duplicates between
-/// the operator's list AND the auto-included list are harmless (Claude
-/// CLI deduplicates them internally).
-fn build_allowed_tools_arg(sandbox_allowed: &[String]) -> String {
-    let mut combined: Vec<String> = sandbox_allowed.to_vec();
-    for tool in crate::mcp_askuser_server::PROVIDED_TOOL_NAMES {
-        combined.push(crate::mcp_askuser_server::qualified_tool_name(tool));
-    }
-    combined.join(",")
 }
 
 fn build_handle(workspace: &Path, change: &str, session_id: Option<String>) -> ResumeHandle {
@@ -1688,61 +1365,6 @@ fn map_recorded_outcome(
     }
 }
 
-struct SubprocessOutcome {
-    timed_out: bool,
-    exit_status: Option<std::process::ExitStatus>,
-    stdout: String,
-    stderr: String,
-    /// Populated by the JSON streaming path with the agent's
-    /// conversational summary from the `result` event. `None` in legacy
-    /// text mode (no streaming) AND when the run timed out before the
-    /// result event arrived.
-    final_answer: Option<String>,
-    /// True when the JSON streaming path built the log file itself (so
-    /// the legacy `persist_run_log` writer should skip it). False in
-    /// text mode where `persist_run_log` still owns the log shape.
-    streamed_log: bool,
-    /// Session id captured from the JSON-streaming `system`-event
-    /// init subtype. `None` in text mode (no JSON events to parse)
-    /// OR when the system event was not present in the captured
-    /// stream. The acceptance-scan recovery loop (a27a2) reads this
-    /// to launch `claude --resume <session_id>` against the same
-    /// conversation.
-    session_id: Option<String>,
-}
-
-/// RAII guard that removes a temp file when dropped. Used so the sandbox
-/// settings file is cleaned up regardless of how `run_subprocess` exits
-/// (success, error, panic).
-struct TempFileGuard(PathBuf);
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.0) {
-            tracing::warn!(
-                path = %self.0.display(),
-                "failed to remove sandbox settings temp file: {e}"
-            );
-        }
-    }
-}
-
-/// RAII guard that removes the subprocess-PID sidecar when dropped.
-/// Constructed in `run_subprocess` after the sidecar file is successfully
-/// written; ensures the file is gone on success, error, or panic so the
-/// next iteration's busy-marker recovery only sees a sidecar when an
-/// actual orphan exists (i.e. the daemon crashed before Drop ran).
-struct SubprocessMarkerGuard {
-    paths: std::sync::Arc<crate::paths::DaemonPaths>,
-    workspace: PathBuf,
-}
-
-impl Drop for SubprocessMarkerGuard {
-    fn drop(&mut self) {
-        crate::busy_marker::remove_subprocess_marker(&self.paths, &self.workspace);
-    }
-}
-
 #[async_trait]
 impl Executor for ClaudeCliExecutor {
     async fn run(&self, workspace: &Path, change: &str) -> Result<ExecutorOutcome> {
@@ -1755,8 +1377,8 @@ impl Executor for ClaudeCliExecutor {
             .join(ASKUSER_MARKER_FILENAME);
         let _ = std::fs::remove_file(&stale_marker);
 
-        let _mcp_path = Self::write_mcp_config(workspace, change)?;
-        let outcome = self.run_subprocess(workspace, change, &prompt).await;
+        let _mcp_path = Self::write_mcp_config(workspace, change, None)?;
+        let outcome = self.spawn_agentic_session(workspace, change, &prompt).await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(&self.paths, workspace, change, &prompt, &outcome);
@@ -1806,8 +1428,8 @@ impl Executor for ClaudeCliExecutor {
             .join(ASKUSER_MARKER_FILENAME);
         let _ = std::fs::remove_file(&stale_marker);
 
-        let _mcp_path = Self::write_mcp_config(workspace, change)?;
-        let outcome = self.run_subprocess(workspace, change, &prompt).await;
+        let _mcp_path = Self::write_mcp_config(workspace, change, None)?;
+        let outcome = self.spawn_agentic_session(workspace, change, &prompt).await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(&self.paths, workspace, change, &prompt, &outcome);
@@ -1829,8 +1451,8 @@ impl Executor for ClaudeCliExecutor {
             .join(ASKUSER_MARKER_FILENAME);
         let _ = std::fs::remove_file(&stale_marker);
 
-        let _mcp_path = Self::write_mcp_config(workspace, change)?;
-        let outcome = self.run_subprocess(workspace, change, &prompt).await;
+        let _mcp_path = Self::write_mcp_config(workspace, change, None)?;
+        let outcome = self.spawn_agentic_session(workspace, change, &prompt).await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
         persist_run_log(&self.paths, workspace, change, &prompt, &outcome);
@@ -1845,9 +1467,9 @@ impl Executor for ClaudeCliExecutor {
         let prompt = self.build_triage_prompt(ctx);
         // Triage mode does not target a specific change directory, so the
         // per-change MCP marker plumbing is keyed by a synthetic name.
-        let _mcp_path = Self::write_mcp_config(workspace, TRIAGE_LOG_CHANGE_NAME)?;
+        let _mcp_path = Self::write_mcp_config(workspace, TRIAGE_LOG_CHANGE_NAME, None)?;
         let outcome = self
-            .run_subprocess(workspace, TRIAGE_LOG_CHANGE_NAME, &prompt)
+            .spawn_agentic_session(workspace, TRIAGE_LOG_CHANGE_NAME, &prompt)
             .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
@@ -1862,9 +1484,9 @@ impl Executor for ClaudeCliExecutor {
         ctx: &ChatTriageContext,
     ) -> Result<ExecutorOutcome> {
         let prompt = self.build_chat_triage_prompt(ctx);
-        let _mcp_path = Self::write_mcp_config(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME)?;
+        let _mcp_path = Self::write_mcp_config(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, None)?;
         let outcome = self
-            .run_subprocess(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, &prompt)
+            .spawn_agentic_session(workspace, CHAT_TRIAGE_LOG_CHANGE_NAME, &prompt)
             .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
@@ -1881,9 +1503,9 @@ impl Executor for ClaudeCliExecutor {
         // The polling layer has already substituted the template; the
         // executor passes `rendered_prompt` verbatim to the wrapped CLI.
         let prompt = ctx.rendered_prompt.clone();
-        let _mcp_path = Self::write_mcp_config(workspace, BROWNFIELD_DRAFT_LOG_CHANGE_NAME)?;
+        let _mcp_path = Self::write_mcp_config(workspace, BROWNFIELD_DRAFT_LOG_CHANGE_NAME, None)?;
         let outcome = self
-            .run_subprocess(workspace, BROWNFIELD_DRAFT_LOG_CHANGE_NAME, &prompt)
+            .spawn_agentic_session(workspace, BROWNFIELD_DRAFT_LOG_CHANGE_NAME, &prompt)
             .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
@@ -1904,9 +1526,9 @@ impl Executor for ClaudeCliExecutor {
         ctx: &ScoutContext,
     ) -> Result<ExecutorOutcome> {
         let prompt = ctx.rendered_prompt.clone();
-        let _mcp_path = Self::write_mcp_config(workspace, SCOUT_LOG_CHANGE_NAME)?;
+        let _mcp_path = Self::write_mcp_config(workspace, SCOUT_LOG_CHANGE_NAME, None)?;
         let outcome = self
-            .run_subprocess(workspace, SCOUT_LOG_CHANGE_NAME, &prompt)
+            .spawn_agentic_session(workspace, SCOUT_LOG_CHANGE_NAME, &prompt)
             .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
@@ -1921,9 +1543,9 @@ impl Executor for ClaudeCliExecutor {
         ctx: &ChangelogContext,
     ) -> Result<ExecutorOutcome> {
         let prompt = self.build_changelog_prompt(ctx);
-        let _mcp_path = Self::write_mcp_config(workspace, CHANGELOG_STYLIST_LOG_CHANGE_NAME)?;
+        let _mcp_path = Self::write_mcp_config(workspace, CHANGELOG_STYLIST_LOG_CHANGE_NAME, None)?;
         let outcome = self
-            .run_subprocess(workspace, CHANGELOG_STYLIST_LOG_CHANGE_NAME, &prompt)
+            .spawn_agentic_session(workspace, CHANGELOG_STYLIST_LOG_CHANGE_NAME, &prompt)
             .await;
         Self::delete_mcp_config(workspace);
         let outcome = outcome?;
@@ -1936,160 +1558,6 @@ impl Executor for ClaudeCliExecutor {
         );
         self.classify_outcome(workspace, CHANGELOG_STYLIST_LOG_CHANGE_NAME, outcome)
             .await
-    }
-}
-
-/// Parse a stdout line as a JSON event and append a corresponding
-/// ACTIONS-section line (or, for the `result` event, capture the final
-/// answer in the writer's buffer). Malformed JSON lands as `[raw]`;
-/// unknown event types as `[unknown:<type>]` — neither aborts the
-/// stream-reader loop.
-fn dispatch_event_to_log(writer: &StructuredLogWriter, line: &str) {
-    if line.is_empty() {
-        return;
-    }
-    match json_event::parse_event_line(line) {
-        Ok(event) => dispatch_parsed_event(writer, event),
-        Err(e) => {
-            tracing::warn!(
-                "claude stream-json: malformed line, recording as [raw]: {e}"
-            );
-            let _ = writer.append_action(ActionKind::Raw, line);
-        }
-    }
-}
-
-fn dispatch_parsed_event(writer: &StructuredLogWriter, event: JsonEvent) {
-    match event {
-        JsonEvent::System { content } => {
-            // Init metadata isn't actionable for operators; suppress
-            // from the action stream. We DO capture the session_id so
-            // the recovery loop (a27a2) can launch `claude --resume
-            // <session_id>` against the same conversation.
-            if let Some(id) = content.get("session_id").and_then(|v| v.as_str())
-                && !id.is_empty()
-            {
-                writer.set_session_id(id.to_string());
-            }
-        }
-        JsonEvent::Assistant { content_blocks } => {
-            for block in content_blocks {
-                match block {
-                    AssistantBlock::Text { text } => {
-                        for line in wrap_assistant_text(&text) {
-                            let _ = writer.append_action(ActionKind::Assistant, &line);
-                        }
-                    }
-                    AssistantBlock::ToolUse {
-                        tool_name,
-                        tool_input,
-                    } => {
-                        let summary = format_tool_input_summary(&tool_input);
-                        let content = if summary.is_empty() {
-                            tool_name
-                        } else {
-                            format!("{tool_name} {summary}")
-                        };
-                        let _ = writer.append_action(ActionKind::ToolUse, &content);
-                    }
-                }
-            }
-        }
-        JsonEvent::User { content_blocks } => {
-            for block in content_blocks {
-                match block {
-                    UserBlock::ToolResult {
-                        content, is_error, ..
-                    } => {
-                        if is_error {
-                            let msg: String =
-                                content.chars().take(200).collect();
-                            let _ = writer.append_action(
-                                ActionKind::Unknown("tool_result:error".into()),
-                                &msg,
-                            );
-                        } else {
-                            let line = format!("({n} bytes returned)", n = content.len());
-                            let _ = writer.append_action(ActionKind::ToolResult, &line);
-                        }
-                    }
-                }
-            }
-        }
-        JsonEvent::Result { final_text, .. } => {
-            let _ = writer.set_final_answer(final_text);
-        }
-        JsonEvent::Unknown { event_type, raw } => {
-            let body = serde_json::to_string(&raw).unwrap_or_default();
-            let _ = writer.append_action(ActionKind::Unknown(event_type), &body);
-        }
-    }
-}
-
-/// Wrap assistant text at ~80 columns on whitespace boundaries; long
-/// single-line runs (URLs, code) get returned as a single chunk to
-/// avoid mid-token splits.
-fn wrap_assistant_text(text: &str) -> Vec<String> {
-    const WIDTH: usize = 80;
-    let mut out: Vec<String> = Vec::new();
-    for para in text.split('\n') {
-        if para.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let mut current = String::new();
-        for word in para.split_whitespace() {
-            if current.is_empty() {
-                current.push_str(word);
-            } else if current.len() + 1 + word.len() <= WIDTH {
-                current.push(' ');
-                current.push_str(word);
-            } else {
-                out.push(std::mem::take(&mut current));
-                current.push_str(word);
-            }
-        }
-        if !current.is_empty() {
-            out.push(current);
-        }
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
-}
-
-/// Format a `tool_input` JSON value into a one-line summary suitable
-/// for a `[tool_use]` log line. Truncates at ~200 chars to keep the
-/// log readable; the full input was emitted on the stream and is no
-/// longer addressable, but operators can re-run the change with text
-/// mode to capture the raw bytes if they need them.
-fn format_tool_input_summary(input: &serde_json::Value) -> String {
-    let raw = match input {
-        serde_json::Value::Object(map) => {
-            // Pick a small set of recognizable shape clues without
-            // dumping the entire object; falls through to to_string
-            // when no recognizable key is present.
-            if let Some(p) = map.get("file_path").and_then(|v| v.as_str()) {
-                p.to_string()
-            } else if let Some(p) = map.get("path").and_then(|v| v.as_str()) {
-                p.to_string()
-            } else if let Some(c) = map.get("command").and_then(|v| v.as_str()) {
-                c.to_string()
-            } else if let Some(p) = map.get("pattern").and_then(|v| v.as_str()) {
-                p.to_string()
-            } else {
-                serde_json::to_string(input).unwrap_or_default()
-            }
-        }
-        _ => serde_json::to_string(input).unwrap_or_default(),
-    };
-    if raw.chars().count() > 200 {
-        let mut truncated: String = raw.chars().take(200).collect();
-        truncated.push('…');
-        truncated
-    } else {
-        raw
     }
 }
 
@@ -2122,7 +1590,7 @@ fn persist_run_log(
     workspace: &Path,
     change: &str,
     prompt: &str,
-    outcome: &SubprocessOutcome,
+    outcome: &AgenticRunOutcome,
 ) {
     // The JSON-streaming path already wrote the structured log
     // incrementally; overwriting here would discard the ACTIONS section.
@@ -2246,7 +1714,7 @@ mod tests {
         // with the agent. Operators who never touched their config still
         // get a functional outcome-tools path.
         let operator_tools = vec!["Read".to_string(), "Edit".to_string()];
-        let combined = build_allowed_tools_arg(&operator_tools);
+        let combined = crate::agentic_run::build_allowed_tools_value(&operator_tools, true);
         let entries: Vec<&str> = combined.split(',').collect();
 
         // Operator-configured tools preserved verbatim.
@@ -2280,7 +1748,7 @@ mod tests {
         // Operators who configure NO sandbox.allowed_tools still get the
         // autocoder MCP tools auto-allowed — the daemon contract holds
         // regardless of operator config state.
-        let combined = build_allowed_tools_arg(&[]);
+        let combined = crate::agentic_run::build_allowed_tools_value(&[], true);
         let entries: Vec<&str> = combined.split(',').collect();
         assert!(entries.contains(&"mcp__ask_user__ask_user"));
         assert!(entries.contains(&"mcp__ask_user__query_canonical_specs"));
@@ -2291,19 +1759,20 @@ mod tests {
 
     #[test]
     fn sandbox_settings_file_contains_expected_deny_patterns() {
-        // Construct executor with a small custom sandbox so test asserts
-        // are precise.
+        // The executor path through `agentic_run` writes its settings file
+        // via the shared `audits::write_sandbox_settings` with
+        // `deny_writes: false` — preserving the pre-refactor executor
+        // settings exactly: the bash/read deny patterns are present AND
+        // `Write(*)`/`Edit(*)` are NOT denied (the executor implements
+        // code).
         let sandbox = crate::config::ResolvedSandbox {
             allowed_tools: vec!["Read".into(), "Bash".into()],
             disallowed_bash_patterns: vec!["curl:*".into(), "git push:*".into()],
             disallowed_read_paths: vec!["/home/*/.ssh/**".into()],
         };
-        let (_td_paths, paths) = crate::testing::test_daemon_paths();
-        let executor =
-            ClaudeCliExecutor::new_with_sandbox("dummy-claude".into(), 30, sandbox, std::sync::Arc::new(paths));
-        let path = executor
-            .write_sandbox_settings()
-            .expect("settings file writes");
+        let (path, _guard) =
+            crate::audits::write_sandbox_settings(&sandbox, None, false)
+                .expect("settings file writes");
         // Settings file is in OS temp dir.
         assert_eq!(path.parent().unwrap(), std::env::temp_dir());
         let content = std::fs::read_to_string(&path).unwrap();
@@ -2316,7 +1785,40 @@ mod tests {
         assert!(deny_strings.contains(&"Bash(curl:*)".to_string()));
         assert!(deny_strings.contains(&"Bash(git push:*)".to_string()));
         assert!(deny_strings.contains(&"Read(/home/*/.ssh/**)".to_string()));
-        std::fs::remove_file(&path).ok();
+        // Executor settings allow Write/Edit (deny_writes: false).
+        assert!(!deny_strings.contains(&"Write(*)".to_string()));
+        assert!(!deny_strings.contains(&"Edit(*)".to_string()));
+    }
+
+    // a56: `write_mcp_config` writes `ORCH_MCP_ROLE` into the `.mcp.json`
+    // env when a role is supplied, AND omits it when `None` (the executor's
+    // own runs, which report via the `outcome_*` tools, pass `None`).
+    #[test]
+    fn write_mcp_config_writes_role_env_when_supplied() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        let path =
+            ClaudeCliExecutor::write_mcp_config(ws, "a56-foo", Some("reviewer")).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let env = &v["mcpServers"]["ask_user"]["env"];
+        assert_eq!(env[crate::mcp_askuser_server::ENV_ROLE], "reviewer");
+        ClaudeCliExecutor::delete_mcp_config(ws);
+    }
+
+    #[test]
+    fn write_mcp_config_omits_role_env_when_none() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        let path = ClaudeCliExecutor::write_mcp_config(ws, "a56-foo", None).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let env = &v["mcpServers"]["ask_user"]["env"];
+        assert!(
+            env.get(crate::mcp_askuser_server::ENV_ROLE).is_none(),
+            "ORCH_MCP_ROLE must be absent when role is None: {env}"
+        );
+        ClaudeCliExecutor::delete_mcp_config(ws);
     }
 
     #[tokio::test]
@@ -3183,7 +2685,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("github_com_owner_repo");
         std::fs::create_dir_all(&ws).unwrap();
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: false,
             exit_status: None,
             stdout: "STDOUT_SENTINEL".to_string(),
@@ -3241,7 +2743,7 @@ mod tests {
     async fn timed_out_run_with_sentinel_in_stdout_returns_timeout() {
         let executor = fixture_executor_json();
         let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: true,
             exit_status: None,
             // Full well-formed sentinel-shaped content in stdout —
@@ -3283,7 +2785,7 @@ some tool output\n\
         // The `\n31\t` is the cat-n style prefix that signaled the bug:
         // a Read tool result for prompts/implementer.md renders the
         // file with line numbers, breaking JSON parse if scanned.
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: true,
             exit_status: None,
             stdout: "\
@@ -3906,7 +3408,7 @@ exit 0
         }
         let executor = fixture_executor_text();
         use std::os::unix::process::ExitStatusExt;
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: false,
             exit_status: Some(std::process::ExitStatus::from_raw(0)),
             stdout: "some normal output".to_string(),
@@ -3955,7 +3457,7 @@ exit 0
             );
         }
         let executor = fixture_executor_json();
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: true,
             exit_status: None,
             stdout: String::new(),
@@ -4725,7 +4227,7 @@ exit 0
             "{\"question\":\"clarify scope\"}",
         )
         .unwrap();
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: true,
             exit_status: None,
             stdout: String::new(),
@@ -4747,7 +4249,7 @@ exit 0
     async fn classifier_ordering_timeout_wins_over_exit_status() {
         let executor = fixture_executor_json();
         let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: true,
             exit_status: None,
             stdout: String::new(),
@@ -4770,7 +4272,7 @@ exit 0
         use std::os::unix::process::ExitStatusExt;
         let executor = fixture_executor_json();
         let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: false,
             exit_status: Some(std::process::ExitStatus::from_raw(1 << 8)),
             stdout: "could you clarify the scope?".to_string(),
@@ -4800,7 +4302,7 @@ exit 0
         use std::os::unix::process::ExitStatusExt;
         let executor = fixture_executor_json();
         let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: false,
             exit_status: Some(std::process::ExitStatus::from_raw(0)),
             stdout: String::new(),
@@ -4862,7 +4364,7 @@ exit 0
         crate::daemon::request_shutdown();
         let executor = fixture_executor_json();
         let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: false,
             // `from_raw(15)` = killed by signal 15 (SIGTERM): the wait
             // status a directly-spawned child reports when the daemon's
@@ -4906,7 +4408,7 @@ exit 0
         crate::daemon::request_shutdown();
         let executor = fixture_executor_json();
         let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: false,
             // `from_raw(143 << 8)` = a NORMAL exit with code 143 (the
             // shell "128 + 15" convention surfacing through a wrapper).
@@ -4949,7 +4451,7 @@ exit 0
         crate::daemon::reset_for_test();
         let executor = fixture_executor_json();
         let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: false,
             exit_status: Some(std::process::ExitStatus::from_raw(15)),
             stdout: String::new(),
@@ -4991,7 +4493,7 @@ exit 0
         crate::daemon::request_shutdown();
         let executor = fixture_executor_json();
         let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: false,
             exit_status: Some(std::process::ExitStatus::from_raw(1 << 8)),
             stdout: String::new(),
@@ -5030,7 +4532,7 @@ exit 0
         crate::daemon::request_shutdown();
         let executor = fixture_executor_json();
         let (_tmp, ws) = fixture_workspace_for_classify();
-        let outcome = SubprocessOutcome {
+        let outcome = AgenticRunOutcome {
             timed_out: false,
             exit_status: Some(std::process::ExitStatus::from_raw(0)),
             stdout: String::new(),

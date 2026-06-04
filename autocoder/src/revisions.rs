@@ -1679,7 +1679,12 @@ async fn execute_code_review(
     // contents reflect the CURRENT PR state. The change_list drives
     // archived-change brief lookup; unfound briefs are best-effort.
     let processed: Vec<String> = change_list.to_vec();
-    let ctx = match crate::polling_loop::build_review_context(workspace, repo, &processed) {
+    let ctx = match crate::polling_loop::build_review_context(
+        workspace,
+        repo,
+        &processed,
+        reviewer.kind(),
+    ) {
         Ok(c) => c,
         Err(e) => {
             return Ok(CodeReviewOutcome::Failed {
@@ -1687,13 +1692,34 @@ async fn execute_code_review(
             });
         }
     };
-    // Run the reviewer.
-    let result = match crate::code_reviewer::review_pr_at_state_with(reviewer, &ctx).await {
-        Ok(r) => r,
-        Err(e) => {
-            return Ok(CodeReviewOutcome::Failed {
-                reason: format!("reviewer invocation failed: {e}"),
-            });
+    // Run the reviewer, dispatching on the configured transport (a58). The
+    // one-shot path is unchanged. The agentic path discards the review (no
+    // verdict, never auto-approve) when the session records no valid
+    // submission — mapped to `Failed` so the existing alert + PR-comment
+    // path fires. This supersedes the one-shot composer's verdict-default.
+    let result = match reviewer.kind() {
+        crate::config::ReviewerKind::Oneshot => {
+            match crate::code_reviewer::review_pr_at_state_with(reviewer, &ctx).await {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(CodeReviewOutcome::Failed {
+                        reason: format!("reviewer invocation failed: {e}"),
+                    });
+                }
+            }
+        }
+        crate::config::ReviewerKind::Agentic => {
+            match crate::code_reviewer::run_agentic_review(reviewer, &ctx, workspace).await {
+                Ok(crate::code_reviewer::AgenticReviewOutcome::Reviewed(r)) => r,
+                Ok(crate::code_reviewer::AgenticReviewOutcome::Discarded { reason }) => {
+                    return Ok(CodeReviewOutcome::Failed { reason });
+                }
+                Err(e) => {
+                    return Ok(CodeReviewOutcome::Failed {
+                        reason: format!("agentic reviewer failed: {e}"),
+                    });
+                }
+            }
         }
     };
     // Compose + post the fresh PR comment with the canonical heading. When

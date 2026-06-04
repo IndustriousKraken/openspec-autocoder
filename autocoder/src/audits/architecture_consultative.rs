@@ -1,9 +1,12 @@
 //! Architecture consultative audit. Invokes the wrapped agent CLI
 //! (typically `claude`) with a read-only sandbox (`Read`, `Glob`, `Grep`,
-//! `Bash`) and a consultative architecture prompt. Parses the agent's
-//! structured JSON output into 0-5 [`Finding`]s, each phrased as a
-//! question anchored to a specific file:line range, and returns
-//! `AuditOutcome::Reported`.
+//! `Bash`) plus the `submit_findings` MCP tool (a57) and a consultative
+//! architecture prompt. The agent returns 0-5 [`Finding`]s — each phrased
+//! as a question anchored to a specific file:line range — by calling
+//! `submit_findings`; the daemon consumes the stored submission, which is
+//! capped at 5 entries by the registered schema, and returns
+//! `AuditOutcome::Reported`. A run that ends with no stored submission is
+//! an audit failure.
 //!
 //! `requires_head_change = true` — re-asking the same architecture
 //! questions about the same SHA wastes CLI invocations.
@@ -17,14 +20,11 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
 
 use super::{
     Audit, AuditContext, AuditLogWriter, AuditOutcome, Finding, Severity, WritePolicy,
-    workspace_is_valid, workspace_unavailable_outcome, write_sandbox_settings,
+    workspace_is_valid, workspace_unavailable_outcome,
 };
 use crate::config::{AuditSettings, ExecutorConfig, ResolvedSandbox};
 use crate::prompts::{PromptId, PromptLoader};
@@ -52,6 +52,10 @@ pub struct ArchitectureConsultativeAudit {
     /// file is written to. `None` (production) means
     /// `std::env::temp_dir()`. Tests pass a per-test TempDir.
     settings_dir: Option<PathBuf>,
+    /// Test-only injected `submit_findings` submission (a57). See
+    /// [`super::try_consume_submission`] for the production path.
+    #[cfg(test)]
+    test_submission: Option<Option<serde_json::Value>>,
 }
 
 impl ArchitectureConsultativeAudit {
@@ -72,6 +76,8 @@ impl ArchitectureConsultativeAudit {
             executor_timeout_secs: executor.timeout_secs,
             sandbox,
             settings_dir: None,
+            #[cfg(test)]
+            test_submission: None,
         }
     }
 
@@ -79,6 +85,24 @@ impl ArchitectureConsultativeAudit {
     pub(crate) fn with_settings_dir(mut self, dir: PathBuf) -> Self {
         self.settings_dir = Some(dir);
         self
+    }
+
+    /// Test-only override standing in for the agent's `submit_findings`
+    /// submission (a57). `Some(payload)` → consumed as the result;
+    /// `None` → the audit observes "no submission".
+    #[cfg(test)]
+    pub(crate) fn with_submission(mut self, submission: Option<serde_json::Value>) -> Self {
+        self.test_submission = Some(submission);
+        self
+    }
+
+    /// Drain the agent's `submit_findings` submission (a57).
+    async fn consume_submission(&self, workspace: &Path) -> Option<serde_json::Value> {
+        #[cfg(test)]
+        if let Some(over) = &self.test_submission {
+            return over.clone();
+        }
+        super::try_consume_submission(workspace, Self::TYPE).await
     }
 
     /// Resolve the consultative prompt via the uniform [`PromptLoader`].
@@ -131,14 +155,10 @@ impl Audit for ArchitectureConsultativeAudit {
         let mut sandbox = self.sandbox.clone();
         sandbox.allowed_tools = ALLOWED_TOOLS.iter().map(|s| (*s).to_string()).collect();
 
-        let (settings_path, _settings_guard) =
-            write_sandbox_settings(&sandbox, self.settings_dir.as_deref())
-                .context("generating architecture-consultative sandbox settings file")?;
-
         let _ = ctx.log_writer.write_section(
             "architecture_consultative_preamble",
             &format!(
-                "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nsettings_file: {}\nallowed_tools: {}",
+                "executor_command: {}\ntimeout_secs: {}\nprompt_source: {}\nallowed_tools: {}",
                 self.executor_command,
                 self.executor_timeout_secs,
                 self.settings
@@ -146,7 +166,6 @@ impl Audit for ArchitectureConsultativeAudit {
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "<embedded default>".to_string()),
-                settings_path.display(),
                 sandbox.allowed_tools.join(","),
             ),
         );
@@ -154,13 +173,16 @@ impl Audit for ArchitectureConsultativeAudit {
             .log_writer
             .write_section("architecture_consultative_prompt", &prompt);
 
-        let outcome = run_subprocess(
+        // a57: run WITH MCP enabled; findings arrive via `submit_findings`,
+        // not stdout.
+        let outcome = super::run_audit_cli_with_submit(
             &self.executor_command,
-            &settings_path,
-            &sandbox.allowed_tools,
+            &sandbox,
             ctx.workspace,
             &prompt,
             Duration::from_secs(self.executor_timeout_secs),
+            self.settings_dir.as_deref(),
+            Self::TYPE,
         )
         .await
         .context("spawning architecture-consultative CLI subprocess")?;
@@ -191,14 +213,26 @@ impl Audit for ArchitectureConsultativeAudit {
             return Err(err);
         }
 
-        let findings = match parse_findings(&outcome.stdout) {
+        // Drain the agent's `submit_findings` submission. No stored
+        // submission is an audit failure (retried next iteration).
+        let Some(payload) = self.consume_submission(ctx.workspace).await else {
+            let _ = ctx.log_writer.write_section(
+                "architecture_consultative_outcome",
+                "kind: Err\nreason: no submit_findings submission recorded",
+            );
+            return Err(anyhow!(
+                "architecture_consultative: agent exited with no submit_findings submission; stderr excerpt: {}",
+                excerpt(&outcome.stderr)
+            ));
+        };
+        let findings = match payload_to_findings(&payload) {
             Ok(f) => f,
             Err(e) => {
                 let _ = ctx.log_writer.write_section(
                     "architecture_consultative_outcome",
-                    &format!("kind: Err\nreason: {e:#}"),
+                    &format!("kind: Err\nreason: {e}"),
                 );
-                return Err(e);
+                return Err(anyhow!("architecture_consultative: {e}"));
             }
         };
         let _ = ctx.log_writer.write_section(
@@ -222,45 +256,32 @@ impl Audit for ArchitectureConsultativeAudit {
     }
 }
 
-/// Parse `stdout` as `{ "findings": [...] }`. Rejects more than
-/// `MAX_FINDINGS` entries (the prompt's cap; the agent disregarding
-/// the cap is treated as audit failure rather than silently truncated).
-pub(crate) fn parse_findings(stdout: &str) -> Result<Vec<Finding>> {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!(
-            "architecture_consultative: agent produced empty stdout (expected `{{ \"findings\": [...] }}`)"
-        ));
-    }
-    let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
-        anyhow!(
-            "architecture_consultative: stdout is not valid JSON: {e}; excerpt: {}",
-            excerpt(stdout)
-        )
-    })?;
-    let arr = parsed
+/// Deserialize a `submit_findings` payload (`{ "findings": [...] }`) into
+/// [`Finding`]s (a57). Rejects more than `MAX_FINDINGS` entries — the
+/// registered `record_submission` validator (this function with its `Ok`
+/// value discarded) surfaces the rejection to the agent as a correctable
+/// tool error rather than silently truncating. Returns `Err(reason)` (a
+/// correction-suitable string) on any malformed payload.
+pub(crate) fn payload_to_findings(
+    payload: &serde_json::Value,
+) -> std::result::Result<Vec<Finding>, String> {
+    let arr = payload
         .get("findings")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            anyhow!(
-                "architecture_consultative: stdout JSON missing top-level `findings` array; excerpt: {}",
-                excerpt(stdout)
-            )
+            "architecture_consultative: submission missing top-level `findings` array".to_string()
         })?;
     if arr.len() > MAX_FINDINGS {
-        return Err(anyhow!(
-            "architecture_consultative: agent emitted {} findings; prompt caps at {}; excerpt: {}",
+        return Err(format!(
+            "architecture_consultative: submission has {} findings; the schema caps at {MAX_FINDINGS}",
             arr.len(),
-            MAX_FINDINGS,
-            excerpt(stdout)
         ));
     }
     let mut findings = Vec::with_capacity(arr.len());
     for (idx, raw) in arr.iter().enumerate() {
         let entry: RawFinding = serde_json::from_value(raw.clone()).map_err(|e| {
-            anyhow!(
-                "architecture_consultative: findings[{idx}] does not match the expected shape: {e}; excerpt: {}",
-                excerpt(stdout)
+            format!(
+                "architecture_consultative: findings[{idx}] does not match the expected shape: {e}"
             )
         })?;
         let severity = parse_severity(&entry.severity);
@@ -309,23 +330,16 @@ fn excerpt(s: &str) -> String {
     out
 }
 
-struct SubprocessOutcome {
-    timed_out: bool,
-    exit_status: Option<std::process::ExitStatus>,
-    stdout: String,
-    stderr: String,
-}
-
-/// Pure transformation: given a SubprocessOutcome, return Some(error) if
-/// the outcome is terminal (timed out OR non-zero exit). Returns None when
-/// the caller should continue processing (parse stdout into findings).
+/// Pure transformation: given an [`crate::agentic_run::AgenticRunOutcome`],
+/// return Some(error) if the outcome is terminal (timed out OR non-zero
+/// exit). Returns None when the caller should continue processing (parse
+/// stdout into findings).
 ///
 /// Extracted from `run()` so tests can exercise the timeout/exit error
-/// shapes by constructing synthetic SubprocessOutcome values directly,
-/// avoiding real subprocesses, timers, and the race condition that
-/// comes with them.
+/// shapes by constructing synthetic outcome values directly, avoiding real
+/// subprocesses, timers, and the race condition that comes with them.
 fn outcome_to_terminal_err(
-    outcome: &SubprocessOutcome,
+    outcome: &crate::agentic_run::AgenticRunOutcome,
     log_writer: &mut AuditLogWriter,
     audit_type: &str,
     timeout_secs: u64,
@@ -352,87 +366,6 @@ fn outcome_to_terminal_err(
         ));
     }
     None
-}
-
-/// Spawn the wrapped CLI, write `prompt` on its stdin, wait with the
-/// configured timeout, return captured stdout + stderr. Mirrors the
-/// drift audit's run_subprocess.
-async fn run_subprocess(
-    command: &str,
-    settings_path: &std::path::Path,
-    allowed_tools: &[String],
-    workspace: &std::path::Path,
-    prompt: &str,
-    timeout: Duration,
-) -> Result<SubprocessOutcome> {
-    // ETXTBSY retry: see docs/test-reliability.md
-    // "ETXTBSY from concurrent audit-CLI fixtures".
-    let mut child = super::spawn_with_etxtbsy_retry(|| {
-        let mut cmd = Command::new(command);
-        cmd.arg("--settings")
-            .arg(settings_path)
-            .arg("--allowedTools")
-            .arg(allowed_tools.join(","))
-            .arg("--permission-mode")
-            .arg("acceptEdits")
-            .current_dir(workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        cmd
-    })
-    .await
-    .with_context(|| {
-        format!("spawning architecture-consultative command `{command}`")
-    })?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt.as_bytes()).await;
-    }
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-
-    let sleeper = tokio::time::sleep(timeout);
-    tokio::pin!(sleeper);
-
-    let exit_status: Option<std::io::Result<std::process::ExitStatus>> = tokio::select! {
-        biased;
-        () = &mut sleeper => None,
-        res = child.wait() => Some(res),
-    };
-
-    match exit_status {
-        None => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            Ok(SubprocessOutcome {
-                timed_out: true,
-                exit_status: None,
-                stdout: String::new(),
-                stderr: "timeout".to_string(),
-            })
-        }
-        Some(Err(e)) => {
-            Err(e).context("waiting on architecture-consultative child process")
-        }
-        Some(Ok(status)) => {
-            let mut stdout_text = String::new();
-            if let Some(ref mut p) = stdout_pipe {
-                let _ = p.read_to_string(&mut stdout_text).await;
-            }
-            let mut stderr_text = String::new();
-            if let Some(ref mut p) = stderr_pipe {
-                let _ = p.read_to_string(&mut stderr_text).await;
-            }
-            Ok(SubprocessOutcome {
-                timed_out: false,
-                exit_status: Some(status),
-                stdout: stdout_text,
-                stderr: stderr_text,
-            })
-        }
-    }
 }
 
 #[cfg(test)]
@@ -507,8 +440,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_well_formed_findings_json() {
-        let stdout = r#"{
+    fn payload_round_trips_to_findings() {
+        let payload = serde_json::json!({
             "findings": [
                 {
                     "subject": "Should the parser move into its own module?",
@@ -523,8 +456,8 @@ mod tests {
                     "severity": "low"
                 }
             ]
-        }"#;
-        let findings = parse_findings(stdout).expect("parses");
+        });
+        let findings = payload_to_findings(&payload).expect("deserializes");
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].severity, Severity::Medium);
         assert!(findings[0].subject.starts_with("Should"));
@@ -537,15 +470,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_zero_findings_as_no_findings_outcome() {
-        let stdout = r#"{"findings": []}"#;
-        let findings = parse_findings(stdout).expect("parses empty array");
+    fn empty_findings_array_deserializes_to_no_findings() {
+        let payload = serde_json::json!({"findings": []});
+        let findings = payload_to_findings(&payload).expect("deserializes empty array");
         assert!(findings.is_empty());
     }
 
+    /// a57 (task 3.3): a 6-finding payload is rejected by the schema; a
+    /// subsequent valid (≤5) payload deserializes. The rejection reason is
+    /// correction-suitable so the agent can resubmit in the same session.
     #[test]
-    fn rejects_runs_with_more_than_5_findings() {
-        let stdout = r#"{
+    fn six_findings_rejected_then_five_accepted() {
+        let six = serde_json::json!({
             "findings": [
                 {"subject":"q1?","body":"b","anchor":"a:1","severity":"low"},
                 {"subject":"q2?","body":"b","anchor":"a:1","severity":"low"},
@@ -554,20 +490,29 @@ mod tests {
                 {"subject":"q5?","body":"b","anchor":"a:1","severity":"low"},
                 {"subject":"q6?","body":"b","anchor":"a:1","severity":"low"}
             ]
-        }"#;
-        let err = parse_findings(stdout).expect_err("six findings must error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("6 findings"), "got: {msg}");
-        assert!(msg.contains("caps at 5"), "got: {msg}");
+        });
+        let err = payload_to_findings(&six).expect_err("six findings must error");
+        assert!(err.contains("caps at 5"), "got: {err}");
+        let five = serde_json::json!({
+            "findings": [
+                {"subject":"q1?","body":"b","anchor":"a:1","severity":"low"},
+                {"subject":"q2?","body":"b","anchor":"a:1","severity":"low"},
+                {"subject":"q3?","body":"b","anchor":"a:1","severity":"low"},
+                {"subject":"q4?","body":"b","anchor":"a:1","severity":"low"},
+                {"subject":"q5?","body":"b","anchor":"a:1","severity":"low"}
+            ]
+        });
+        let findings = payload_to_findings(&five).expect("five findings accepted");
+        assert_eq!(findings.len(), 5);
     }
 
     #[test]
-    fn malformed_json_returns_err_with_excerpt() {
-        let stdout = "this is not JSON at all, just some prose the agent wrote";
-        let err = parse_findings(stdout).expect_err("non-JSON must error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("not valid JSON"), "got: {msg}");
-        assert!(msg.contains("just some prose"), "excerpt missing: {msg}");
+    fn finding_missing_required_field_returns_err() {
+        let payload = serde_json::json!({
+            "findings": [{"subject": "q?", "body": "b", "severity": "low"}]
+        });
+        let err = payload_to_findings(&payload).expect_err("missing anchor must error");
+        assert!(err.contains("findings[0]"), "got: {err}");
     }
 
     /// Anti-prompt-drift assertion: the anti-microservices clause must
@@ -612,17 +557,9 @@ mod tests {
 
     #[test]
     fn missing_top_level_findings_key_returns_err() {
-        let stdout = r#"{"results": []}"#;
-        let err = parse_findings(stdout).expect_err("missing key must error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("findings"), "got: {msg}");
-    }
-
-    #[test]
-    fn empty_stdout_returns_err() {
-        let err = parse_findings("   \n").expect_err("empty stdout must error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("empty"), "got: {msg}");
+        let payload = serde_json::json!({"results": []});
+        let err = payload_to_findings(&payload).expect_err("missing key must error");
+        assert!(err.contains("findings"), "got: {err}");
     }
 
     #[test]
@@ -735,8 +672,14 @@ mod tests {
 
         let cfg = executor_cfg(&script.to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
+        let submission = serde_json::json!({
+            "findings": [
+                {"subject": "Should foo move?", "body": "detail", "anchor": "src/foo.rs:1", "severity": "medium"}
+            ]
+        });
         let audit = ArchitectureConsultativeAudit::new(&HashMap::new(), &cfg)
-            .with_settings_dir(settings_dir.path().to_path_buf());
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_submission(Some(submission));
         let repo = fixture_repo();
         let mut ctx = AuditContext {
             workspace,
@@ -782,22 +725,23 @@ mod tests {
         }
     }
 
+    /// a57 (task 3.4): a clean exit with no stored submission is an audit
+    /// failure (`Err`).
     #[tokio::test]
-    async fn run_returns_err_on_malformed_stdout() {
+    async fn run_returns_err_when_no_submission() {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
-        // Satisfy the workspace-validity gate
-        // (see `audits-require-valid-workspace`).
         std::fs::create_dir_all(workspace.join(".git")).unwrap();
         let script = write_script(
             ws_dir.path(),
-            "bad.sh",
-            "#!/bin/sh\necho 'this is not the JSON you are looking for'\nexit 0\n",
+            "silent.sh",
+            "#!/bin/sh\nexit 0\n",
         );
         let cfg = executor_cfg(&script.to_string_lossy());
         let settings_dir = TempDir::new().unwrap();
         let audit = ArchitectureConsultativeAudit::new(&HashMap::new(), &cfg)
-            .with_settings_dir(settings_dir.path().to_path_buf());
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_submission(None);
         let repo = fixture_repo();
         let mut ctx = AuditContext {
             workspace,
@@ -810,18 +754,50 @@ mod tests {
         let err = audit
             .run(&mut ctx)
             .await
-            .expect_err("malformed stdout errors");
+            .expect_err("no submission must error");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("not valid JSON") || msg.contains("findings"),
-            "error must describe parse failure: {msg}"
+            msg.contains("no submit_findings submission"),
+            "error must name the missing submission: {msg}"
         );
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
         }
     }
 
-    /// Pure-data test: feed a synthesized `SubprocessOutcome` with
+    /// a57 (task 3.5): an empty `findings` submission yields a silent
+    /// `Reported(vec![])`.
+    #[tokio::test]
+    async fn run_returns_reported_empty_for_empty_submission() {
+        let ws_dir = TempDir::new().unwrap();
+        let workspace = ws_dir.path();
+        std::fs::create_dir_all(workspace.join(".git")).unwrap();
+        let script = write_script(ws_dir.path(), "clean.sh", "#!/bin/sh\nexit 0\n");
+        let cfg = executor_cfg(&script.to_string_lossy());
+        let settings_dir = TempDir::new().unwrap();
+        let audit = ArchitectureConsultativeAudit::new(&HashMap::new(), &cfg)
+            .with_settings_dir(settings_dir.path().to_path_buf())
+            .with_submission(Some(serde_json::json!({"findings": []})));
+        let repo = fixture_repo();
+        let mut ctx = AuditContext {
+            workspace,
+            repo: &repo,
+            chatops_ctx: None,
+            log_writer: make_log_writer(workspace),
+            max_validation_retries: 0,
+        };
+        let log_path = ctx.log_writer.path().to_path_buf();
+        let outcome = audit.run(&mut ctx).await.expect("empty submission succeeds");
+        match outcome {
+            AuditOutcome::Reported { findings, .. } => assert!(findings.is_empty()),
+            other => panic!("expected Reported(empty), got {other:?}"),
+        }
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
+        }
+    }
+
+    /// Pure-data test: feed a synthesized `AgenticRunOutcome` with
     /// `timed_out: true` directly into `outcome_to_terminal_err` and
     /// assert the resulting error + log entries. No subprocess, no
     /// timer, no race — verifies the audit's translation logic, which
@@ -835,11 +811,12 @@ mod tests {
         let workspace = ws_dir.path();
         let mut log_writer = make_log_writer(workspace);
         let log_path = log_writer.path().to_path_buf();
-        let outcome = SubprocessOutcome {
+        let outcome = crate::agentic_run::AgenticRunOutcome {
             timed_out: true,
             exit_status: None,
             stdout: String::new(),
             stderr: "timeout".into(),
+            ..Default::default()
         };
         let err = outcome_to_terminal_err(
             &outcome,
@@ -875,11 +852,12 @@ mod tests {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
         let mut log_writer = make_log_writer(workspace);
-        let outcome = SubprocessOutcome {
+        let outcome = crate::agentic_run::AgenticRunOutcome {
             timed_out: false,
             exit_status: Some(std::process::ExitStatus::from_raw(7 << 8)),
             stdout: String::new(),
             stderr: "boom".into(),
+            ..Default::default()
         };
         let err = outcome_to_terminal_err(
             &outcome,
@@ -901,11 +879,12 @@ mod tests {
         let ws_dir = TempDir::new().unwrap();
         let workspace = ws_dir.path();
         let mut log_writer = make_log_writer(workspace);
-        let outcome = SubprocessOutcome {
+        let outcome = crate::agentic_run::AgenticRunOutcome {
             timed_out: false,
             exit_status: Some(std::process::ExitStatus::from_raw(0)),
             stdout: r#"{"findings":[]}"#.into(),
             stderr: String::new(),
+            ..Default::default()
         };
         assert!(
             outcome_to_terminal_err(&outcome, &mut log_writer, "architecture_consultative", 30)

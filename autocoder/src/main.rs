@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 
+mod agentic_run;
 mod alert_state;
 mod alert_state_migration;
 mod alerts;
@@ -44,6 +45,7 @@ mod spec_revision;
 mod spec_root;
 mod spec_storage_routing;
 mod state;
+mod submission_store;
 #[cfg(test)]
 mod testing;
 mod workspace;
