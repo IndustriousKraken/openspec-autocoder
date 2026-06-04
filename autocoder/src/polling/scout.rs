@@ -225,16 +225,24 @@ fn render_scout_prompt(
     recent_activity: &str,
     open_issues: &str,
 ) -> String {
-    template
-        .replace("{{max_items}}", &max_items.to_string())
-        .replace("{{guidance}}", guidance)
-        .replace("{{repo_url}}", repo_url)
-        .replace("{{head_sha}}", head_sha)
-        .replace("{{readme}}", readme)
-        .replace("{{docs_listing}}", docs_listing)
-        .replace("{{symbols_overview}}", symbols_overview)
-        .replace("{{recent_activity}}", recent_activity)
-        .replace("{{open_issues}}", open_issues)
+    // Single-pass substitution (a002): an injected README / docs listing /
+    // symbols overview / operator-guidance value that itself contains a
+    // `{{...}}` token is emitted verbatim, never re-expanded by a later
+    // pass.
+    crate::prompts::render_template(
+        template,
+        &[
+            ("max_items", &max_items.to_string()),
+            ("guidance", guidance),
+            ("repo_url", repo_url),
+            ("head_sha", head_sha),
+            ("readme", readme),
+            ("docs_listing", docs_listing),
+            ("symbols_overview", symbols_overview),
+            ("recent_activity", recent_activity),
+            ("open_issues", open_issues),
+        ],
+    )
 }
 
 /// Validate the executor's JSON response. Returns the parsed item list

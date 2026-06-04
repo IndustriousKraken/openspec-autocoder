@@ -475,17 +475,25 @@ pub fn delete_branch_remote(workspace: &Path, branch: &str, remote: &str) -> Res
     Ok(())
 }
 
-/// Return the trimmed stdout of `git status --porcelain`. Empty string ⇒
-/// clean working tree.
+/// Return the stdout of `git status --porcelain`, trailing-trimmed only.
+/// Empty string ⇒ clean working tree.
+///
+/// The whole blob is `.trim_end()`-ed rather than `.trim()`-ed on purpose:
+/// a worktree-modified-but-not-staged file's record has a blank staged
+/// column, so it begins with a leading space (` M <path>`). A whole-string
+/// `.trim()` would strip that leading space off the FIRST record,
+/// collapsing its `XY␣` prefix to two chars and decapitating that record's
+/// path for any caller that slices by fixed offset.
 pub fn status_porcelain(workspace: &Path) -> Result<String> {
     let output = run_git(workspace, "status --porcelain", &["status", "--porcelain"])?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
 }
 
-/// Return the trimmed stdout of `git status --porcelain -uall`. Unlike
-/// `status_porcelain`, this expands untracked directories to every
-/// individual file path inside them, so callers doing per-path policy
-/// checks (e.g. the audit framework's `WritePolicy::OpenSpecOnly`
+/// Return the stdout of `git status --porcelain -uall`, trailing-trimmed
+/// only (see [`status_porcelain`] for why the leading status-space must
+/// survive). Unlike `status_porcelain`, this expands untracked directories
+/// to every individual file path inside them, so callers doing per-path
+/// policy checks (e.g. the audit framework's `WritePolicy::OpenSpecOnly`
 /// enforcement) see the actual paths, not just the parent dir.
 pub fn status_porcelain_untracked_all(workspace: &Path) -> Result<String> {
     let output = run_git(
@@ -493,7 +501,82 @@ pub fn status_porcelain_untracked_all(workspace: &Path) -> Result<String> {
         "status --porcelain -uall",
         &["status", "--porcelain", "-uall"],
     )?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+}
+
+/// One parsed record from `git status -z --porcelain`. `staged` is the
+/// index (X) status code, `worktree` is the worktree (Y) status code,
+/// `path` is the (verbatim, unquoted) path, AND `orig_path` is the
+/// rename/copy source path when the record is a rename or copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusEntry {
+    pub staged: char,
+    pub worktree: char,
+    pub path: String,
+    pub orig_path: Option<String>,
+}
+
+/// Parse the working tree's status into structured [`StatusEntry`] records
+/// via `git status -z --porcelain --untracked-files=all`. This is the
+/// single source of truth for working-tree status parsing in the daemon —
+/// every caller that needs the changed paths (and/or their status codes)
+/// goes through here rather than hand-slicing porcelain lines.
+///
+/// `-z` is load-bearing. It emits NUL-terminated records with paths
+/// VERBATIM — no `core.quotePath` C-escaping and no surrounding quotes —
+/// so a path containing a space or non-ASCII bytes parses correctly with
+/// no unquoting step. The raw output is split on the NUL byte rather than
+/// trimmed as a whole: a whole-blob trim would strip the leading
+/// staged-status space of the first record (a worktree-modified file's
+/// blank X column), decapitating that record's path.
+///
+/// Within a record the first two chars are the staged (X) AND worktree (Y)
+/// status codes, the third char is a space, AND the remainder is the path.
+/// A rename/copy record (X or Y is `R` or `C`) is immediately followed by
+/// a second NUL-terminated token carrying the original path, captured as
+/// `orig_path`; that token is consumed so the record stream stays aligned.
+pub fn status_entries(workspace: &Path) -> Result<Vec<StatusEntry>> {
+    let output = run_git(
+        workspace,
+        "status -z --porcelain --untracked-files=all",
+        &["status", "-z", "--porcelain", "--untracked-files=all"],
+    )?;
+    let mut records = output.stdout.split(|&b| b == 0u8);
+    let mut entries = Vec::new();
+    while let Some(record) = records.next() {
+        // A valid record is `XY <path>`: two status chars + a space + at
+        // least one path byte (>= 4 bytes). The split's trailing element
+        // after the final NUL is empty; skip it AND any stray short
+        // record. The path bytes are NOT trimmed — under `-z` they are
+        // exact, so a leading/trailing space in a filename survives.
+        if record.len() < 4 {
+            continue;
+        }
+        let staged = record[0] as char;
+        let worktree = record[1] as char;
+        let path = String::from_utf8_lossy(&record[3..]).into_owned();
+        if path.is_empty() {
+            continue;
+        }
+        // A rename (`R`) or copy (`C`) in either status column carries the
+        // original path in the immediately-following NUL token; consume it
+        // to keep the record stream aligned with the status records.
+        let orig_path = if matches!(staged, 'R' | 'C') || matches!(worktree, 'R' | 'C') {
+            records
+                .next()
+                .map(|src| String::from_utf8_lossy(src).into_owned())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+        entries.push(StatusEntry {
+            staged,
+            worktree,
+            path,
+            orig_path,
+        });
+    }
+    Ok(entries)
 }
 
 /// Return the 40-character commit SHA pointed to by `rev`.
@@ -839,6 +922,100 @@ mod tests {
         commit(&path, "add note").unwrap();
         let s = status_porcelain(&path).unwrap();
         assert_eq!(s, "");
+    }
+
+    #[test]
+    fn status_entries_empty_on_clean_tree() {
+        let (_dir, path) = fixture_repo();
+        assert!(
+            status_entries(&path).unwrap().is_empty(),
+            "a clean tree must yield no entries"
+        );
+    }
+
+    /// 3.1 — pins the changelog regression: a worktree-modified tracked
+    /// file whose record is the FIRST (and only) record keeps its full
+    /// path. A whole-blob `.trim()` used to drop the leading status-space,
+    /// decapitating `openspec/...` to `penspec/...`.
+    #[test]
+    fn status_entries_worktree_modified_first_record_keeps_full_path() {
+        let (_dir, path) = fixture_repo();
+        let rel = "openspec/changes/archive/a001-slug/proposal.md";
+        let abs = path.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "before\n").unwrap();
+        run_init(&path, &["add", rel]);
+        run_init(&path, &["commit", "-q", "-m", "add proposal"]);
+        // Worktree-modify it WITHOUT staging — the staged column is blank.
+        std::fs::write(&abs, "after\n").unwrap();
+
+        let entries = status_entries(&path).unwrap();
+        assert_eq!(entries.len(), 1, "expected one entry, got {entries:?}");
+        let e = &entries[0];
+        assert_eq!(e.path, rel, "no leading character may be dropped");
+        assert_eq!(e.staged, ' ', "staged code must be a blank space");
+        assert_eq!(e.worktree, 'M', "worktree code must be M");
+        assert_eq!(e.orig_path, None);
+    }
+
+    /// 3.2 — a path containing a space parses to the literal path, with no
+    /// surrounding quote characters and no truncation (`-z` disables
+    /// `core.quotePath`).
+    #[test]
+    fn status_entries_path_with_spaces_parses_literally() {
+        let (_dir, path) = fixture_repo();
+        let rel = "dir with spaces/note.md";
+        let abs = path.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "x\n").unwrap();
+
+        let entries = status_entries(&path).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let e = &entries[0];
+        assert_eq!(e.path, rel, "spaced path must parse literally");
+        assert_eq!((e.staged, e.worktree), ('?', '?'), "untracked file is ??");
+    }
+
+    /// 3.3 — a staged rename yields the destination path AND the original
+    /// path captured from the trailing `-z` token.
+    #[test]
+    fn status_entries_staged_rename_captures_orig_path() {
+        let (_dir, path) = fixture_repo();
+        std::fs::write(path.join("old.md"), "content\n").unwrap();
+        run_init(&path, &["add", "old.md"]);
+        run_init(&path, &["commit", "-q", "-m", "add old.md"]);
+        // `git mv` stages the rename old.md -> new.md.
+        run_init(&path, &["mv", "old.md", "new.md"]);
+
+        let entries = status_entries(&path).unwrap();
+        assert_eq!(entries.len(), 1, "a rename is one entry, got {entries:?}");
+        let e = &entries[0];
+        assert_eq!(e.path, "new.md");
+        assert_eq!(e.orig_path, Some("old.md".to_string()));
+        assert_eq!(e.staged, 'R', "staged rename index code must be R");
+    }
+
+    /// 3.4 — a staged new file is distinguishable from an untracked one:
+    /// its index (staged) code is `A`, not `?`.
+    #[test]
+    fn status_entries_staged_new_file_is_added_not_untracked() {
+        let (_dir, path) = fixture_repo();
+        let rel = "src/new.rs";
+        let abs = path.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "fn main() {}\n").unwrap();
+        run_init(&path, &["add", rel]);
+
+        let entries = status_entries(&path).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let e = &entries[0];
+        assert_eq!(e.staged, 'A', "a staged add's index code must be A");
+        assert_eq!(e.path, "src/new.rs");
+        assert_ne!(
+            (e.staged, e.worktree),
+            ('?', '?'),
+            "a staged add must be distinguishable from an untracked file"
+        );
     }
 
     #[test]

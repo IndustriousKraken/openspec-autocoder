@@ -282,14 +282,16 @@ pub(crate) fn verify_change_artifacts(workspace: &Path, capability: &str) -> Res
     }
 }
 
-/// Detect sandbox leaks by partitioning the porcelain output into
+/// Detect sandbox leaks by partitioning the status entries into
 /// `openspec/` paths AND everything else. Returns the list of leaked
 /// (non-`openspec/`) paths; an empty list means the run stayed within
-/// the documented `WritePolicy::OpenSpecOnly` boundary.
-pub(crate) fn detect_sandbox_leak(porcelain: &str) -> Vec<String> {
-    porcelain
-        .lines()
-        .filter_map(|l| extract_porcelain_path(l).map(|p| p.to_string()))
+/// the documented `WritePolicy::OpenSpecOnly` boundary. Only the entry's
+/// destination `path` is considered (a rename INTO a non-`openspec/` path
+/// is a leak; its `openspec/` source is not).
+pub(crate) fn detect_sandbox_leak(entries: &[git::StatusEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|e| e.path.clone())
         .filter(|p| !p.is_empty() && !p.starts_with("openspec/"))
         .collect()
 }
@@ -311,9 +313,9 @@ async fn finalize_completed(
     // 2. Sandbox-leak check: every modified path MUST be under
     //    `openspec/`. Anything else means the executor violated the
     //    WritePolicy::OpenSpecOnly contract.
-    let porcelain = git::status_porcelain_untracked_all(workspace)
+    let entries = git::status_entries(workspace)
         .with_context(|| "brownfield: reading git status".to_string())?;
-    let leaked = detect_sandbox_leak(&porcelain);
+    let leaked = detect_sandbox_leak(&entries);
     if !leaked.is_empty() {
         tracing::warn!(
             request_id = %state.request_id,
@@ -451,13 +453,20 @@ fn render_brownfield_prompt(
     docs_listing: &str,
     symbols_overview: &str,
 ) -> String {
-    template
-        .replace("{{capability_name}}", capability_name)
-        .replace("{{guidance}}", guidance)
-        .replace("{{repo_url}}", repo_url)
-        .replace("{{readme}}", readme)
-        .replace("{{docs_listing}}", docs_listing)
-        .replace("{{symbols_overview}}", symbols_overview)
+    // Single-pass substitution (a002): an injected README / docs listing /
+    // symbols overview / operator-guidance value that itself contains a
+    // `{{...}}` token is emitted verbatim, never re-expanded.
+    crate::prompts::render_template(
+        template,
+        &[
+            ("capability_name", capability_name),
+            ("guidance", guidance),
+            ("repo_url", repo_url),
+            ("readme", readme),
+            ("docs_listing", docs_listing),
+            ("symbols_overview", symbols_overview),
+        ],
+    )
 }
 
 /// Read the workspace's `README.md`. Returns a placeholder when the
@@ -569,19 +578,6 @@ fn rg_public_items_overview(workspace: &Path) -> Option<String> {
     }
     lines.sort();
     Some(lines.join("\n"))
-}
-
-/// Pull the path out of a `git status --porcelain` line. Local copy of
-/// the same parser used by `polling_loop`; kept here to avoid a wider
-/// cross-module dependency.
-fn extract_porcelain_path(line: &str) -> Option<&str> {
-    let trimmed = line.get(3..)?.trim_start();
-    let path = if let Some(idx) = trimmed.rfind(" -> ") {
-        trimmed[idx + 4..].trim()
-    } else {
-        trimmed.trim()
-    };
-    if path.is_empty() { None } else { Some(path) }
 }
 
 /// Extract the `## Why` section text from a brownfield proposal.md.
@@ -838,16 +834,6 @@ mod tests {
         assert!(body.contains("No code changes"), "{body}");
     }
 
-    #[test]
-    fn extract_porcelain_path_handles_simple_and_rename() {
-        assert_eq!(extract_porcelain_path(" M src/foo.rs"), Some("src/foo.rs"));
-        assert_eq!(
-            extract_porcelain_path("R  old.rs -> new.rs"),
-            Some("new.rs")
-        );
-        assert_eq!(extract_porcelain_path(""), None);
-    }
-
     fn write_artifacts(workspace: &Path, capability: &str) {
         let change_dir = workspace
             .join("openspec/changes")
@@ -911,32 +897,54 @@ mod tests {
         assert!(msg.contains("missing"), "{msg}");
     }
 
+    fn se(staged: char, worktree: char, path: &str) -> git::StatusEntry {
+        git::StatusEntry {
+            staged,
+            worktree,
+            path: path.to_string(),
+            orig_path: None,
+        }
+    }
+
     #[test]
     fn detect_sandbox_leak_empty_when_diff_is_pure_openspec() {
-        let porcelain = " M openspec/changes/brownfield-scheduler/proposal.md\n A openspec/changes/brownfield-scheduler/tasks.md\n";
-        let leaked = detect_sandbox_leak(porcelain);
+        let entries = [
+            se(' ', 'M', "openspec/changes/brownfield-scheduler/proposal.md"),
+            se('A', ' ', "openspec/changes/brownfield-scheduler/tasks.md"),
+        ];
+        let leaked = detect_sandbox_leak(&entries);
         assert!(leaked.is_empty(), "expected no leaks; got {leaked:?}");
     }
 
     #[test]
     fn detect_sandbox_leak_lists_paths_outside_openspec() {
-        let porcelain = " M openspec/changes/x/proposal.md\n M src/lib.rs\n A README.md\n";
-        let mut leaked = detect_sandbox_leak(porcelain);
+        let entries = [
+            se(' ', 'M', "openspec/changes/x/proposal.md"),
+            se(' ', 'M', "src/lib.rs"),
+            se('A', ' ', "README.md"),
+        ];
+        let mut leaked = detect_sandbox_leak(&entries);
         leaked.sort();
         assert_eq!(leaked, vec!["README.md".to_string(), "src/lib.rs".to_string()]);
     }
 
     #[test]
     fn detect_sandbox_leak_handles_renames_into_source() {
-        let porcelain = "R  openspec/changes/x/old.md -> src/leak.rs\n";
-        let leaked = detect_sandbox_leak(porcelain);
+        // A rename whose DESTINATION leaks out of `openspec/` is a leak;
+        // the `openspec/` source (orig_path) is not reported.
+        let entries = [git::StatusEntry {
+            staged: 'R',
+            worktree: ' ',
+            path: "src/leak.rs".to_string(),
+            orig_path: Some("openspec/changes/x/old.md".to_string()),
+        }];
+        let leaked = detect_sandbox_leak(&entries);
         assert_eq!(leaked, vec!["src/leak.rs".to_string()]);
     }
 
     #[test]
-    fn detect_sandbox_leak_skips_blank_lines() {
-        let porcelain = "\n\n M openspec/changes/x/p.md\n";
-        let leaked = detect_sandbox_leak(porcelain);
+    fn detect_sandbox_leak_empty_for_no_entries() {
+        let leaked = detect_sandbox_leak(&[]);
         assert!(leaked.is_empty(), "{leaked:?}");
     }
 

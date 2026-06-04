@@ -339,12 +339,22 @@ impl CodeReviewer {
         preamble: &str,
     ) -> Result<ReviewReport> {
         let rendered = render_sections(context, self.prompt_budget);
-        let body = self
-            .template
-            .replace("{{cross_change_preamble}}", preamble)
-            .replace("{{change_context}}", &rendered.change_context)
-            .replace("{{changed_files}}", &rendered.changed_files)
-            .replace("{{diff}}", &rendered.diff_or_explanation);
+        // Single-pass substitution (a002): a `{{...}}` token appearing
+        // inside a substituted value — most importantly inside the
+        // `{{changed_files}}` value when the change under review touches a
+        // template, docs, OR the reviewer's own code/specs — is emitted
+        // verbatim, never re-expanded. Chained `.replace` re-scanned
+        // injected content and could multiply the prompt past the model's
+        // context limit.
+        let body = crate::prompts::render_template(
+            &self.template,
+            &[
+                ("cross_change_preamble", preamble),
+                ("change_context", &rendered.change_context),
+                ("changed_files", &rendered.changed_files),
+                ("diff", &rendered.diff_or_explanation),
+            ],
+        );
         log_prompt_stats(context, &rendered, body.len(), self.prompt_budget);
         let raw = self.client.complete(&body).await?;
         let mut report = parse_response(&raw);
@@ -1759,6 +1769,69 @@ this is not yaml: at all: ::: {{{ broken
         assert!(
             rendered.contains("SENTINEL_DIFF_a48"),
             "default template must reference the {{diff}} placeholder"
+        );
+    }
+
+    /// a002 regression (task 3.4): a `ReviewContext` whose changed files
+    /// contain the literal `{{diff}}` AND `{{changed_files}}` tokens — the
+    /// self-hosting case where the change under review edits the reviewer's
+    /// own spec/code/docs — renders a prompt that does NOT re-expand those
+    /// literals. Under the old chained `.replace`, the final
+    /// `.replace("{{diff}}", …)` stamped the whole diff into every literal
+    /// `{{diff}}` carried in the changed files, exploding the prompt.
+    #[tokio::test]
+    async fn changed_file_placeholder_literals_are_not_re_expanded() {
+        let (client, captured) = stub_with_capture("VERDICT: Pass\n");
+        // A realistic template wraps each section in delimiters.
+        let template =
+            "CTX<<<{{change_context}}>>>\nFILES<<<{{changed_files}}>>>\nDIFF<<<{{diff}}>>>"
+                .to_string();
+        let reviewer = CodeReviewer::new(client, template.clone());
+
+        // The changed file's contents carry MANY literal placeholder tokens
+        // (as the reviewer's own spec docs do). The diff itself is large so
+        // that re-expansion would be conspicuous.
+        let file_contents = "documents {{diff}} and {{changed_files}} tokens\n".repeat(50);
+        let diff = "D".repeat(10_000);
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "openspec/specs/code-reviewer/spec.md".into(),
+                contents: file_contents.clone(),
+            }],
+            diff: diff.clone(),
+        };
+        reviewer.review(&ctx).await.unwrap();
+        let prompt = captured.lock().unwrap().clone().unwrap();
+
+        // The literal tokens survive verbatim in the changed-files section.
+        assert!(
+            prompt.contains("documents {{diff}} and {{changed_files}} tokens"),
+            "literal placeholder tokens must survive verbatim in the changed-files section"
+        );
+        // The big diff is inserted exactly once (at the template's own
+        // `{{diff}}`), NOT once per literal carried in the file.
+        assert_eq!(
+            prompt.matches(&diff).count(),
+            1,
+            "the diff must be inserted exactly once, not re-stamped into every literal"
+        );
+
+        // Size bound: the rendered prompt cannot exceed the sum of the
+        // section values plus the template scaffolding. (`render_sections`
+        // builds the changed-files section with `## File:` headers, so we
+        // bound by file_contents + a small per-file header allowance rather
+        // than by the bare contents.)
+        let rendered = render_sections(&ctx, reviewer.prompt_budget());
+        let bound = rendered.change_context.len()
+            + rendered.changed_files.len()
+            + rendered.diff_or_explanation.len()
+            + template.len();
+        assert!(
+            prompt.len() <= bound,
+            "prompt size {} must be bounded by section sizes + template = {bound} \
+             (no multiplicative blowup)",
+            prompt.len()
         );
     }
 }

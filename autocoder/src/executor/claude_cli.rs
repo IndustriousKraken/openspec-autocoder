@@ -73,6 +73,18 @@ const CHAT_TRIAGE_REQUEST_TEXT_PLACEHOLDER: &str = "{{request_text}}";
 const CHANGELOG_JSON_PLACEHOLDER: &str = "{{changelog_json}}";
 const CHANGELOG_REVISION_TEXT_PLACEHOLDER: &str = "{{revision_text}}";
 
+/// Strip the wrapping `{{`/`}}` from a placeholder constant, yielding the
+/// bare key [`crate::prompts::render_template`] matches on. Keeping the
+/// full-token constants as the single source of truth (they document the
+/// tokens AND are asserted by tests) while deriving the bare key here
+/// avoids drift between the two forms.
+fn placeholder_key(token: &str) -> &str {
+    token
+        .strip_prefix("{{")
+        .and_then(|t| t.strip_suffix("}}"))
+        .unwrap_or(token)
+}
+
 /// Synthetic "change" name used for the triage-mode run-log path. The
 /// triage flow does not target a specific change directory; the name is
 /// only used to produce a per-run log file on disk for diagnostics.
@@ -360,19 +372,36 @@ impl ClaudeCliExecutor {
         _change: &str,
         revision_context: &crate::revisions::RevisionContext,
     ) -> Result<String> {
-        let rendered = self
-            .revision_template
-            .replace(REVISION_PR_BODY_PLACEHOLDER, &revision_context.pr_body)
-            .replace(
-                REVISION_PR_CHANGE_LIST_PLACEHOLDER,
-                &revision_context.pr_change_list,
-            )
-            .replace(
-                REVISION_AGENT_NOTES_PLACEHOLDER,
-                &revision_context.agent_implementation_notes,
-            )
-            .replace(REVISION_DIFF_PLACEHOLDER, &revision_context.pr_diff)
-            .replace(REVISION_REQUEST_PLACEHOLDER, &revision_context.revision_text);
+        // Single-pass substitution (a002): closes the self-hosting hazard
+        // where `prompts/implementer-revision.md` itself contains
+        // `{{pr_diff}}` / `{{revision_request}}` / `{{pr_body}}` — revising
+        // a PR whose diff touches that template would, under chained
+        // `.replace`, re-expand those tokens inside the injected diff.
+        let rendered = crate::prompts::render_template(
+            &self.revision_template,
+            &[
+                (
+                    placeholder_key(REVISION_PR_BODY_PLACEHOLDER),
+                    &revision_context.pr_body,
+                ),
+                (
+                    placeholder_key(REVISION_PR_CHANGE_LIST_PLACEHOLDER),
+                    &revision_context.pr_change_list,
+                ),
+                (
+                    placeholder_key(REVISION_AGENT_NOTES_PLACEHOLDER),
+                    &revision_context.agent_implementation_notes,
+                ),
+                (
+                    placeholder_key(REVISION_DIFF_PLACEHOLDER),
+                    &revision_context.pr_diff,
+                ),
+                (
+                    placeholder_key(REVISION_REQUEST_PLACEHOLDER),
+                    &revision_context.revision_text,
+                ),
+            ],
+        );
         Ok(rendered)
     }
 
@@ -384,11 +413,23 @@ impl ClaudeCliExecutor {
     /// to explore the codebase itself rather than acting on one
     /// pre-existing change.
     fn build_triage_prompt(&self, ctx: &TriageContext) -> String {
-        self.triage_template
-            .replace(TRIAGE_FINDINGS_PLACEHOLDER, &ctx.findings)
-            .replace(TRIAGE_AUDIT_TYPE_PLACEHOLDER, &ctx.audit_type)
-            .replace(TRIAGE_REPO_URL_PLACEHOLDER, &ctx.repo_url)
-            .replace(TRIAGE_SPECS_INDEX_PLACEHOLDER, &ctx.canonical_specs_index)
+        // Single-pass substitution (a002): a `{{...}}` token inside the
+        // injected findings or canonical-specs index is not re-expanded.
+        crate::prompts::render_template(
+            &self.triage_template,
+            &[
+                (placeholder_key(TRIAGE_FINDINGS_PLACEHOLDER), &ctx.findings),
+                (
+                    placeholder_key(TRIAGE_AUDIT_TYPE_PLACEHOLDER),
+                    &ctx.audit_type,
+                ),
+                (placeholder_key(TRIAGE_REPO_URL_PLACEHOLDER), &ctx.repo_url),
+                (
+                    placeholder_key(TRIAGE_SPECS_INDEX_PLACEHOLDER),
+                    &ctx.canonical_specs_index,
+                ),
+            ],
+        )
     }
 
     /// Build the chat-triage prompt by substituting the three
@@ -397,10 +438,23 @@ impl ClaudeCliExecutor {
     /// this does NOT shell out to `openspec instructions apply` because the
     /// LLM is asked to classify and explore the codebase itself.
     fn build_chat_triage_prompt(&self, ctx: &ChatTriageContext) -> String {
-        self.chat_triage_template
-            .replace(CHAT_TRIAGE_REQUEST_TEXT_PLACEHOLDER, &ctx.request_text)
-            .replace(TRIAGE_REPO_URL_PLACEHOLDER, &ctx.repo_url)
-            .replace(TRIAGE_SPECS_INDEX_PLACEHOLDER, &ctx.canonical_specs_index)
+        // Single-pass substitution (a002): operator `request_text` that
+        // contains a `{{repo_url}}` / `{{canonical_specs_index}}` literal is
+        // not re-expanded by the later substitutions.
+        crate::prompts::render_template(
+            &self.chat_triage_template,
+            &[
+                (
+                    placeholder_key(CHAT_TRIAGE_REQUEST_TEXT_PLACEHOLDER),
+                    &ctx.request_text,
+                ),
+                (placeholder_key(TRIAGE_REPO_URL_PLACEHOLDER), &ctx.repo_url),
+                (
+                    placeholder_key(TRIAGE_SPECS_INDEX_PLACEHOLDER),
+                    &ctx.canonical_specs_index,
+                ),
+            ],
+        )
     }
 
     /// Build the changelog-stylist prompt by substituting the
@@ -408,10 +462,22 @@ impl ClaudeCliExecutor {
     /// (embedded default OR override loaded from
     /// `executor.changelog_stylist_prompt_path`).
     fn build_changelog_prompt(&self, ctx: &ChangelogContext) -> String {
-        self.changelog_stylist_template
-            .replace(CHANGELOG_JSON_PLACEHOLDER, &ctx.changelog_json)
-            .replace(TRIAGE_REPO_URL_PLACEHOLDER, &ctx.repo_url)
-            .replace(CHANGELOG_REVISION_TEXT_PLACEHOLDER, &ctx.revision_text)
+        // Single-pass substitution (a002): a `{{...}}` token inside the
+        // changelog JSON or operator revision text is not re-expanded.
+        crate::prompts::render_template(
+            &self.changelog_stylist_template,
+            &[
+                (
+                    placeholder_key(CHANGELOG_JSON_PLACEHOLDER),
+                    &ctx.changelog_json,
+                ),
+                (placeholder_key(TRIAGE_REPO_URL_PLACEHOLDER), &ctx.repo_url),
+                (
+                    placeholder_key(CHANGELOG_REVISION_TEXT_PLACEHOLDER),
+                    &ctx.revision_text,
+                ),
+            ],
+        )
     }
 
     /// Write a `<workspace>/.mcp.json` file telling the wrapped CLI to
@@ -3390,6 +3456,98 @@ some tool output\n\
         // either of these substrings under any input.
         assert!(!prompt.contains("openspec instructions apply"));
         assert!(!prompt.contains("original change material unavailable"));
+    }
+
+    /// a002 regression (task 3.5): the self-hosting case. When the PR
+    /// under revision edits `prompts/implementer-revision.md`, the
+    /// `pr_diff` carries literal `{{revision_request}}` / `{{pr_body}}`
+    /// tokens. Under chained `.replace`, the later
+    /// `.replace("{{revision_request}}", …)` / `.replace("{{pr_body}}", …)`
+    /// passes re-expanded those literals inside the injected diff,
+    /// corrupting the prompt. Single-pass substitution emits them verbatim
+    /// and inserts each real value exactly once.
+    #[test]
+    fn build_revision_prompt_does_not_re_expand_placeholders_in_diff() {
+        let (_dir, ws) = fixture_workspace();
+        let executor = ClaudeCliExecutor::new("dummy".into(), 30, test_paths_arc());
+        // The diff carries many literal placeholder tokens (as a diff
+        // touching the revision template itself would).
+        let diff_line = "+ instructions reference {{revision_request}} and {{pr_body}}\n";
+        let k = 40usize;
+        let pr_diff = diff_line.repeat(k);
+        let ctx = crate::revisions::RevisionContext {
+            change_name: "x".to_string(),
+            pr_diff: pr_diff.clone(),
+            revision_text: "UNIQUE_REVISION_SENTINEL".to_string(),
+            pr_body: "UNIQUE_BODY_SENTINEL".to_string(),
+            pr_change_list: "a01-x".to_string(),
+            agent_implementation_notes: "notes".to_string(),
+        };
+        let prompt = executor.build_revision_prompt(&ws, "x", &ctx).unwrap();
+
+        // The literal tokens carried by the diff survive verbatim.
+        assert!(
+            prompt.contains("instructions reference {{revision_request}} and {{pr_body}}"),
+            "diff-borne placeholder literals must survive verbatim:\n{prompt}"
+        );
+        // Each real value is inserted exactly once — NOT once per literal
+        // carried in the diff.
+        assert_eq!(
+            prompt.matches("UNIQUE_REVISION_SENTINEL").count(),
+            1,
+            "the revision request must be inserted exactly once"
+        );
+        assert_eq!(
+            prompt.matches("UNIQUE_BODY_SENTINEL").count(),
+            1,
+            "the PR body must be inserted exactly once"
+        );
+        // The K literal tokens remain K (none were expanded).
+        assert_eq!(prompt.matches("{{revision_request}}").count(), k);
+        assert_eq!(prompt.matches("{{pr_body}}").count(), k);
+        // Size bound: the prompt cannot exceed template + every injected
+        // value's length (no multiplicative growth from the diff's literals).
+        let bound = executor.revision_template.len()
+            + ctx.pr_body.len()
+            + ctx.pr_change_list.len()
+            + ctx.agent_implementation_notes.len()
+            + ctx.pr_diff.len()
+            + ctx.revision_text.len();
+        assert!(
+            prompt.len() <= bound,
+            "prompt size {} must be bounded by template + injected values = {bound}",
+            prompt.len()
+        );
+    }
+
+    /// a002 (executor spec scenario): operator `request_text` carrying a
+    /// `{{repo_url}}` / `{{canonical_specs_index}}` literal is not
+    /// re-expanded by `build_chat_triage_prompt`; the real placeholders are
+    /// each substituted exactly once.
+    #[test]
+    fn build_chat_triage_prompt_does_not_re_expand_request_text() {
+        let executor = ClaudeCliExecutor::new("dummy".into(), 30, test_paths_arc());
+        let ctx = ChatTriageContext {
+            request_text: "please look at {{repo_url}} and {{canonical_specs_index}}".to_string(),
+            repo_url: "UNIQUE_REPO_URL_SENTINEL".to_string(),
+            canonical_specs_index: "UNIQUE_SPECS_INDEX_SENTINEL".to_string(),
+        };
+        let prompt = executor.build_chat_triage_prompt(&ctx);
+
+        assert!(
+            prompt.contains("please look at {{repo_url}} and {{canonical_specs_index}}"),
+            "request_text placeholder literals must survive verbatim:\n{prompt}"
+        );
+        assert_eq!(
+            prompt.matches("UNIQUE_REPO_URL_SENTINEL").count(),
+            1,
+            "repo_url must be substituted exactly once"
+        );
+        assert_eq!(
+            prompt.matches("UNIQUE_SPECS_INDEX_SENTINEL").count(),
+            1,
+            "canonical_specs_index must be substituted exactly once"
+        );
     }
 
     /// End-to-end: after a `run`, the persisted log contains a PROMPT

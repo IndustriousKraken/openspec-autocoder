@@ -230,14 +230,22 @@ fn render_survey_prompt(
     symbols_overview: &str,
     already_specced: &str,
 ) -> String {
-    template
-        .replace("{{max_capabilities}}", &max_capabilities.to_string())
-        .replace("{{guidance}}", guidance)
-        .replace("{{repo_url}}", repo_url)
-        .replace("{{readme}}", readme)
-        .replace("{{docs_listing}}", docs_listing)
-        .replace("{{symbols_overview}}", symbols_overview)
-        .replace("{{already_specced}}", already_specced)
+    // Single-pass substitution (a002): an injected README / docs listing /
+    // symbols overview / operator-guidance / already-specced value that
+    // itself contains a `{{...}}` token is emitted verbatim, never
+    // re-expanded.
+    crate::prompts::render_template(
+        template,
+        &[
+            ("max_capabilities", &max_capabilities.to_string()),
+            ("guidance", guidance),
+            ("repo_url", repo_url),
+            ("readme", readme),
+            ("docs_listing", docs_listing),
+            ("symbols_overview", symbols_overview),
+            ("already_specced", already_specced),
+        ],
+    )
 }
 
 /// Validate the executor's JSON response.

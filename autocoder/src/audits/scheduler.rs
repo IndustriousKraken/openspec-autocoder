@@ -406,7 +406,7 @@ async fn drive_one_audit(
     // would report just `?? openspec/` (when the parent is also new),
     // which would mis-categorize the OpenSpecOnly check.
     let policy = audit.write_policy();
-    let porcelain = match git::status_porcelain_untracked_all(workspace) {
+    let entries = match git::status_entries(workspace) {
         Ok(s) => s,
         Err(e) => {
             // Couldn't probe the workspace — treat as a violation so the
@@ -414,12 +414,15 @@ async fn drive_one_audit(
             // signal). State stays untouched.
             log_writer.write_section(
                 "audit_postcheck_failed",
-                &format!("git status --porcelain errored: {e:#}"),
+                &format!("git status errored: {e:#}"),
             )?;
             return Err(e);
         }
     };
-    if let Some(violation) = detect_write_policy_violation(policy, &porcelain) {
+    if let Some(violation) = detect_write_policy_violation(policy, &entries) {
+        // Raw porcelain for the human-readable log section only; the
+        // decision above used the structured `status_entries`. Best-effort.
+        let porcelain = git::status_porcelain_untracked_all(workspace).unwrap_or_default();
         log_writer.write_section(
             "audit_write_policy_violation",
             &format!(
@@ -662,31 +665,30 @@ struct PolicyViolation {
     reason: String,
 }
 
-/// Inspect `git status --porcelain` output against the audit's policy.
-/// `None` is returned iff the diff is allowed; `Some` describes why.
+/// Inspect the parsed working-tree status entries against the audit's
+/// policy. `None` is returned iff the diff is allowed; `Some` describes
+/// why. Only each entry's destination `path` is checked (a rename's
+/// `orig_path` is not), matching the prior per-line parser.
 pub(crate) fn detect_write_policy_violation(
     policy: WritePolicy,
-    porcelain: &str,
+    entries: &[git::StatusEntry],
 ) -> Option<PolicyViolation> {
-    let lines: Vec<&str> = porcelain
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    if lines.is_empty() {
+    if entries.is_empty() {
         return None;
     }
     match policy {
         WritePolicy::None => Some(PolicyViolation {
-            reason: format!("workspace dirty after audit (expected clean): {} entry(ies)", lines.len()),
+            reason: format!(
+                "workspace dirty after audit (expected clean): {} entry(ies)",
+                entries.len()
+            ),
         }),
         WritePolicy::OpenSpecOnly => {
-            let mut bad_paths: Vec<String> = Vec::new();
-            for line in &lines {
-                let path = extract_porcelain_path(line);
-                if !path.starts_with("openspec/changes/") {
-                    bad_paths.push(path.to_string());
-                }
-            }
+            let bad_paths: Vec<String> = entries
+                .iter()
+                .map(|e| e.path.clone())
+                .filter(|p| !p.starts_with("openspec/changes/"))
+                .collect();
             if bad_paths.is_empty() {
                 None
             } else {
@@ -699,20 +701,6 @@ pub(crate) fn detect_write_policy_violation(
             }
         }
         WritePolicy::Approved => None,
-    }
-}
-
-/// Pull the path out of a `git status --porcelain` line. Lines look like
-/// `XY <path>`; for renames the format is `R  <from> -> <to>` but we
-/// keep the trailing target which is what callers care about.
-fn extract_porcelain_path(line: &str) -> &str {
-    // Skip the first two status chars + one space (per `git status
-    // --porcelain` man page: `XY <path>`).
-    let trimmed = line.get(3..).unwrap_or(line.trim_start());
-    if let Some(idx) = trimmed.rfind(" -> ") {
-        trimmed[idx + 4..].trim()
-    } else {
-        trimmed.trim()
     }
 }
 
@@ -1991,35 +1979,55 @@ mod tests {
         assert_eq!(format_retry_clause(2, 5), " (validated on retry 2 of 5)");
     }
 
+    fn se(staged: char, worktree: char, path: &str) -> git::StatusEntry {
+        git::StatusEntry {
+            staged,
+            worktree,
+            path: path.to_string(),
+            orig_path: None,
+        }
+    }
+
     #[test]
     fn detect_violation_none_with_empty_porcelain_is_ok() {
-        assert!(detect_write_policy_violation(WritePolicy::None, "").is_none());
+        assert!(detect_write_policy_violation(WritePolicy::None, &[]).is_none());
     }
 
     #[test]
     fn detect_violation_none_with_dirty_workspace_fails() {
-        let v = detect_write_policy_violation(WritePolicy::None, "?? new-file.txt");
+        let v = detect_write_policy_violation(WritePolicy::None, &[se('?', '?', "new-file.txt")]);
         assert!(v.is_some());
     }
 
     #[test]
     fn detect_violation_openspec_only_allows_changes_dir() {
-        let porcelain = "?? openspec/changes/new-thing/proposal.md\n M openspec/changes/new-thing/tasks.md";
-        assert!(detect_write_policy_violation(WritePolicy::OpenSpecOnly, porcelain).is_none());
+        let entries = [
+            se('?', '?', "openspec/changes/new-thing/proposal.md"),
+            se(' ', 'M', "openspec/changes/new-thing/tasks.md"),
+        ];
+        assert!(detect_write_policy_violation(WritePolicy::OpenSpecOnly, &entries).is_none());
     }
 
     #[test]
     fn detect_violation_openspec_only_rejects_outside_path() {
-        let porcelain = "?? openspec/changes/new/proposal.md\n M src/lib.rs";
-        let v = detect_write_policy_violation(WritePolicy::OpenSpecOnly, porcelain);
+        let entries = [
+            se('?', '?', "openspec/changes/new/proposal.md"),
+            se(' ', 'M', "src/lib.rs"),
+        ];
+        let v = detect_write_policy_violation(WritePolicy::OpenSpecOnly, &entries);
         assert!(v.is_some());
         assert!(v.unwrap().reason.contains("src/lib.rs"));
     }
 
     #[test]
     fn detect_violation_approved_always_ok() {
-        let porcelain = " M anywhere/at/all.rs";
-        assert!(detect_write_policy_violation(WritePolicy::Approved, porcelain).is_none());
+        assert!(
+            detect_write_policy_violation(
+                WritePolicy::Approved,
+                &[se(' ', 'M', "anywhere/at/all.rs")]
+            )
+            .is_none()
+        );
     }
 
     // ---------- queued audit runs (chatops-on-demand-audit-trigger) ----------

@@ -6316,10 +6316,10 @@ async fn process_completed_triage(
     use crate::audits::threads::{self, AuditThreadStatus};
     let state_root = threads::default_state_root(paths);
 
-    let changed: Vec<String> = triage_status_entries(workspace)
+    let changed: Vec<String> = git::status_entries(workspace)
         .with_context(|| "audit-triage: reading post-Completed git status".to_string())?
         .into_iter()
-        .map(|(_, p)| p)
+        .flat_map(|e| std::iter::once(e.path).chain(e.orig_path))
         .collect();
 
     // A stable slug derived from `<audit_type>-<short_hash>`, retained
@@ -6663,19 +6663,6 @@ fn validate_brightline_triage_scope(
     }
 }
 
-/// Pull the path out of a `git status --porcelain` line. Lines look like
-/// `XY <path>`; for renames the format is `R  <from> -> <to>` and we
-/// keep the trailing target.
-fn extract_porcelain_path(line: &str) -> Option<&str> {
-    let trimmed = line.get(3..)?.trim_start();
-    let path = if let Some(idx) = trimmed.rfind(" -> ") {
-        trimmed[idx + 4..].trim()
-    } else {
-        trimmed.trim()
-    };
-    if path.is_empty() { None } else { Some(path) }
-}
-
 /// a43: discard every working-tree change OUTSIDE the OpenSpec change
 /// root (`openspec/changes/`), reverting each non-spec path to its
 /// committed (HEAD) state so the spec-PR commit is genuinely spec-only.
@@ -6714,8 +6701,18 @@ pub fn discard_non_spec_writes(workspace: &Path, spec_slug: &str) -> Result<Vec<
     const KEEP_PREFIX: &str = "openspec/changes/";
     tracing::debug!(spec_slug = %spec_slug, "discard_non_spec_writes: keeping openspec/changes/ content");
     let mut discarded: Vec<String> = Vec::new();
-    for (is_untracked, path) in triage_status_entries(workspace)
+    // `status_entries` yields one record per change with the rename/copy
+    // source in `orig_path`; flatten back to `(is_untracked, path)` pairs
+    // — destination first, then the source as a tracked (never untracked)
+    // change — so both sides of a staged rename are reverted relative to
+    // HEAD.
+    for (is_untracked, path) in git::status_entries(workspace)
         .with_context(|| "discard_non_spec_writes: reading git status".to_string())?
+        .into_iter()
+        .flat_map(|e| {
+            let is_untracked = e.staged == '?' && e.worktree == '?';
+            std::iter::once((is_untracked, e.path)).chain(e.orig_path.map(|o| (false, o)))
+        })
     {
         if path.starts_with(KEEP_PREFIX) {
             continue;
@@ -6858,75 +6855,6 @@ fn run_git_revert(workspace: &Path, args: &[&str], path: &str, spec_slug: &str) 
         ));
     }
     Ok(())
-}
-
-/// Robustly enumerate the working tree's changed paths via `git status
-/// --porcelain=v1 -z --untracked-files=all`, returning `(is_untracked,
-/// path)` per entry.
-///
-/// `-z` is load-bearing. The default porcelain format wraps any path
-/// containing "unusual" bytes — non-ASCII, a space, control chars — in
-/// double quotes AND C-escapes it (`core.quotePath`, on by default), so a
-/// file like `föö.rs` renders as `"f\303\266\303\266.rs"`. Parsing that
-/// quoted literal would (a) miss the `openspec/changes/` keep-prefix on a
-/// quoted spec path — silently DISCARDING real spec content — AND (b)
-/// hand a path matching nothing on disk to `git restore` / `remove_file`,
-/// leaving the actual file in place to be swept into the supposedly
-/// spec-only commit. `-z` emits NUL-terminated records with NO quoting or
-/// escaping, sidestepping both failures. (It also avoids the
-/// `git::status_porcelain*` whole-string `.trim()` that would corrupt a
-/// leading ` M <path>`.)
-///
-/// Each record is `XY <path>`: two status chars, a separator space, then
-/// the raw path bytes. A rename/copy record carries a SECOND
-/// NUL-terminated field — under `-z` the destination is emitted first AND
-/// the source second — so the source field is consumed (and yielded) to
-/// keep the record stream aligned; both sides of a staged rename are
-/// changes relative to HEAD that must be reverted.
-fn triage_status_entries(workspace: &Path) -> Result<Vec<(bool, String)>> {
-    let output = std::process::Command::new("git")
-        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-        .current_dir(workspace)
-        .output()
-        .with_context(|| "git status --porcelain=v1 -z failed to spawn".to_string())?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "git status --porcelain=v1 -z exited non-zero: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let mut records = output.stdout.split(|&b| b == 0u8);
-    let mut entries = Vec::new();
-    while let Some(record) = records.next() {
-        // A valid record is `XY <path>` (>= 4 bytes: 2 status + space +
-        // >= 1 path byte). The split's trailing element after the final
-        // NUL is empty; skip it AND any stray short record. Do NOT trim
-        // the path — under `-z` the bytes are exact, so a filename with a
-        // leading/trailing space must survive verbatim.
-        if record.len() < 4 {
-            continue;
-        }
-        let is_untracked = record.starts_with(b"??");
-        // `R` (rename) or `C` (copy) in either status column means a
-        // second field (the source path) trails this record.
-        let is_rename_or_copy =
-            matches!(record[0], b'R' | b'C') || matches!(record[1], b'R' | b'C');
-        let path = String::from_utf8_lossy(&record[3..]).into_owned();
-        if !path.is_empty() {
-            entries.push((is_untracked, path));
-        }
-        if is_rename_or_copy
-            && let Some(source) = records.next()
-        {
-            let source = String::from_utf8_lossy(source).into_owned();
-            if !source.is_empty() {
-                // A staged rename's source is a tracked deletion at HEAD;
-                // revert it alongside the destination.
-                entries.push((false, source));
-            }
-        }
-    }
-    Ok(entries)
 }
 
 /// Read the workspace's `openspec/specs/` directory and produce a brief
@@ -7293,11 +7221,10 @@ async fn process_completed_proposal(
                 );
             }
             // Detect any OTHER modifications and WARN + revert.
-            let porcelain = git::status_porcelain(workspace)
-                .unwrap_or_default();
-            let unexpected: Vec<String> = porcelain
-                .lines()
-                .filter_map(|l| extract_porcelain_path(l).map(|p| p.to_string()))
+            let unexpected: Vec<String> = git::status_entries(workspace)
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|e| std::iter::once(e.path).chain(e.orig_path))
                 .filter(|p| !p.is_empty() && p != ".chat-reply.md")
                 .collect();
             if !unexpected.is_empty() {
@@ -7322,10 +7249,10 @@ async fn process_completed_proposal(
     //    writes are discarded before commit; implementation flows through
     //    the standard implementer pipeline on a later iteration after the
     //    operator merges the spec PR. Mirrors `process_completed_triage`.
-    let changed: Vec<String> = triage_status_entries(workspace)
+    let changed: Vec<String> = git::status_entries(workspace)
         .with_context(|| "chat-triage: reading post-Completed git status".to_string())?
         .into_iter()
-        .map(|(_, p)| p)
+        .flat_map(|e| std::iter::once(e.path).chain(e.orig_path))
         .collect();
 
     // Stable diagnostic label only; the spec/code boundary is the
@@ -7835,7 +7762,7 @@ mod tests {
 
     /// a43 revision: paths git would quote under the default
     /// `core.quotePath` (a space AND non-ASCII bytes both trigger it) must
-    /// still be parsed AND acted on correctly. `triage_status_entries`
+    /// still be parsed AND acted on correctly. `git::status_entries`
     /// uses `-z`, which disables quoting; the pre-fix default-format parse
     /// would yield the literal `"f\303\266\303\266.rs"`, so `remove_file`
     /// would NotFound-no-op AND the real file would survive into the
