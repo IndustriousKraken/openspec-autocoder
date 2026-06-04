@@ -1366,7 +1366,7 @@ pub fn format_audit_notification_with_attribution(
 }
 
 /// Build the per-audit-type top-line string. Documented shapes:
-/// - `architecture_brightline`: `📐 architecture_brightline on <repo>: <N> file(s) over line threshold; <M> duplicate signature(s)` —
+/// - `architecture_brightline`: `📐 architecture_brightline on <repo>: <N> file(s) over line threshold; <P> function(s) over line threshold; <M> duplicate signature(s); <Q> duplicate body group(s)` —
 ///   with an optional trailing `; <K> stale ignore entries to clean up`
 ///   clause when the audit detected stale entries in `.brightline-ignore`.
 /// - `drift_audit`: `🧭 drift_audit on <repo>: <N> spec/code divergence(s) detected`
@@ -1385,13 +1385,18 @@ fn format_audit_top_line(
     }
     match audit_type {
         "architecture_brightline" => {
-            let (files, dupes, stale) = count_brightline_findings(findings);
+            let counts = count_brightline_findings(findings);
             let mut line = format!(
-                "📐 architecture_brightline on {repo_url}: {files} file(s) over line threshold; {dupes} duplicate signature(s)"
+                "📐 architecture_brightline on {repo_url}: {files} file(s) over line threshold; {funcs} function(s) over line threshold; {dupes} duplicate signature(s); {bodies} duplicate body group(s)",
+                files = counts.files,
+                funcs = counts.functions,
+                dupes = counts.duplicate_signatures,
+                bodies = counts.duplicate_bodies,
             );
-            if stale > 0 {
+            if counts.stale > 0 {
                 line.push_str(&format!(
-                    "; {stale} stale ignore entries to clean up"
+                    "; {stale} stale ignore entries to clean up",
+                    stale = counts.stale
                 ));
             }
             line
@@ -1417,29 +1422,48 @@ fn format_audit_top_line(
     }
 }
 
-/// Partition brightline findings by subject shape. Files-over-threshold
-/// subjects start with `"file "` and contain `" lines (threshold:"`;
-/// duplicate-signature subjects start with `"duplicate signature "`;
+/// Per-metric brightline finding counts, derived from finding-subject
+/// prefixes. Used to render the chatops top-line's per-metric clauses.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BrightlineCounts {
+    files: usize,
+    functions: usize,
+    duplicate_signatures: usize,
+    duplicate_bodies: usize,
+    stale: usize,
+}
+
+/// Partition brightline findings by subject shape, using the
+/// subject-prefix constants the audit stamps onto each finding kind.
+/// File-size subjects start with `"file "` AND contain
+/// `" lines (threshold:"`; function-size subjects start with
+/// `"function "` AND contain the same; duplicate-signature AND
+/// duplicate-body subjects start with their respective prefixes;
 /// stale-ignore-entry subjects start with
-/// [`crate::audits::brightline::STALE_IGNORE_SUBJECT_PREFIX`]. Any
-/// other finding shape falls into none of the three buckets and is
-/// not counted in any total (the per-finding body still appears in
-/// the thread).
-fn count_brightline_findings(findings: &[Finding]) -> (usize, usize, usize) {
-    let mut files = 0usize;
-    let mut dupes = 0usize;
-    let mut stale = 0usize;
+/// [`crate::audits::brightline::STALE_IGNORE_SUBJECT_PREFIX`]. Any other
+/// finding shape falls into none of the buckets AND is not counted in any
+/// total (the per-finding body still appears in the thread).
+fn count_brightline_findings(findings: &[Finding]) -> BrightlineCounts {
+    let mut counts = BrightlineCounts::default();
     for f in findings {
         let s = f.subject.as_str();
         if s.starts_with(brightline::STALE_IGNORE_SUBJECT_PREFIX) {
-            stale += 1;
-        } else if s.starts_with("file ") && s.contains(" lines (threshold:") {
-            files += 1;
-        } else if s.starts_with("duplicate signature ") {
-            dupes += 1;
+            counts.stale += 1;
+        } else if s.starts_with(brightline::FUNCTION_SIZE_SUBJECT_PREFIX)
+            && s.contains(" lines (threshold:")
+        {
+            counts.functions += 1;
+        } else if s.starts_with(brightline::FILE_SIZE_SUBJECT_PREFIX)
+            && s.contains(" lines (threshold:")
+        {
+            counts.files += 1;
+        } else if s.starts_with(brightline::DUPLICATE_SIGNATURE_SUBJECT_PREFIX) {
+            counts.duplicate_signatures += 1;
+        } else if s.starts_with(brightline::DUPLICATE_BODY_SUBJECT_PREFIX) {
+            counts.duplicate_bodies += 1;
         }
     }
-    (files, dupes, stale)
+    counts
 }
 
 /// Render the per-finding body the thread reply carries. Same shape as
@@ -2287,6 +2311,24 @@ mod tests {
         }
     }
 
+    fn brightline_function_finding(name: &str, rel: &str, n: u64) -> Finding {
+        Finding {
+            severity: Severity::Low,
+            subject: format!("function {name} in {rel} is {n} lines (threshold: 200)"),
+            body: format!("path: {rel}\nfunction: {name}\nstart_line: 1\nlines: {n}\nthreshold: 200"),
+            anchor: Some(format!("{rel}:1")),
+        }
+    }
+
+    fn brightline_dup_body_finding(name_a: &str, name_b: &str) -> Finding {
+        Finding {
+            severity: Severity::Low,
+            subject: format!("duplicate body across 2 files ({name_a}, {name_b})"),
+            body: format!("mod_a.rs:1 {name_a}\nmod_b.rs:1 {name_b}"),
+            anchor: Some("mod_a.rs:1".into()),
+        }
+    }
+
     fn brightline_stale_finding(file: &str, function: &str, reason: &str) -> Finding {
         Finding {
             severity: Severity::Low,
@@ -2421,6 +2463,47 @@ mod tests {
         assert!(
             !n.top_line.contains("stale ignore"),
             "no stale entries → no clause: {}",
+            n.top_line
+        );
+    }
+
+    /// 8.6 — the top-line renders all four metric counts (file, function,
+    /// duplicate signature, duplicate body) from a mixed finding set. We
+    /// assert the derived counts, not the exact sentence.
+    #[test]
+    fn format_audit_notification_brightline_renders_all_four_counts() {
+        let findings = vec![
+            brightline_file_finding("src/a.rs", 1200),
+            brightline_file_finding("src/b.rs", 1300),
+            brightline_function_finding("huge", "src/c.rs", 400),
+            brightline_dup_finding("fn helper(u32)"),
+            brightline_dup_body_finding("alert_disk", "alert_mem"),
+        ];
+        let n = format_audit_notification(
+            "architecture_brightline",
+            "git@github.com:o/r.git",
+            &findings,
+            false,
+            ts(),
+        );
+        assert!(
+            n.top_line.contains("2 file(s) over line threshold"),
+            "top_line should report 2 files: {}",
+            n.top_line
+        );
+        assert!(
+            n.top_line.contains("1 function(s) over line threshold"),
+            "top_line should report 1 function: {}",
+            n.top_line
+        );
+        assert!(
+            n.top_line.contains("1 duplicate signature(s)"),
+            "top_line should report 1 duplicate signature: {}",
+            n.top_line
+        );
+        assert!(
+            n.top_line.contains("1 duplicate body group(s)"),
+            "top_line should report 1 duplicate body group: {}",
             n.top_line
         );
     }

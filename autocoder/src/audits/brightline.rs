@@ -33,8 +33,23 @@ pub mod ignore;
 /// `; <K> stale ignore entries to clean up` clause.
 pub const STALE_IGNORE_SUBJECT_PREFIX: &str = "stale ignore entry: ";
 
-const DEFAULT_FILE_LINES_THRESHOLD: u64 = 800;
+/// Subject prefix for whole-file size findings (`"file <path> is <N> …"`).
+/// The chatops top-line formatter discriminates finding kinds by these
+/// prefixes when rendering the per-metric counts.
+pub const FILE_SIZE_SUBJECT_PREFIX: &str = "file ";
+/// Subject prefix for function size findings
+/// (`"function <name> in <path> is <N> …"`).
+pub const FUNCTION_SIZE_SUBJECT_PREFIX: &str = "function ";
+/// Subject prefix for duplicate-signature findings.
+pub const DUPLICATE_SIGNATURE_SUBJECT_PREFIX: &str = "duplicate signature ";
+/// Subject prefix for duplicate-body findings.
+pub const DUPLICATE_BODY_SUBJECT_PREFIX: &str = "duplicate body ";
+
+pub(crate) const DEFAULT_FILE_LINES_THRESHOLD: u64 = 800;
 const SETTINGS_KEY_FILE_LINES: &str = "file_lines_threshold";
+
+pub(crate) const DEFAULT_FUNCTION_LINES_THRESHOLD: u64 = 200;
+const SETTINGS_KEY_FUNCTION_LINES: &str = "function_lines_threshold";
 
 /// Directories to skip entirely. Vendored / generated trees would
 /// dominate the findings otherwise.
@@ -61,6 +76,7 @@ const SCANNED_EXTENSIONS: &[&str] = &[
 #[derive(Clone)]
 pub struct ArchitectureBrightlineAudit {
     file_lines_threshold: u64,
+    function_lines_threshold: u64,
 }
 
 impl ArchitectureBrightlineAudit {
@@ -68,13 +84,18 @@ impl ArchitectureBrightlineAudit {
     /// (under the audit's slug key in `settings.extra`). Falls back to
     /// the compile-time defaults when a knob is unset.
     pub fn new(audit_settings: &HashMap<String, AuditSettings>) -> Self {
-        let file_lines_threshold = audit_settings
-            .get(Self::TYPE)
+        let settings = audit_settings.get(Self::TYPE);
+        let file_lines_threshold = settings
             .and_then(|s| s.extra.get(SETTINGS_KEY_FILE_LINES))
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_FILE_LINES_THRESHOLD);
+        let function_lines_threshold = settings
+            .and_then(|s| s.extra.get(SETTINGS_KEY_FUNCTION_LINES))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_FUNCTION_LINES_THRESHOLD);
         Self {
             file_lines_threshold,
+            function_lines_threshold,
         }
     }
 
@@ -91,8 +112,14 @@ impl ArchitectureBrightlineAudit {
             if let Some(f) = check_file_size(path, workspace, self.file_lines_threshold) {
                 findings.push(f);
             }
+            findings.extend(check_function_sizes(
+                path,
+                workspace,
+                self.function_lines_threshold,
+            ));
         }
         findings.extend(check_signature_duplicates(&scanned, workspace, &ignore_entries));
+        findings.extend(check_body_duplicates(&scanned, workspace, &ignore_entries));
         // Validate every loaded ignore entry against the current
         // workspace state. Stale entries surface as findings with a
         // dedicated subject prefix that the chatops top-line formatter
@@ -172,8 +199,9 @@ impl Audit for ArchitectureBrightlineAudit {
         let _ = ctx.log_writer.write_section(
             "brightline_summary",
             &format!(
-                "file_lines_threshold: {}\nfindings_count: {}",
+                "file_lines_threshold: {}\nfunction_lines_threshold: {}\nfindings_count: {}",
                 self.file_lines_threshold,
+                self.function_lines_threshold,
                 findings.len()
             ),
         );
@@ -242,6 +270,20 @@ fn relative_path(path: &Path, root: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
+/// Map a measured line count to a graduated severity by its ratio to
+/// `threshold`. `Low` below `1.5×`, `Medium` in `[1.5×, 2.5×)`, `High`
+/// at or above `2.5×`. Integer-ratio arithmetic (`threshold * 3 / 2`,
+/// `threshold * 5 / 2`) keeps the band edges exact and float-free.
+pub(crate) fn severity_for_ratio(n: u64, threshold: u64) -> Severity {
+    if n < threshold.saturating_mul(3) / 2 {
+        Severity::Low
+    } else if n < threshold.saturating_mul(5) / 2 {
+        Severity::Medium
+    } else {
+        Severity::High
+    }
+}
+
 fn check_file_size(path: &Path, root: &Path, threshold: u64) -> Option<Finding> {
     let contents = std::fs::read_to_string(path).ok()?;
     let n = contents.lines().count() as u64;
@@ -249,12 +291,50 @@ fn check_file_size(path: &Path, root: &Path, threshold: u64) -> Option<Finding> 
         return None;
     }
     let rel = relative_path(path, root);
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    // Where test-only regions are identifiable (Rust `#[cfg(test)]`
+    // modules today), report the production/test split so the operator
+    // can tell "extract the tests" from "decompose the production code".
+    let body = match production_test_split(&contents, ext) {
+        Some((production, test)) => format!(
+            "path: {rel}\nlines: {n}\nproduction_lines: {production}\ntest_lines: {test}\nthreshold: {threshold}"
+        ),
+        None => format!("path: {rel}\nlines: {n}\nthreshold: {threshold}"),
+    };
     Some(Finding {
-        severity: Severity::Medium,
+        severity: severity_for_ratio(n, threshold),
         subject: format!("file {rel} is {n} lines (threshold: {threshold})"),
-        body: format!("path: {rel}\nlines: {n}\nthreshold: {threshold}"),
+        body,
         anchor: Some(format!("{rel}:1")),
     })
+}
+
+/// Compute the production-line / test-line split for a file when its
+/// test-only regions are identifiable. Today only Rust `#[cfg(test)]`
+/// (`mod tests { … }`) modules are recognized, reusing the same module-
+/// boundary detection the duplicate-signature scan uses. Returns `None`
+/// when no test-only region is present (callers then report the total
+/// only). `production + test` always equals the file's total line count.
+fn production_test_split(contents: &str, ext: &str) -> Option<(u64, u64)> {
+    if ext != "rs" {
+        return None;
+    }
+    let spans = rust_test_module_spans(contents);
+    if spans.is_empty() {
+        return None;
+    }
+    let total = contents.lines().count() as u64;
+    let mut test_lines = 0u64;
+    let mut offset = 0usize;
+    for line in contents.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        if spans.iter().any(|(s, e)| line_start >= *s && line_start < *e) {
+            test_lines += 1;
+        }
+    }
+    let production = total.saturating_sub(test_lines);
+    Some((production, test_lines))
 }
 
 /// One occurrence of a function signature in a file. Used to apply
@@ -394,6 +474,13 @@ fn extract_signatures(contents: &str, ext: &str) -> Vec<(usize, String)> {
 /// Like [`extract_signatures`] but also returns the parsed function
 /// name and the raw signature line — both needed to apply
 /// `.brightline-ignore` match-suppression.
+///
+/// The `sig_key` is the function's **I/O profile** — name + parameter
+/// *types* (parameter names normalized away) + return type where the
+/// language exposes it — NOT the verbatim parameter text. Two
+/// declarations with the same interface but different parameter names
+/// therefore key identically. The raw `signature_line` (4th tuple
+/// element) is the unchanged source line `.brightline-ignore` matches on.
 fn extract_signature_sites(contents: &str, ext: &str) -> Vec<(usize, String, String, String)> {
     let re = match signature_regex(ext) {
         Some(r) => r,
@@ -404,19 +491,545 @@ fn extract_signature_sites(contents: &str, ext: &str) -> Vec<(usize, String, Str
         if let Some(caps) = re.captures(line) {
             let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let params = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            // Normalize whitespace in the parameter list so trivial
-            // formatting differences don't dodge the duplicate check.
-            let normalized_params: String = params.split_whitespace().collect::<Vec<_>>().join(" ");
-            let key = format!("{name}({normalized_params})");
+            let ret = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            let key = signature_io_key(name, params, ret, ext);
             out.push((idx + 1, key, name.to_string(), line.to_string()));
         }
     }
     out
 }
 
+/// Build the I/O-profile signature key: `name(<param-type-sequence>)`
+/// optionally suffixed with ` -> <return-type>`. Parameter names are
+/// normalized away; for languages without static parameter types the
+/// param sequence falls back to `arity=<N>`.
+fn signature_io_key(name: &str, params: &str, ret: &str, ext: &str) -> String {
+    let param_profile = param_io_profile(params, ext);
+    let ret_norm = normalize_return_type(ret);
+    if ret_norm.is_empty() {
+        format!("{name}({param_profile})")
+    } else {
+        format!("{name}({param_profile}) -> {ret_norm}")
+    }
+}
+
+/// Languages whose parameter syntax is `name: type` (type follows a
+/// colon), so a parameter's type can be recovered by stripping the name.
+/// Other scanned languages fall back to parameter arity.
+fn uses_colon_param_types(ext: &str) -> bool {
+    matches!(ext, "rs" | "ts" | "tsx" | "py" | "swift" | "kt")
+}
+
+/// Render a parameter list as its type sequence (names normalized away).
+/// For `name: type` languages each parameter contributes the text after
+/// its `:`; a parameter with no `:` (e.g. a Rust `&self` receiver)
+/// contributes its whitespace-collapsed text verbatim. For languages
+/// without static parameter types the profile is `arity=<N>`.
+fn param_io_profile(params: &str, ext: &str) -> String {
+    let trimmed = params.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<&str> = trimmed.split(',').map(|p| p.trim()).collect();
+    if uses_colon_param_types(ext) {
+        let types: Vec<String> = parts.iter().map(|p| colon_param_type(p)).collect();
+        types.join(", ")
+    } else {
+        format!("arity={}", parts.len())
+    }
+}
+
+/// The type of a single `name: type` parameter — the whitespace-collapsed
+/// text after the first `:`. A parameter with no `:` (a receiver like
+/// `&self`, or an untyped parameter) yields its collapsed text verbatim.
+fn colon_param_type(p: &str) -> String {
+    let collapse = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    match p.find(':') {
+        Some(idx) => collapse(&p[idx + 1..]),
+        None => collapse(p),
+    }
+}
+
+/// Normalize a captured return type: collapse whitespace, drop a Rust
+/// `where`-clause tail, AND trim trailing block-open / terminator
+/// punctuation. Empty when the language exposes no return type.
+fn normalize_return_type(ret: &str) -> String {
+    let ret = ret.trim();
+    if ret.is_empty() {
+        return String::new();
+    }
+    // A `where` clause is part of the bounds, not the I/O type.
+    let ret = ret.split(" where ").next().unwrap_or(ret);
+    let collapsed = ret.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .trim_end_matches('{')
+        .trim_end_matches(';')
+        .trim()
+        .to_string()
+}
+
+/// One function definition's line span within a file: its signature
+/// line through the line bearing its matching closing brace. Indices are
+/// 0-based into the (test-stripped) line vector.
+#[derive(Debug, Clone)]
+struct FunctionSpan {
+    name: String,
+    start_idx: usize,
+    end_idx: usize,
+}
+
+/// Scan `lines` (already test-stripped for Rust) for function
+/// definitions, returning each one's name AND line span. The span runs
+/// from the signature line to the line carrying its matching closing
+/// delimiter, brace-matched while skipping comments AND double-quoted
+/// strings. Reuses the same per-language [`signature_regex`] that powers
+/// the duplicate-signature metric to locate each function start.
+/// Declarations with no `{ … }` body (e.g. trait-method signatures) are
+/// skipped because no balanced span is found.
+fn scan_function_spans(lines: &[&str], ext: &str) -> Vec<FunctionSpan> {
+    let re = match signature_regex(ext) {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if let Some(caps) = re.captures(line) {
+            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+            if let Some(end_idx) = find_function_end(lines, idx) {
+                out.push(FunctionSpan {
+                    name,
+                    start_idx: idx,
+                    end_idx,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Locate the line index of the matching closing brace for the function
+/// whose signature is on `lines[start_idx]`. Brace-matches from the first
+/// `{` at/after the signature line, skipping `//` line comments, `/* */`
+/// block comments, AND double-quoted string literals (with `\` escapes).
+/// Returns `None` when no balanced body is found.
+fn find_function_end(lines: &[&str], start_idx: usize) -> Option<usize> {
+    let mut depth: i64 = 0;
+    let mut seen_open = false;
+    let mut in_block_comment = false;
+    for (i, line) in lines.iter().enumerate().skip(start_idx) {
+        let bytes = line.as_bytes();
+        let mut j = 0;
+        let mut in_string = false;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if in_block_comment {
+                if b == b'*' && j + 1 < bytes.len() && bytes[j + 1] == b'/' {
+                    in_block_comment = false;
+                    j += 2;
+                    continue;
+                }
+                j += 1;
+                continue;
+            }
+            if in_string {
+                if b == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    in_string = false;
+                }
+                j += 1;
+                continue;
+            }
+            if b == b'/' && j + 1 < bytes.len() && bytes[j + 1] == b'/' {
+                break; // rest of the line is a line comment
+            }
+            if b == b'/' && j + 1 < bytes.len() && bytes[j + 1] == b'*' {
+                in_block_comment = true;
+                j += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_string = true;
+                j += 1;
+                continue;
+            }
+            if b == b'{' {
+                depth += 1;
+                seen_open = true;
+            } else if b == b'}' {
+                depth -= 1;
+                if seen_open && depth <= 0 {
+                    return Some(i);
+                }
+            }
+            j += 1;
+        }
+    }
+    None
+}
+
+/// Measure each function's line span (outside test-only regions) AND emit
+/// a finding for any function longer than `threshold` lines, with
+/// graduated severity. Mirrors `check_file_size`'s subject/anchor shape
+/// at the function granularity. Functions inside Rust `#[cfg(test)]`
+/// modules are skipped (their lines are stripped before scanning).
+fn check_function_sizes(path: &Path, root: &Path, threshold: u64) -> Vec<Finding> {
+    let ext = match path.extension().and_then(|e| e.to_str()) {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let stripped = if ext == "rs" {
+        strip_rust_tests_modules(&contents)
+    } else {
+        contents.clone()
+    };
+    let lines: Vec<&str> = stripped.lines().collect();
+    let rel = relative_path(path, root);
+    let mut out = Vec::new();
+    for span in scan_function_spans(&lines, ext) {
+        let n = (span.end_idx - span.start_idx + 1) as u64;
+        if n <= threshold {
+            continue;
+        }
+        let start_line = span.start_idx + 1;
+        let name = span.name;
+        out.push(Finding {
+            severity: severity_for_ratio(n, threshold),
+            subject: format!("function {name} in {rel} is {n} lines (threshold: {threshold})"),
+            body: format!(
+                "path: {rel}\nfunction: {name}\nstart_line: {start_line}\nlines: {n}\nthreshold: {threshold}"
+            ),
+            anchor: Some(format!("{rel}:{start_line}")),
+        });
+    }
+    out
+}
+
+/// One occurrence of a normalized function body. Mirrors `SignatureSite`
+/// so duplicate-body findings reuse the same `.brightline-ignore`
+/// suppression path (`file` / `function` / `signature_match`).
+#[derive(Debug, Clone)]
+struct BodySite {
+    rel_path: String,
+    line_number: usize,
+    function: String,
+    signature_line: String,
+}
+
+/// Detect groups of two-or-more functions in different files (outside
+/// test-only regions) whose normalized bodies are identical.
+/// Normalization strips comments, collapses whitespace, AND canonicalizes
+/// local identifier and string-literal spellings, so rename-only clones
+/// collide despite differing function names. Each qualifying group emits
+/// one `Severity::Low` finding listing its sites. A group is suppressed
+/// in full when every constituent site matches a `.brightline-ignore`
+/// entry, reusing [`ignore::entry_matches_site`].
+fn check_body_duplicates(
+    files: &[PathBuf],
+    root: &Path,
+    ignore_entries: &[ignore::IgnoreEntry],
+) -> Vec<Finding> {
+    let mut groups: BTreeMap<String, Vec<BodySite>> = BTreeMap::new();
+    for path in files {
+        let ext = match path.extension().and_then(|e| e.to_str()) {
+            Some(e) => e,
+            None => continue,
+        };
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let stripped = if ext == "rs" {
+            strip_rust_tests_modules(&contents)
+        } else {
+            contents.clone()
+        };
+        let lines: Vec<&str> = stripped.lines().collect();
+        for span in scan_function_spans(&lines, ext) {
+            let body = extract_function_body(&lines, &span);
+            let normalized = normalize_body(&body);
+            // Skip empty / trivial bodies: an empty normalized body is not
+            // a meaningful clone signal AND would group unrelated stubs.
+            if normalized.is_empty() {
+                continue;
+            }
+            groups.entry(normalized).or_default().push(BodySite {
+                rel_path: relative_path(path, root),
+                line_number: span.start_idx + 1,
+                function: span.name.clone(),
+                signature_line: lines[span.start_idx].to_string(),
+            });
+        }
+    }
+    let mut findings = Vec::new();
+    for sites in groups.into_values() {
+        if sites.len() < 2 {
+            continue;
+        }
+        let distinct_files: std::collections::BTreeSet<&str> =
+            sites.iter().map(|s| s.rel_path.as_str()).collect();
+        if distinct_files.len() < 2 {
+            continue;
+        }
+        // Suppression: drop the group when EVERY site matches an ignore
+        // entry (same basis as duplicate-signature suppression).
+        let all_ignored = sites.iter().all(|s| {
+            ignore_entries.iter().any(|e| {
+                ignore::entry_matches_site(e, &s.rel_path, &s.function, &s.signature_line)
+            })
+        });
+        if all_ignored {
+            continue;
+        }
+        let mut locations: Vec<String> = sites
+            .iter()
+            .map(|s| {
+                format!(
+                    "{p}:{ln} {f}",
+                    p = s.rel_path,
+                    ln = s.line_number,
+                    f = s.function
+                )
+            })
+            .collect();
+        locations.sort();
+        let names: std::collections::BTreeSet<&str> =
+            sites.iter().map(|s| s.function.as_str()).collect();
+        let names_joined = names.into_iter().collect::<Vec<_>>().join(", ");
+        let anchor = locations
+            .first()
+            .and_then(|l| l.split(' ').next())
+            .map(|s| s.to_string());
+        findings.push(Finding {
+            severity: Severity::Low,
+            subject: format!(
+                "duplicate body across {n} files ({names_joined})",
+                n = distinct_files.len(),
+            ),
+            body: locations.join("\n"),
+            anchor,
+        });
+    }
+    findings
+}
+
+/// Public view of a function's line span, exposed for cross-module reuse
+/// (the code reviewer's advisory size flag). Line numbers are 1-based AND
+/// inclusive, matching the diff/anchor convention.
+#[derive(Debug, Clone)]
+pub(crate) struct FunctionLineSpan {
+    pub name: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+impl FunctionLineSpan {
+    /// Number of source lines the function spans (signature through
+    /// closing delimiter, inclusive).
+    pub fn line_count(&self) -> u64 {
+        (self.end_line - self.start_line + 1) as u64
+    }
+}
+
+/// Scan `contents` for function definitions outside test-only regions,
+/// returning each one's name AND 1-based inclusive line span. Reuses the
+/// same scanning the function-size metric uses (test modules are stripped
+/// before scanning, preserving line numbers). Exposed for the reviewer's
+/// advisory size flag.
+pub(crate) fn function_line_spans(contents: &str, ext: &str) -> Vec<FunctionLineSpan> {
+    let stripped = if ext == "rs" {
+        strip_rust_tests_modules(contents)
+    } else {
+        contents.to_string()
+    };
+    let lines: Vec<&str> = stripped.lines().collect();
+    scan_function_spans(&lines, ext)
+        .into_iter()
+        .map(|s| FunctionLineSpan {
+            name: s.name,
+            start_line: s.start_idx + 1,
+            end_line: s.end_idx + 1,
+        })
+        .collect()
+}
+
+/// Production/test line split for `contents`, exposed for the reviewer's
+/// advisory. `None` when no test-only region is identifiable; otherwise
+/// `(production_lines, test_lines)` summing to the total line count.
+pub(crate) fn production_test_line_split(contents: &str, ext: &str) -> Option<(u64, u64)> {
+    production_test_split(contents, ext)
+}
+
+/// Extract a function's body text — between its first `{` and its last
+/// `}` — from the span's lines. Falls back to the full span text when a
+/// balanced brace pair isn't found.
+fn extract_function_body(lines: &[&str], span: &FunctionSpan) -> String {
+    let slice = lines[span.start_idx..=span.end_idx].join("\n");
+    match (slice.find('{'), slice.rfind('}')) {
+        (Some(open), Some(close)) if open < close => slice[open + 1..close].to_string(),
+        _ => slice,
+    }
+}
+
+/// Normalize a function body for clone detection: strip comments,
+/// canonicalize non-keyword identifiers to positional tokens (`v0`,
+/// `v1`, … by first appearance), AND replace every string literal with a
+/// single `STR` placeholder. Keywords, numbers, AND punctuation are
+/// preserved verbatim; whitespace is collapsed (tokens are space-joined).
+/// Two bodies differing only in local names or string spellings normalize
+/// to the same token stream.
+fn normalize_body(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut ident_map: HashMap<String, String> = HashMap::new();
+    let mut i = 0;
+    let mut in_block_comment = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_block_comment {
+            if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if b == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            tokens.push("STR".to_string());
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &body[start..i];
+            if is_normalize_keyword(word) {
+                tokens.push(word.to_string());
+            } else {
+                let next_id = ident_map.len();
+                let canon = ident_map
+                    .entry(word.to_string())
+                    .or_insert_with(|| format!("v{next_id}"));
+                tokens.push(canon.clone());
+            }
+            continue;
+        }
+        if b.is_ascii_digit() {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.' || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            tokens.push(body[start..i].to_string());
+            continue;
+        }
+        // Single punctuation byte (ASCII operators / delimiters). A
+        // multibyte UTF-8 lead byte falls here too; it only needs to be
+        // deterministic, not semantically a char.
+        tokens.push((b as char).to_string());
+        i += 1;
+    }
+    tokens.join(" ")
+}
+
+/// Keywords preserved verbatim during body normalization so the control-
+/// flow skeleton survives identifier canonicalization. Covers Rust plus a
+/// few cross-language declaration keywords so clones in the other scanned
+/// languages keep their structure too.
+fn is_normalize_keyword(w: &str) -> bool {
+    matches!(
+        w,
+        "as" | "async"
+            | "await"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            // cross-language declaration / control keywords
+            | "function"
+            | "def"
+            | "var"
+            | "val"
+            | "func"
+            | "null"
+            | "None"
+            | "True"
+            | "False"
+            | "new"
+            | "class"
+    )
+}
+
 pub(super) fn signature_regex(ext: &str) -> Option<Regex> {
     let pattern = match ext {
-        "rs" => Some(r"^\s*(?:pub\s+(?:\([^)]*\)\s+)?)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?fn\s+(\w+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)"),
+        "rs" => Some(r"^\s*(?:pub\s+(?:\([^)]*\)\s+)?)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?fn\s+(\w+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)(?:\s*->\s*([^{]+))?"),
         "py" => Some(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(([^)]*)\)\s*(?:->[^:]+)?\s*:"),
         "cs" => Some(r"^\s*(?:public|private|protected|internal)?\s*(?:static\s+)?(?:async\s+)?\w[\w<>?]*\s+(\w+)\s*\(([^)]*)\)"),
         "ts" | "tsx" | "js" | "jsx" => Some(
@@ -432,26 +1045,27 @@ pub(super) fn signature_regex(ext: &str) -> Option<Regex> {
     pattern.and_then(|p| Regex::new(p).ok())
 }
 
-/// Strip every `mod tests { ... }` block from Rust source, brace-matched
-/// so nested braces don't trip the scanner. The block can be preceded by
-/// `#[cfg(test)]` or any other attribute. Returns the source with the
-/// matched ranges replaced by empty lines (preserving line numbers for
-/// the duplicate-signature anchors).
-pub(super) fn strip_rust_tests_modules(src: &str) -> String {
+/// Byte ranges of every `mod tests { ... }` block in Rust source,
+/// brace-matched so nested braces don't trip the scanner. The block can
+/// be preceded by `#[cfg(test)]` or any other attribute. Each returned
+/// `(start, end)` is a half-open byte range `[start, end)` spanning from
+/// the `mod` keyword (or its leading attribute) through the closing
+/// brace. Shared by [`strip_rust_tests_modules`] and the production/test
+/// line split so both agree on what counts as a test-only region.
+pub(super) fn rust_test_module_spans(src: &str) -> Vec<(usize, usize)> {
     let re = match Regex::new(r"(?m)^\s*(?:#\[[^\]]+\]\s*)?mod\s+tests\s*\{") {
         Ok(r) => r,
-        Err(_) => return src.to_string(),
+        Err(_) => return Vec::new(),
     };
-    let mut out = String::with_capacity(src.len());
+    let mut spans = Vec::new();
     let mut last = 0;
+    let bytes = src.as_bytes();
     while let Some(m) = re.find_at(src, last) {
-        out.push_str(&src[last..m.start()]);
         // Walk forward from the opening brace position to find the
         // matching closing brace.
         let body_start = m.end(); // position right after `{`
         let mut depth: i64 = 1;
         let mut idx = body_start;
-        let bytes = src.as_bytes();
         let mut in_line_comment = false;
         let mut in_block_comment = false;
         while idx < bytes.len() {
@@ -495,14 +1109,30 @@ pub(super) fn strip_rust_tests_modules(src: &str) -> String {
             }
             idx += 1;
         }
+        spans.push((m.start(), idx));
+        last = idx;
+    }
+    spans
+}
+
+/// Strip every `mod tests { ... }` block from Rust source, brace-matched
+/// so nested braces don't trip the scanner. The block can be preceded by
+/// `#[cfg(test)]` or any other attribute. Returns the source with the
+/// matched ranges replaced by empty lines (preserving line numbers for
+/// the duplicate-signature anchors).
+pub(super) fn strip_rust_tests_modules(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut last = 0;
+    for (start, end) in rust_test_module_spans(src) {
+        out.push_str(&src[last..start]);
         // Replace the entire `mod tests { ... }` span with blank lines
         // matching the original newline count, preserving line numbers.
-        let span = &src[m.start()..idx];
+        let span = &src[start..end];
         let newlines = span.bytes().filter(|b| *b == b'\n').count();
         for _ in 0..newlines {
             out.push('\n');
         }
-        last = idx;
+        last = end;
     }
     out.push_str(&src[last..]);
     out
@@ -1108,5 +1738,261 @@ mod tests {
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::remove_dir_all(parent.parent().unwrap_or(parent));
         }
+    }
+
+    // ====================================================================
+    // a67: graduated severity, function-size, duplicate-body, I/O profile
+    // ====================================================================
+
+    /// Build settings overriding both the file AND function line
+    /// thresholds for the audit.
+    fn settings_with_thresholds(file_t: u64, func_t: u64) -> HashMap<String, AuditSettings> {
+        let mut extra = HashMap::new();
+        extra.insert(
+            SETTINGS_KEY_FILE_LINES.to_string(),
+            serde_yml::Value::Number(serde_yml::Number::from(file_t)),
+        );
+        extra.insert(
+            SETTINGS_KEY_FUNCTION_LINES.to_string(),
+            serde_yml::Value::Number(serde_yml::Number::from(func_t)),
+        );
+        let mut s = HashMap::new();
+        s.insert(
+            ArchitectureBrightlineAudit::TYPE.to_string(),
+            AuditSettings {
+                prompt_path: None,
+                notify_on_clean: false,
+                extra,
+            },
+        );
+        s
+    }
+
+    /// 8.1 — `severity_for_ratio` band edges are exact. Threshold 100 so
+    /// the documented ratios land on round integers.
+    #[test]
+    fn severity_for_ratio_band_edges() {
+        let t = 100u64;
+        // 1× and 1.49× → Low; 1.5× and 2.49× → Medium; 2.5× and 10× → High.
+        assert_eq!(severity_for_ratio(100, t), Severity::Low); // 1×
+        assert_eq!(severity_for_ratio(149, t), Severity::Low); // 1.49×
+        assert_eq!(severity_for_ratio(150, t), Severity::Medium); // 1.5×
+        assert_eq!(severity_for_ratio(249, t), Severity::Medium); // 2.49×
+        assert_eq!(severity_for_ratio(250, t), Severity::High); // 2.5×
+        assert_eq!(severity_for_ratio(1000, t), Severity::High); // 10×
+    }
+
+    /// 8.2 — file metric: just-over → Low, ≥ 2.5× → High; a file with a
+    /// `#[cfg(test)]` region reports a production/test split summing to
+    /// the total.
+    #[test]
+    fn file_metric_graduated_severity_and_split() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        // Just over a threshold of 100 → Low.
+        let low_file: String = (0..120).map(|i| format!("// line {i}\n")).collect();
+        write(&ws.join("src/low.rs"), &low_file);
+        // 3× the threshold → High.
+        let high_file: String = (0..300).map(|i| format!("// line {i}\n")).collect();
+        write(&ws.join("src/high.rs"), &high_file);
+        let audit = ArchitectureBrightlineAudit::new(&settings_with_threshold(100));
+        let findings = audit.analyze(ws).unwrap();
+        let low = findings
+            .iter()
+            .find(|f| f.subject.contains("src/low.rs"))
+            .expect("low.rs flagged");
+        assert_eq!(low.severity, Severity::Low, "120/100 must grade Low");
+        let high = findings
+            .iter()
+            .find(|f| f.subject.contains("src/high.rs"))
+            .expect("high.rs flagged");
+        assert_eq!(high.severity, Severity::High, "300/100 must grade High");
+
+        // Production/test split: 20 production lines + an 18-line
+        // `#[cfg(test)]` region = 38 total.
+        let dir2 = TempDir::new().unwrap();
+        let ws2 = dir2.path();
+        let mut src = String::new();
+        for i in 0..20 {
+            src.push_str(&format!("pub fn prod_{i}() {{ let _ = {i}; }}\n"));
+        }
+        src.push_str("#[cfg(test)]\n");
+        src.push_str("mod tests {\n");
+        for i in 0..15 {
+            src.push_str(&format!("    fn test_{i}() {{}}\n"));
+        }
+        src.push_str("}\n");
+        write(&ws2.join("src/split.rs"), &src);
+        let audit2 = ArchitectureBrightlineAudit::new(&settings_with_threshold(10));
+        let findings2 = audit2.analyze(ws2).unwrap();
+        let f = findings2
+            .iter()
+            .find(|f| f.subject.starts_with("file ") && f.subject.contains("src/split.rs"))
+            .expect("split.rs flagged for size");
+        // Parse the split from the body and assert it sums to the total.
+        let total = body_value(&f.body, "lines:");
+        let prod = body_value(&f.body, "production_lines:");
+        let test = body_value(&f.body, "test_lines:");
+        assert_eq!(total, 38);
+        assert_eq!(prod + test, total, "production + test must sum to total");
+        assert!(test > 0, "the #[cfg(test)] region must be counted: {}", f.body);
+    }
+
+    /// Pull a `key: <N>` numeric value out of a finding body.
+    fn body_value(body: &str, key: &str) -> u64 {
+        body.lines()
+            .find_map(|l| l.trim().strip_prefix(key))
+            .map(|v| v.trim().parse().unwrap())
+            .unwrap_or_else(|| panic!("missing `{key}` in body: {body}"))
+    }
+
+    /// 8.3 — function metric: a non-test function over the threshold is
+    /// reported with graduated severity AND a `<file>:<start-line>`
+    /// anchor; an equally-long function inside `#[cfg(test)]` is NOT.
+    #[test]
+    fn function_metric_reports_nontest_and_skips_test() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        let mut src = String::new();
+        src.push_str("pub fn big_prod() {\n");
+        for i in 0..600 {
+            src.push_str(&format!("    let _x{i} = {i};\n"));
+        }
+        src.push_str("}\n");
+        // An equally-long function buried in a test module.
+        src.push_str("#[cfg(test)]\n");
+        src.push_str("mod tests {\n");
+        src.push_str("    fn big_test() {\n");
+        for i in 0..600 {
+            src.push_str(&format!("        let _y{i} = {i};\n"));
+        }
+        src.push_str("    }\n");
+        src.push_str("}\n");
+        write(&ws.join("src/funcs.rs"), &src);
+        // High file threshold so only function findings appear.
+        let audit = ArchitectureBrightlineAudit::new(&settings_with_thresholds(100_000, 200));
+        let findings = audit.analyze(ws).unwrap();
+        let fn_findings: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.subject.starts_with("function "))
+            .collect();
+        assert_eq!(
+            fn_findings.len(),
+            1,
+            "only the non-test function is reported: {findings:?}"
+        );
+        let f = fn_findings[0];
+        assert!(f.subject.contains("big_prod"), "subject: {}", f.subject);
+        assert!(
+            !findings.iter().any(|f| f.subject.contains("big_test")),
+            "the #[cfg(test)] function must not be reported: {findings:?}"
+        );
+        // 602-line span vs 200 threshold → ≥ 2.5× → High.
+        assert_eq!(f.severity, Severity::High);
+        assert_eq!(
+            f.anchor.as_deref(),
+            Some("src/funcs.rs:1"),
+            "anchor names the function's start line"
+        );
+    }
+
+    /// 8.4 — duplicate-body metric: rename-only clones in different files
+    /// collide into one finding; a clone inside `#[cfg(test)]` is
+    /// excluded; an ignore entry covering the sites suppresses it.
+    #[test]
+    fn duplicate_body_metric_collapses_renamed_clones() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        write(
+            &ws.join("src/a.rs"),
+            "pub fn alert_disk(threshold: u32) -> String {\n    let label = \"disk\";\n    format!(\"{label} over {threshold}\")\n}\n",
+        );
+        write(
+            &ws.join("src/b.rs"),
+            "pub fn alert_mem(limit: u32) -> String {\n    let name = \"mem\";\n    format!(\"{name} over {limit}\")\n}\n",
+        );
+        // Same body, but inside a `#[cfg(test)]` module → excluded.
+        write(
+            &ws.join("src/c.rs"),
+            "#[cfg(test)]\nmod tests {\n    fn alert_net(cap: u32) -> String {\n        let tag = \"net\";\n        format!(\"{tag} over {cap}\")\n    }\n}\n",
+        );
+        let audit = ArchitectureBrightlineAudit::new(&HashMap::new());
+        let findings = audit.analyze(ws).unwrap();
+        let bodies: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.subject.starts_with(DUPLICATE_BODY_SUBJECT_PREFIX))
+            .collect();
+        assert_eq!(bodies.len(), 1, "one duplicate-body group: {findings:?}");
+        let f = bodies[0];
+        assert!(
+            f.subject.contains("across 2 files"),
+            "test-module clone must be excluded: {}",
+            f.subject
+        );
+        assert!(
+            !f.body.contains("alert_net") && !f.body.contains("src/c.rs"),
+            "test-module clone must not appear among the sites: {}",
+            f.body
+        );
+
+        // With an ignore entry covering BOTH live sites, the group is
+        // suppressed.
+        write(
+            &ws.join(".brightline-ignore"),
+            "ignore:\n  - file: src/a.rs\n    function: alert_disk\n    signature_match: \"fn alert_disk(\"\n    reason: \"intentional\"\n  - file: src/b.rs\n    function: alert_mem\n    signature_match: \"fn alert_mem(\"\n    reason: \"intentional\"\n",
+        );
+        let findings2 = audit.analyze(ws).unwrap();
+        assert!(
+            !findings2
+                .iter()
+                .any(|f| f.subject.starts_with(DUPLICATE_BODY_SUBJECT_PREFIX)),
+            "ignore entries covering all sites suppress the group: {findings2:?}"
+        );
+    }
+
+    /// 8.5 — signature key is the I/O profile: same name + parameter
+    /// *types* but different parameter *names* collide; same name but
+    /// different parameter types do not.
+    #[test]
+    fn signature_io_profile_keys_on_types_not_names() {
+        // Different parameter names, same types → collision.
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+        write(
+            &ws.join("src/a.rs"),
+            "pub fn calc(x: u32, y: u32) -> u32 { x + y }\n",
+        );
+        write(
+            &ws.join("src/b.rs"),
+            "pub fn calc(a: u32, b: u32) -> u32 { a * b }\n",
+        );
+        let audit = ArchitectureBrightlineAudit::new(&HashMap::new());
+        let findings = audit.analyze(ws).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.subject.starts_with(DUPLICATE_SIGNATURE_SUBJECT_PREFIX)
+                    && f.subject.contains("calc")),
+            "param-name-only difference must still collide: {findings:?}"
+        );
+
+        // Same name, different parameter types → no collision.
+        let dir2 = TempDir::new().unwrap();
+        let ws2 = dir2.path();
+        write(
+            &ws2.join("src/a.rs"),
+            "pub fn calc(x: u32) -> u32 { x + 1 }\n",
+        );
+        write(
+            &ws2.join("src/b.rs"),
+            "pub fn calc(x: String) -> usize { x.len() }\n",
+        );
+        let findings2 = audit.analyze(ws2).unwrap();
+        assert!(
+            !findings2
+                .iter()
+                .any(|f| f.subject.starts_with(DUPLICATE_SIGNATURE_SUBJECT_PREFIX)),
+            "differing parameter types must not collide: {findings2:?}"
+        );
     }
 }

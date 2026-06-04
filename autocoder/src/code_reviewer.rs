@@ -179,6 +179,13 @@ pub struct CodeReviewer {
     /// strategy via the a55 `provider → CLI` rule. Anthropic for the
     /// test-only [`CodeReviewer::new`] path.
     provider: LlmProvider,
+    /// a67: file/function line thresholds for the advisory size flag. The
+    /// reviewer appends a `## Size advisory` note when a pass pushes a
+    /// changed file or function past these, OR grows one already over.
+    /// Default to the same values the `architecture-brightline` audit
+    /// applies (file `800`, function `200`).
+    file_lines_threshold: u64,
+    function_lines_threshold: u64,
 }
 
 impl CodeReviewer {
@@ -196,7 +203,21 @@ impl CodeReviewer {
             kind: ReviewerKind::Oneshot,
             command: "claude".to_string(),
             provider: LlmProvider::Anthropic,
+            file_lines_threshold: crate::audits::brightline::DEFAULT_FILE_LINES_THRESHOLD,
+            function_lines_threshold: crate::audits::brightline::DEFAULT_FUNCTION_LINES_THRESHOLD,
         }
+    }
+
+    /// Builder-style setter for the advisory size-flag thresholds (a67).
+    /// Defaults match the `architecture-brightline` audit (file `800`,
+    /// function `200`); `from_config` leaves the defaults in place since
+    /// `ReviewerConfig` carries no per-reviewer override. Exercised by the
+    /// size-advisory tests.
+    #[allow(dead_code)]
+    pub fn with_size_thresholds(mut self, file_lines: u64, function_lines: u64) -> Self {
+        self.file_lines_threshold = file_lines;
+        self.function_lines_threshold = function_lines;
+        self
     }
 
     /// Builder-style setter for the reviewer transport (`oneshot` vs
@@ -408,8 +429,250 @@ impl CodeReviewer {
         // Stamp the reviewer's redaction-safe attribution (a49) so the
         // PR-body composer can render `*Reviewer: <provider>/<model>*`.
         report.attribution = self.attribution.clone();
+        // a67: advisory, non-blocking size flag. Appended to the markdown
+        // AFTER the verdict/markdown are assembled; the verdict is never
+        // touched (size is a maintainability signal, not a correctness
+        // defect).
+        append_size_advisory(
+            &mut report,
+            context,
+            self.file_lines_threshold,
+            self.function_lines_threshold,
+        );
         Ok(report)
     }
+}
+
+/// Append the advisory `## Size advisory` section to `report.markdown`
+/// when this pass pushes a changed file or function past a size threshold
+/// (or grows one already over it). The `verdict` is NOT modified — size
+/// is a maintainability signal, not a correctness defect. A no-op when no
+/// changed file/function is both over-threshold AND net-grown by the pass.
+fn append_size_advisory(
+    report: &mut ReviewReport,
+    ctx: &ReviewContext,
+    file_threshold: u64,
+    function_threshold: u64,
+) {
+    if let Some(section) = size_advisory_section(ctx, file_threshold, function_threshold) {
+        if report.markdown.trim().is_empty() {
+            report.markdown = section;
+        } else {
+            report.markdown.push_str("\n\n");
+            report.markdown.push_str(&section);
+        }
+    }
+}
+
+/// Net additions/deletions for one file in the unified diff, plus its
+/// hunks (used to attribute growth to individual functions).
+#[derive(Debug, Default, Clone)]
+struct FileDiffStats {
+    additions: u64,
+    deletions: u64,
+    hunks: Vec<DiffHunk>,
+}
+
+impl FileDiffStats {
+    /// Net lines the pass added to the file (`additions − deletions`).
+    fn net(&self) -> i64 {
+        self.additions as i64 - self.deletions as i64
+    }
+}
+
+/// One unified-diff hunk's new-file footprint AND its add/delete counts.
+#[derive(Debug, Clone)]
+struct DiffHunk {
+    /// First new-file line number the hunk covers (1-based).
+    new_start: usize,
+    /// Last new-file line number the hunk covers (1-based, inclusive).
+    /// For a pure-deletion hunk this is `new_start − 1` (no new lines).
+    new_end: usize,
+    additions: u64,
+    deletions: u64,
+}
+
+/// Compute the advisory `## Size advisory` markdown section for a review,
+/// or `None` when nothing crosses a threshold with net growth. For each
+/// changed file the reviewer determines — from the file's full contents
+/// AND the unified diff — whether the file (or a function within it)
+/// exceeds the file/function threshold AND whether this pass added net
+/// lines to it; only files/functions that are BOTH over-threshold AND
+/// net-grown are reported. Pure (no I/O) for testability.
+fn size_advisory_section(
+    ctx: &ReviewContext,
+    file_threshold: u64,
+    function_threshold: u64,
+) -> Option<String> {
+    let per_file = parse_unified_diff(&ctx.diff);
+    let mut items: Vec<String> = Vec::new();
+    for file in &ctx.changed_files {
+        let ext = file_extension(&file.path);
+        let stats = per_file.get(&file.path);
+        let total = file.contents.lines().count() as u64;
+        // Whole-file advisory.
+        let file_net = stats.map(|s| s.net()).unwrap_or(0);
+        if total > file_threshold && file_net > 0 {
+            match crate::audits::brightline::production_test_line_split(&file.contents, &ext) {
+                Some((prod, test)) => items.push(format!(
+                    "- `{}` is now {total} lines (production {prod} / test {test}); this pass added net lines.",
+                    file.path
+                )),
+                None => items.push(format!(
+                    "- `{}` is now {total} lines; this pass added net lines.",
+                    file.path
+                )),
+            }
+        }
+        // Function-level advisories.
+        let hunks: &[DiffHunk] = stats.map(|s| s.hunks.as_slice()).unwrap_or(&[]);
+        for span in crate::audits::brightline::function_line_spans(&file.contents, &ext) {
+            let n = span.line_count();
+            if n <= function_threshold {
+                continue;
+            }
+            if function_net_lines(hunks, span.start_line, span.end_line) > 0 {
+                items.push(format!(
+                    "- function `{}` in `{}` is now {n} lines; this pass added net lines.",
+                    span.name, file.path
+                ));
+            }
+        }
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let mut out = String::from("## Size advisory\n\n");
+    out.push_str(&items.join("\n"));
+    Some(out)
+}
+
+/// Net lines (`additions − deletions`) the pass contributed to a function
+/// spanning new-file lines `[fstart, fend]`, attributed by hunk overlap:
+/// every hunk whose new-file footprint intersects the span contributes
+/// its add/delete counts.
+fn function_net_lines(hunks: &[DiffHunk], fstart: usize, fend: usize) -> i64 {
+    let mut adds: i64 = 0;
+    let mut dels: i64 = 0;
+    for h in hunks {
+        // A pure-deletion hunk has new_end == new_start - 1; clamp so the
+        // overlap test treats it as the single insertion point new_start.
+        let hend = h.new_end.max(h.new_start);
+        if fstart <= hend && h.new_start <= fend {
+            adds += h.additions as i64;
+            dels += h.deletions as i64;
+        }
+    }
+    adds - dels
+}
+
+/// Parse a unified diff into per-file add/delete totals AND hunk
+/// footprints, keyed by the new-file path (the `+++ b/<path>` line with
+/// its `a/`/`b/` prefix stripped). Robust to git's extended headers
+/// (`diff --git`, `index`, mode/rename lines) AND to hunk headers that
+/// omit the optional `,count`.
+fn parse_unified_diff(diff: &str) -> std::collections::HashMap<String, FileDiffStats> {
+    use std::collections::HashMap;
+    static HUNK_RE: OnceLock<Regex> = OnceLock::new();
+    let hunk_re = HUNK_RE
+        .get_or_init(|| Regex::new(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@").unwrap());
+    let mut map: HashMap<String, FileDiffStats> = HashMap::new();
+    let mut current: Option<String> = None;
+    let mut cur_new: usize = 0;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            current = normalize_diff_path(rest);
+            if let Some(p) = &current {
+                map.entry(p.clone()).or_default();
+            }
+            continue;
+        }
+        if line.starts_with("--- ")
+            || line.starts_with("diff --git")
+            || line.starts_with("index ")
+            || line.starts_with("new file")
+            || line.starts_with("deleted file")
+            || line.starts_with("rename ")
+            || line.starts_with("similarity ")
+            || line.starts_with("old mode")
+            || line.starts_with("new mode")
+            || line.starts_with("Binary ")
+        {
+            continue;
+        }
+        if let Some(caps) = hunk_re.captures(line) {
+            cur_new = caps[1].parse().unwrap_or(1);
+            if let Some(cur) = &current {
+                let fd = map.entry(cur.clone()).or_default();
+                fd.hunks.push(DiffHunk {
+                    new_start: cur_new,
+                    new_end: cur_new.saturating_sub(1),
+                    additions: 0,
+                    deletions: 0,
+                });
+            }
+            continue;
+        }
+        let cur = match &current {
+            Some(c) => c,
+            None => continue,
+        };
+        let fd = match map.get_mut(cur) {
+            Some(fd) => fd,
+            None => continue,
+        };
+        match line.as_bytes().first().copied() {
+            Some(b'+') => {
+                fd.additions += 1;
+                if let Some(h) = fd.hunks.last_mut() {
+                    h.additions += 1;
+                    h.new_end = cur_new;
+                }
+                cur_new += 1;
+            }
+            Some(b'-') => {
+                fd.deletions += 1;
+                if let Some(h) = fd.hunks.last_mut() {
+                    h.deletions += 1;
+                }
+            }
+            Some(b'\\') => { /* "\ No newline at end of file" — ignore */ }
+            _ => {
+                // Context line (leading space) or a blank context line.
+                if let Some(h) = fd.hunks.last_mut() {
+                    h.new_end = cur_new;
+                }
+                cur_new += 1;
+            }
+        }
+    }
+    map
+}
+
+/// Strip a unified-diff path's `a/`/`b/` prefix AND any trailing tab
+/// metadata, yielding the workspace-relative path. `/dev/null` (an
+/// added/deleted side) yields `None`.
+fn normalize_diff_path(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let raw = raw.split('\t').next().unwrap_or(raw);
+    if raw == "/dev/null" {
+        return None;
+    }
+    let stripped = raw
+        .strip_prefix("b/")
+        .or_else(|| raw.strip_prefix("a/"))
+        .unwrap_or(raw);
+    Some(stripped.to_string())
+}
+
+/// File extension (lowercased) for a workspace-relative path, or empty
+/// when there is none.
+fn file_extension(path: &str) -> String {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
 }
 
 /// Operator-facing verdict for the re-review entry point (a33). The
@@ -1866,6 +2129,111 @@ this is not yaml: at all: ::: {{{ broken
         assert!(r.changed_files.contains("## File: a.rs"));
         assert!(r.changed_files.contains("BODY"));
         assert_eq!(r.diff_or_explanation, "DELTA");
+    }
+
+    // ====================================================================
+    // a67: advisory size flag (tasks 7.x / 8.7)
+    // ====================================================================
+
+    async fn review_with_size_thresholds(
+        ctx: &ReviewContext,
+        file_t: u64,
+        func_t: u64,
+    ) -> ReviewReport {
+        let (client, _captured) = stub_with_capture("VERDICT: Pass\n\n## Review\nlooks fine\n");
+        let reviewer =
+            CodeReviewer::new(client, "{{diff}}".to_string()).with_size_thresholds(file_t, func_t);
+        reviewer.review(ctx).await.unwrap()
+    }
+
+    /// 8.7a — a pass that grows a changed file past the file threshold
+    /// yields a size advisory naming the file, AND leaves the verdict
+    /// untouched.
+    #[tokio::test]
+    async fn size_advisory_flags_file_grown_past_threshold() {
+        let contents: String = (0..60).map(|i| format!("// line {i}\n")).collect();
+        let mut diff = String::from(
+            "diff --git a/src/foo.rs b/src/foo.rs\n--- a/src/foo.rs\n+++ b/src/foo.rs\n@@ -1,1 +1,11 @@\n // line 0\n",
+        );
+        for i in 0..10 {
+            diff.push_str(&format!("+// added {i}\n"));
+        }
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "src/foo.rs".into(),
+                contents,
+            }],
+            diff,
+        };
+        let report = review_with_size_thresholds(&ctx, 50, 20).await;
+        assert!(
+            report.markdown.contains("## Size advisory") && report.markdown.contains("src/foo.rs"),
+            "expected a file size advisory: {}",
+            report.markdown
+        );
+        // Size is advisory only — the parsed verdict is unchanged.
+        assert_eq!(report.verdict, ReviewVerdict::Pass);
+    }
+
+    /// 8.7b — a pass that only shrinks an over-threshold file is NOT
+    /// flagged.
+    #[tokio::test]
+    async fn size_advisory_skips_file_only_shrunk() {
+        let contents: String = (0..60).map(|i| format!("// line {i}\n")).collect();
+        let diff = String::from(
+            "diff --git a/src/bar.rs b/src/bar.rs\n--- a/src/bar.rs\n+++ b/src/bar.rs\n@@ -1,5 +1,1 @@\n // keep\n-// del 0\n-// del 1\n-// del 2\n-// del 3\n",
+        );
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "src/bar.rs".into(),
+                contents,
+            }],
+            diff,
+        };
+        let report = review_with_size_thresholds(&ctx, 50, 20).await;
+        assert!(
+            !report.markdown.contains("## Size advisory"),
+            "a shrinking pass must not be flagged: {}",
+            report.markdown
+        );
+    }
+
+    /// 8.7c — a pass that grows a single function past the function
+    /// threshold yields a function-level advisory.
+    #[tokio::test]
+    async fn size_advisory_flags_function_grown_past_threshold() {
+        // 27-line function (1 signature + 25 body + 1 close).
+        let mut contents = String::from("pub fn grower() {\n");
+        for i in 0..25 {
+            contents.push_str(&format!("    let v{i} = {i};\n"));
+        }
+        contents.push_str("}\n");
+        // Diff that adds the 25 body lines (net +25 within the function).
+        let mut diff = String::from(
+            "diff --git a/src/grow.rs b/src/grow.rs\n--- a/src/grow.rs\n+++ b/src/grow.rs\n@@ -1,2 +1,27 @@\n pub fn grower() {\n",
+        );
+        for i in 0..25 {
+            diff.push_str(&format!("+    let v{i} = {i};\n"));
+        }
+        diff.push_str(" }\n");
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "src/grow.rs".into(),
+                contents,
+            }],
+            diff,
+        };
+        // High file threshold so only the function advisory can fire.
+        let report = review_with_size_thresholds(&ctx, 100_000, 20).await;
+        assert!(
+            report.markdown.contains("## Size advisory") && report.markdown.contains("grower"),
+            "expected a function size advisory naming `grower`: {}",
+            report.markdown
+        );
+        assert_eq!(report.verdict, ReviewVerdict::Pass);
     }
 
     /// a34 §6: `skip_spec_only_prs` defaults to `false` AND propagates

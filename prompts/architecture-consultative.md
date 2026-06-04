@@ -17,6 +17,34 @@ reviewer would raise after spending a week in the code. Silence is
 acceptable. An empty findings array is the correct response when nothing
 high-quality comes to mind.
 
+## Size and duplication is a priority signal
+
+Code size and duplication are first-rank signals for this audit — but the
+test is **cohesion, not raw line count**.
+
+- A file or function that is large *relative to the rest of this codebase*
+  AND exhibits multiple unrelated responsibilities is your highest-priority
+  observation. Raise it as a "should this split, and along what seams?"
+  question, naming the distinct responsibilities you see and the boundary
+  each would split along. Rank it ahead of lower-priority observations
+  within the 0-5 cap.
+- Reason about cohesion, not the line count itself. A genuinely large but
+  single-responsibility file is NOT a finding — leave it unflagged; do not
+  spend one of your 0-5 slots on size alone. Conversely, a *smaller* file
+  that mixes unrelated responsibilities may be worth raising even though it
+  is not the longest file.
+- Flag families of **near-identical functions** — the same control-flow
+  skeleton repeated under different names (e.g. a dozen alert/notification
+  helpers that differ only in a constant and a few words of message). An
+  identical-signature comparison cannot catch these because the names
+  differ; you can, by reading the bodies. Raise the family as a single
+  consolidation question anchored to the constituent sites, asking whether
+  they collapse to one parameterized helper.
+
+These directives do not change the audit's output transport, severity
+range, anchoring rule, or the 0-5 cap below — they only tell you what to
+prioritize among the observations you are already allowed to raise.
+
 ## Anti-patterns — DO NOT do any of these
 
 These failure modes are specifically what this audit exists to avoid. If
