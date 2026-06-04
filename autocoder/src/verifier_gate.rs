@@ -82,9 +82,15 @@ impl VerifierGate {
 
     /// The gate's stable diagnostic label, e.g. `[verifier:in]`. The shared
     /// labeling token (task 1.2) that prefixes a gate's diagnostics so a
-    /// finding is attributable to the gate that produced it.
-    pub fn label(self) -> String {
-        format!("[verifier:{}]", self.id())
+    /// finding is attributable to the gate that produced it. A `const fn`
+    /// returning a `&'static str`: the label set is fixed by the enum, so it
+    /// allocates nothing even on the polling-loop hot path.
+    pub const fn label(self) -> &'static str {
+        match self {
+            VerifierGate::In => "[verifier:in]",
+            VerifierGate::Canon => "[verifier:canon]",
+            VerifierGate::Out => "[verifier:out]",
+        }
     }
 
     /// Prefix one log/diagnostic line with this gate's stable label. Callers
