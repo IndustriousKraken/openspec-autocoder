@@ -5702,8 +5702,11 @@ fn reviewer_revisions_for_review(
 /// `partition_and_annotate_reviewer_revisions`, this does NOT drop concerns
 /// against the per-PR cap: the whole set is dispatched as ONE aggregated run
 /// consuming exactly one `max_auto_revisions_per_pr` slot, so all concerns
-/// ride together. Logs a WARN when the set is empty (the "flag flipped but
-/// the template emits no actionable concerns" misconfiguration).
+/// ride together. Logs a WARN when concerns were surfaced but none were
+/// revisable (the "flag flipped but the template emits no actionable concerns"
+/// misconfiguration). A completely clean review (zero concerns) is NOT a
+/// misconfiguration, so it is gated out of the WARN — otherwise the daemon
+/// would spam the warning for every clean PR under `auto_revise: actionable`.
 fn collect_reviewer_revisions(report: &ReviewReport) -> Vec<ReviewConcern> {
     let revisable: Vec<ReviewConcern> = report
         .concerns
@@ -5711,7 +5714,7 @@ fn collect_reviewer_revisions(report: &ReviewReport) -> Vec<ReviewConcern> {
         .filter(|c| c.is_revisable())
         .cloned()
         .collect();
-    if revisable.is_empty() {
+    if revisable.is_empty() && !report.concerns.is_empty() {
         tracing::warn!(
             "reviewer auto-revise is enabled but no concerns had `actionable_request` + `should_request_revision: true` populated; verify the reviewer prompt template emits these fields."
         );
@@ -17116,6 +17119,37 @@ mod tests {
             vec![commentary_concern("style nit"), commentary_concern("preference")],
         );
         assert!(collect_reviewer_revisions(&r).is_empty());
+    }
+
+    // a005 revision: concerns were surfaced but none are revisable → the
+    // template-misconfiguration WARN fires (this is the genuine "flag flipped
+    // but no actionable fields" case).
+    #[test]
+    #[tracing_test::traced_test]
+    fn collect_reviewer_revisions_warns_when_concerns_present_but_none_revisable() {
+        let r = make_report(
+            ReviewVerdict::Block,
+            vec![commentary_concern("style nit"), commentary_concern("preference")],
+        );
+        assert!(collect_reviewer_revisions(&r).is_empty());
+        assert!(
+            logs_contain("verify the reviewer prompt template emits these fields"),
+            "a report with concerns but none revisable must WARN about the template"
+        );
+    }
+
+    // a005 revision: a completely clean review (zero concerns) is NOT a
+    // template misconfiguration, so it must NOT log the misleading WARN —
+    // otherwise every clean PR under `auto_revise: actionable` spams the log.
+    #[test]
+    #[tracing_test::traced_test]
+    fn collect_reviewer_revisions_clean_review_does_not_warn() {
+        let r = make_report(ReviewVerdict::Pass, vec![]);
+        assert!(collect_reviewer_revisions(&r).is_empty());
+        assert!(
+            !logs_contain("verify the reviewer prompt template emits these fields"),
+            "a clean review with zero concerns must NOT log the template WARN"
+        );
     }
 
     // a005 task 3.3: default `block` does NOT fire on a Concerns verdict but
