@@ -333,11 +333,52 @@ impl CliStrategy for ClaudeStrategy {
     /// addressed by its `session_id`. Leaves `settings.json`, `.credentials.json`,
     /// `CLAUDE.md`, the generated `.mcp.json`, AND every other session intact.
     fn delete_session(&self, ctx: SessionStoreCtx<'_>, handle: &str) -> Result<bool> {
+        // a70 hardening: a handle with a separator or `..` would let
+        // `dir.join(..)` resolve OUTSIDE the store (Rust does not normalize
+        // `..`); refuse it rather than traverse.
+        if reject_unsafe_session_handle(handle) {
+            return Ok(false);
+        }
         let Some(dir) = self.session_store_dir(ctx) else {
             return Ok(false);
         };
         delete_session_file(&dir.join(format!("{handle}.jsonl")))
     }
+}
+
+/// Reject a session handle that could escape its store directory (a70
+/// hardening). A real handle is a UUID (`claude`) or conversation id
+/// (`antigravity`), OR a store-directory filename stem — none of which ever
+/// contains a path separator or a `..` component. A handle emitted by a
+/// compromised / malicious CLI that DID contain one could, via `Path::join`
+/// (which does NOT normalize `..`) feeding `remove_file` / `remove_dir_all`,
+/// redirect the surgical prune at a path OUTSIDE the store. Any handle with a
+/// separator (`/` or `\`), a `..` component, an interior NUL, OR that is empty
+/// (an empty handle joins to the store dir itself, turning the prune into a
+/// directory wipe) is treated as unsafe so [`CliStrategy::delete_session`]
+/// refuses it rather than traversing.
+fn session_handle_is_safe(handle: &str) -> bool {
+    !handle.is_empty()
+        && !handle.contains('/')
+        && !handle.contains('\\')
+        && !handle.contains('\0')
+        && !handle.contains("..")
+}
+
+/// Log + refuse an unsafe session handle (a70 hardening). Emits a warning so
+/// the refusal is visible regardless of caller (the prune callers log `Ok`
+/// outcomes at debug), then signals "nothing removed". Returns `true` when the
+/// handle was rejected so the caller can early-return `Ok(false)`.
+fn reject_unsafe_session_handle(handle: &str) -> bool {
+    if session_handle_is_safe(handle) {
+        return false;
+    }
+    tracing::warn!(
+        session = %handle,
+        "refusing to prune session: handle contains a path separator or `..` \
+         (possible traversal) — skipping the surgical delete"
+    );
+    true
 }
 
 /// Remove a single session file if it exists, returning whether it was there.
@@ -884,6 +925,14 @@ impl CliStrategy for AntigravityStrategy {
     /// leaving `settings.json`, `oauth_creds.json`, `GEMINI.md`, the generated
     /// `mcp_config.json`, AND every other conversation intact.
     fn delete_session(&self, ctx: SessionStoreCtx<'_>, handle: &str) -> Result<bool> {
+        // a70 hardening: a handle with a separator or `..` would let the
+        // `join(..)` below escape the store (Rust does not normalize `..`),
+        // and the `brain` `remove_dir_all` would then recursively delete an
+        // arbitrary directory. An empty handle would point `brain` at the
+        // whole `brain/` dir. Refuse any such handle rather than traverse.
+        if reject_unsafe_session_handle(handle) {
+            return Ok(false);
+        }
         let store = ctx.home.join(ANTIGRAVITY_STORE_SUBDIR);
         let mut removed = delete_session_file(&store.join("conversations").join(format!("{handle}.db")))?;
         let brain = store.join("brain").join(handle);
@@ -2691,6 +2740,99 @@ mod tests {
         assert!(store.join("brain/other").exists());
         assert!(home.path().join(".gemini/settings.json").exists());
         assert!(home.path().join(".gemini/oauth_creds.json").exists());
+    }
+
+    /// a70 hardening: the handle-safety guard rejects every path-traversal
+    /// shape (separators, a `..` component, interior NUL, empty) while
+    /// accepting the real handle shapes (a `claude` UUID, an `antigravity`
+    /// conversation id, a store-diff filename stem — `.`-containing stems
+    /// without a `..` are fine).
+    #[test]
+    fn session_handle_is_safe_rejects_traversal_handles() {
+        // Real handles pass.
+        assert!(session_handle_is_safe(
+            "0e8c2a1b-7d4f-4c3a-9b2e-1f6a5d3c2b10"
+        ));
+        assert!(session_handle_is_safe("created-by-run"));
+        assert!(session_handle_is_safe("v1.2.3")); // a single `.` is not `..`
+        // Traversal / separator shapes are rejected.
+        assert!(!session_handle_is_safe(""));
+        assert!(!session_handle_is_safe(".."));
+        assert!(!session_handle_is_safe("../escape"));
+        assert!(!session_handle_is_safe("../../.ssh/authorized_keys"));
+        assert!(!session_handle_is_safe("a/b"));
+        assert!(!session_handle_is_safe("a\\b"));
+        assert!(!session_handle_is_safe("foo..bar"));
+        assert!(!session_handle_is_safe("with\0nul"));
+    }
+
+    /// a70 hardening: the claude scoped delete REFUSES a handle that would
+    /// escape the store via `..` (`dir.join("../escape.jsonl")` resolves to a
+    /// sibling of the store dir). The planted out-of-store file survives AND
+    /// the call reports nothing removed.
+    #[test]
+    fn claude_delete_session_refuses_traversal_handle() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/some/workspace/repo");
+        let store = home
+            .path()
+            .join(".claude/projects")
+            .join(claude_project_hash(workspace));
+        std::fs::create_dir_all(&store).unwrap();
+        // `dir.join("../escape.jsonl")` → `<projects>/escape.jsonl`, a sibling
+        // of the per-project store dir. Without the guard the surgical delete
+        // would remove it.
+        let escape_target = store.parent().unwrap().join("escape.jsonl");
+        std::fs::write(&escape_target, "victim").unwrap();
+
+        let strat = ClaudeStrategy::new("claude".into(), vec![]);
+        let ctx = SessionStoreCtx {
+            home: home.path(),
+            workspace,
+        };
+        assert!(
+            !strat.delete_session(ctx, "../escape").unwrap(),
+            "an unsafe handle removes nothing (Ok(false))"
+        );
+        assert!(
+            escape_target.exists(),
+            "the out-of-store file survives — no traversal occurred"
+        );
+    }
+
+    /// a70 hardening: the antigravity scoped delete REFUSES a traversal handle
+    /// for BOTH the `<id>.db` file AND the `brain/<id>/` `remove_dir_all` path
+    /// (the recursive delete is the more dangerous of the two). The planted
+    /// out-of-store db file AND brain directory both survive.
+    #[test]
+    fn antigravity_delete_session_refuses_traversal_handle() {
+        let home = tempfile::tempdir().unwrap();
+        let store = home.path().join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(store.join("conversations")).unwrap();
+        std::fs::create_dir_all(store.join("brain")).unwrap();
+        // db: `conversations/../victim.db` → `<store>/victim.db`.
+        let db_target = store.join("victim.db");
+        std::fs::write(&db_target, "victim").unwrap();
+        // brain: `brain/../victim` → `<store>/victim/` (would be recursively
+        // wiped by `remove_dir_all` without the guard).
+        let brain_target = store.join("victim");
+        std::fs::create_dir_all(&brain_target).unwrap();
+        std::fs::write(brain_target.join("important"), "victim").unwrap();
+
+        let strat = AntigravityStrategy::new("agy".into(), vec![]);
+        let ctx = SessionStoreCtx {
+            home: home.path(),
+            workspace: Path::new("/ws"),
+        };
+        assert!(
+            !strat.delete_session(ctx, "../victim").unwrap(),
+            "an unsafe handle removes nothing (Ok(false))"
+        );
+        assert!(db_target.exists(), "out-of-store db file survives");
+        assert!(
+            brain_target.join("important").exists(),
+            "out-of-store brain dir survives the would-be recursive delete"
+        );
     }
 
     /// a70 §4.1 / scenario "A single-shot agentic role prunes its session on
