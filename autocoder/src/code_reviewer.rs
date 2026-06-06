@@ -1356,12 +1356,32 @@ async fn run_agentic_review_with_runner(
 ) -> Result<AgenticReviewOutcome> {
     // Build the per-session work list. Bundled is always exactly one
     // session even when the pass has zero archived changes.
-    let sessions: Vec<(Option<String>, ReviewContext, String)> = match reviewer.mode() {
-        crate::config::ReviewerMode::Bundled => vec![(None, ctx.clone(), String::new())],
-        crate::config::ReviewerMode::PerChange => split_per_change_contexts(ctx)
-            .into_iter()
-            .map(|p| (Some(p.change_slug), p.context, p.cross_change_preamble))
-            .collect(),
+    //
+    // a015: an empty per-change split (no archived-change briefs resolved
+    // for this PR — e.g. a PR opened under one daemon build and re-reviewed
+    // under another) must NEVER reach `synthesize_agentic_per_change` with
+    // zero reviews: that initializer defaults to `Approve`, so the loop
+    // running zero sessions would produce a blank `Approve` the reviewer
+    // never performed — the exact silent-approval bug the one-shot
+    // `review_pr_at_state_with` path fixes. Mirror that fix here: fall back
+    // to a single BUNDLED session so the PR's diff and changed files still
+    // reach the reviewer and the verdict comes from an actual invocation.
+    // The `bundled` flag then also routes synthesis below through the
+    // bundled arm (no empty per-change synthesis).
+    let mut bundled = matches!(reviewer.mode(), crate::config::ReviewerMode::Bundled);
+    let sessions: Vec<(Option<String>, ReviewContext, String)> = if bundled {
+        vec![(None, ctx.clone(), String::new())]
+    } else {
+        let per_change = split_per_change_contexts(ctx);
+        if per_change.is_empty() {
+            bundled = true;
+            vec![(None, ctx.clone(), String::new())]
+        } else {
+            per_change
+                .into_iter()
+                .map(|p| (Some(p.change_slug), p.context, p.cross_change_preamble))
+                .collect()
+        }
     };
 
     let mut reviews: Vec<(Option<String>, ReviewResult)> = Vec::with_capacity(sessions.len());
@@ -1393,18 +1413,19 @@ async fn run_agentic_review_with_runner(
         }
     }
 
-    let outcome = match reviewer.mode() {
-        crate::config::ReviewerMode::Bundled => {
-            let mut result = reviews
-                .pop()
-                .map(|(_, r)| r)
-                .expect("bundled mode always runs exactly one session");
-            result.attribution = reviewer.attribution.clone();
-            result
-        }
-        crate::config::ReviewerMode::PerChange => {
-            synthesize_agentic_per_change(reviews, reviewer.attribution.clone())
-        }
+    // a015: synthesize through the SAME `bundled` flag the session list was
+    // built with, so an empty-split fallback (bundled = true above) takes
+    // the single-review bundled arm instead of synthesizing per-change from
+    // an effectively empty set.
+    let outcome = if bundled {
+        let mut result = reviews
+            .pop()
+            .map(|(_, r)| r)
+            .expect("bundled mode always runs exactly one session");
+        result.attribution = reviewer.attribution.clone();
+        result
+    } else {
+        synthesize_agentic_per_change(reviews, reviewer.attribution.clone())
     };
     Ok(AgenticReviewOutcome::Reviewed(outcome))
 }
@@ -1419,6 +1440,27 @@ fn synthesize_agentic_per_change(
     reviews: Vec<(Option<String>, ReviewResult)>,
     attribution: Option<String>,
 ) -> ReviewResult {
+    // a015: a synthesis from zero per-change reviews must NEVER be the
+    // source of a defaulted `Approve`. The dispatch in
+    // `run_agentic_review_with_runner` now falls back to a bundled session
+    // before reaching here with an empty vec, so this guard is defensive —
+    // it makes the "never a defaulted Approve" invariant explicit. `Block`
+    // is the only fail-safe verdict: an empty synthesis can never become a
+    // silent approval. (Mirrors the one-shot `synthesize_per_change_report`
+    // guard.)
+    if reviews.is_empty() {
+        return ReviewResult {
+            verdict: Verdict::Block,
+            per_concern: Vec::new(),
+            raw_output: String::new(),
+            markdown: "No per-change reviews were performed; refusing to \
+                synthesize a verdict from zero reviews."
+                .to_string(),
+            per_change_sections: Vec::new(),
+            concerns: Vec::new(),
+            attribution,
+        };
+    }
     let mut verdict = Verdict::Approve;
     let mut concerns: Vec<ReviewConcern> = Vec::new();
     let mut sections: Vec<PerChangeSection> = Vec::with_capacity(reviews.len());
@@ -4091,6 +4133,117 @@ this is not yaml: at all: ::: {{{ broken
             .await
             .unwrap();
         assert!(matches!(outcome, AgenticReviewOutcome::Discarded { .. }));
+    }
+
+    /// a015 (agentic path): `per_change` mode whose split yields ZERO
+    /// sub-contexts (empty `archived_changes`) but a real diff falls back to
+    /// a single BUNDLED session — exactly one reviewer session runs AND the
+    /// verdict is the one that session returned, NOT a defaulted
+    /// `Approve`/`Reviewed` synthesized from zero reviews. The canned
+    /// submission returns `Block` precisely because `Block` is the only
+    /// verdict that does not map to an approval: if the pre-fix bug were
+    /// present (empty split → zero sessions → `synthesize_agentic_per_change`
+    /// defaulting to `Approve`), this assertion would fail.
+    #[tokio::test]
+    async fn agentic_per_change_empty_split_falls_back_to_bundled_with_real_verdict() {
+        let (client, _) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "t".to_string())
+            .with_mode(crate::config::ReviewerMode::PerChange);
+        // Empty archived_changes → split yields zero sub-contexts, but the
+        // PR still has a real diff and changed files to review.
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "src/x.rs".into(),
+                contents: "fn x() {}".into(),
+            }],
+            diff: "the union diff".into(),
+        };
+        let runner = CannedRunner::new(vec![Some(valid_review_payload("Block"))]);
+        let outcome = run_agentic_review_with_runner(&reviewer, &ctx, &runner)
+            .await
+            .unwrap();
+        assert_eq!(
+            runner.session_count(),
+            1,
+            "empty split falls back to exactly one bundled reviewer session"
+        );
+        assert_eq!(
+            runner.slugs.lock().unwrap().as_slice(),
+            [String::new()],
+            "the fallback session is bundled (empty slug), not per-change"
+        );
+        match outcome {
+            AgenticReviewOutcome::Reviewed(r) => {
+                assert_eq!(
+                    r.verdict,
+                    Verdict::Block,
+                    "verdict comes from the bundled review, not a defaulted Approve"
+                );
+                assert!(
+                    r.per_change_sections.is_empty(),
+                    "the fallback is a bundled review — no per-change sections"
+                );
+            }
+            AgenticReviewOutcome::Discarded { .. } => {
+                panic!("a valid bundled submission must produce a reviewed outcome")
+            }
+        }
+    }
+
+    /// a015 (agentic path): the fallback bundled session is handed the
+    /// context's diff and changed files (asserting on the prompt the stub
+    /// runner received, not on any log/message wording). Proves the reviewer
+    /// builds its prompt over the real context rather than skipping the call.
+    #[tokio::test]
+    async fn agentic_per_change_empty_split_fallback_passes_diff_and_files() {
+        let (client, _) = stub_with_capture("");
+        let reviewer = CodeReviewer::new(client, "t".to_string())
+            .with_mode(crate::config::ReviewerMode::PerChange);
+        let ctx = ReviewContext {
+            archived_changes: Vec::new(),
+            changed_files: vec![ChangedFile {
+                path: "src/TOUCHED_SENTINEL_a015.rs".into(),
+                contents: "fn x() {}".into(),
+            }],
+            diff: "DIFF_SENTINEL_a015".into(),
+        };
+        let runner = CannedRunner::new(vec![Some(valid_review_payload("Approve"))]);
+        let _ = run_agentic_review_with_runner(&reviewer, &ctx, &runner)
+            .await
+            .unwrap();
+        let prompts = runner.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "exactly one bundled session prompt");
+        assert!(
+            prompts[0].contains("DIFF_SENTINEL_a015"),
+            "the fallback review receives the context's diff"
+        );
+        assert!(
+            prompts[0].contains("src/TOUCHED_SENTINEL_a015.rs"),
+            "the fallback review receives the context's changed files"
+        );
+    }
+
+    /// a015 (agentic path): the empty-input guard on
+    /// `synthesize_agentic_per_change` makes the "never a defaulted Approve"
+    /// invariant explicit. Called with an empty `reviews` vec it returns
+    /// `Block` (not `Approve`), so a synthesis from zero reviews can never
+    /// become a silent approval even if a future caller reaches it directly.
+    #[test]
+    fn synthesize_agentic_per_change_empty_input_is_block() {
+        let result = synthesize_agentic_per_change(Vec::new(), Some("p/m".to_string()));
+        assert_eq!(
+            result.verdict,
+            Verdict::Block,
+            "an empty per-change synthesis must never default to Approve"
+        );
+        assert!(result.per_change_sections.is_empty());
+        assert!(result.concerns.is_empty());
+        assert_eq!(
+            result.attribution.as_deref(),
+            Some("p/m"),
+            "attribution is preserved through the guard"
+        );
     }
 
     /// A reviewer whose provider resolves (via the a55 provider→CLI rule) to
