@@ -7,7 +7,7 @@
 
 ## 2. Documented-version detection (deterministic, in the daemon)
 
-- [ ] 2.1 Read the existing `CHANGELOG.md` (if present) and extract the set of versions it already documents by matching its version headings (e.g. `## [1.2.0]` / `## v1.2.0`). This is done by the daemon, not the stylist.
+- [ ] 2.1 Read the existing `CHANGELOG.md` (if present) and extract the set of versions it already documents by matching its version headings. Use a flexible regex (e.g., `(?i)^#+\s*(?:\[?)v?(\d+\.\d+\.\d+(?:-[\w\.]+)?)(?:\]?)?`) OR explicitly reuse the exact same heading-detection logic that the `changelog-stylist` prompt already uses to ensure perfect symmetry. This is done by the daemon, not the stylist.
 - [ ] 2.2 Compute the missing set = stable release tags whose version is NOT already documented, sorted oldest-first.
 
 ## 3. Gap-fill extraction + stylist hand-off
