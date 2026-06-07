@@ -734,13 +734,14 @@ github:
 #   #   access_token_env: MATRIX_ACCESS_TOKEN
 
 # Periodic audits — long-cycle background checks orchestrated by the
-# daemon between regular polling iterations. Six audits ship today:
+# daemon between regular polling iterations. Seven audits ship today:
 #   - architecture_brightline    — flags files exceeding a line-count threshold
 #   - drift_audit                — detects spec/code drift via LLM scan
 #   - missing_tests_audit        — proposes test coverage for untested code
 #   - security_bug_audit         — LLM scan for security smells
 #   - architecture_consultative  — LLM architectural-health review
 #   - documentation_audit        — LLM docs coverage / stale-reference / organization check
+#   - canon_contradiction_audit  — LLM scan for two canonical requirements that cannot both hold
 #
 # Cadence vocabulary (per audit; default `disabled`):
 #   disabled | daily | every-N-days | weekly | monthly | quarterly
@@ -759,6 +760,7 @@ github:
 #     security_bug_audit: weekly
 #     architecture_consultative: quarterly
 #     documentation_audit: monthly
+#     canon_contradiction_audit: monthly   # whole-canon scope → heavy default
 #
 #   # Per-audit knobs. `prompt_path` overrides the audit's embedded LLM
 #   # prompt template. `notify_on_clean` toggles a brief "no findings"
@@ -795,6 +797,12 @@ github:
 #       extra:
 #         readme_max_lines: 200             # threshold for "README too long" finding
 #         page_max_lines_without_toc: 500   # threshold for "missing TOC" finding
+#     canon_contradiction_audit:
+#       # prompt_path: /etc/autocoder/prompts/canon-contradiction-audit.md
+#       notify_on_clean: false
+#       extra:
+#         retrieval_breadth: 8        # nearest requirements retrieved per requirement (RAG on)
+#         max_findings_per_run: 20    # cap on findings surfaced per run (overflow surfaces later)
 #
 #   # Number of retry attempts after an LLM-driven audit's generated
 #   # proposal fails `openspec validate --strict`. Each retry re-invokes

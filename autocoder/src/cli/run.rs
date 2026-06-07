@@ -6,6 +6,7 @@ use crate::audits::{
     AuditRegistry,
     architecture_consultative::ArchitectureConsultativeAudit,
     brightline::ArchitectureBrightlineAudit,
+    canon_contradiction::CanonContradictionAudit,
     documentation_audit::DocumentationAudit,
     drift::DriftAudit,
     missing_tests::MissingTestsAudit, security_bug::SecurityBugAudit,
@@ -686,6 +687,10 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         &cfg.executor,
     )));
     registry.register(Arc::new(DocumentationAudit::new(
+        &audit_settings,
+        &cfg.executor,
+    )));
+    registry.register(Arc::new(CanonContradictionAudit::new(
         &audit_settings,
         &cfg.executor,
     )));

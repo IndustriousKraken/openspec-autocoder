@@ -71,6 +71,9 @@ pub enum PromptId {
     AuditSecurityBug,
     /// `prompts/documentation-audit.md` — documentation audit.
     AuditDocumentation,
+    /// `prompts/canon-contradiction-audit.md` — canon-internal
+    /// contradiction audit (a75).
+    AuditCanonContradiction,
     /// `prompts/brownfield-draft.md` — brownfield-draft handler.
     BrownfieldDraft,
     /// `prompts/brownfield-survey.md` — brownfield-survey handler (a29).
@@ -126,6 +129,8 @@ const PROMPT_SECURITY_BUG_AUDIT: &str =
     include_str!("../../../prompts/security-bug-audit.md");
 const PROMPT_DOCUMENTATION_AUDIT: &str =
     include_str!("../../../prompts/documentation-audit.md");
+const PROMPT_CANON_CONTRADICTION_AUDIT: &str =
+    include_str!("../../../prompts/canon-contradiction-audit.md");
 const PROMPT_BROWNFIELD_DRAFT: &str = include_str!("../../../prompts/brownfield-draft.md");
 const PROMPT_BROWNFIELD_SURVEY: &str = include_str!("../../../prompts/brownfield-survey.md");
 const PROMPT_SCOUT: &str = include_str!("../../../prompts/scout.md");
@@ -153,6 +158,7 @@ impl PromptId {
             Self::AuditMissingTests => PROMPT_MISSING_TESTS_AUDIT,
             Self::AuditSecurityBug => PROMPT_SECURITY_BUG_AUDIT,
             Self::AuditDocumentation => PROMPT_DOCUMENTATION_AUDIT,
+            Self::AuditCanonContradiction => PROMPT_CANON_CONTRADICTION_AUDIT,
             Self::BrownfieldDraft => PROMPT_BROWNFIELD_DRAFT,
             Self::BrownfieldSurvey => PROMPT_BROWNFIELD_SURVEY,
             Self::Scout => PROMPT_SCOUT,
@@ -180,6 +186,7 @@ impl PromptId {
             Self::AuditMissingTests => "missing-tests-audit.md",
             Self::AuditSecurityBug => "security-bug-audit.md",
             Self::AuditDocumentation => "documentation-audit.md",
+            Self::AuditCanonContradiction => "canon-contradiction-audit.md",
             Self::BrownfieldDraft => "brownfield-draft.md",
             Self::BrownfieldSurvey => "brownfield-survey.md",
             Self::Scout => "scout.md",
@@ -205,6 +212,7 @@ impl PromptId {
             Self::AuditMissingTests => "AuditMissingTests",
             Self::AuditSecurityBug => "AuditSecurityBug",
             Self::AuditDocumentation => "AuditDocumentation",
+            Self::AuditCanonContradiction => "AuditCanonContradiction",
             Self::BrownfieldDraft => "BrownfieldDraft",
             Self::BrownfieldSurvey => "BrownfieldSurvey",
             Self::Scout => "Scout",
@@ -231,6 +239,7 @@ impl PromptId {
             Self::AuditMissingTests,
             Self::AuditSecurityBug,
             Self::AuditDocumentation,
+            Self::AuditCanonContradiction,
             Self::BrownfieldDraft,
             Self::BrownfieldSurvey,
             Self::Scout,

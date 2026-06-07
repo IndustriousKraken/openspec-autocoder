@@ -3472,6 +3472,7 @@ pub const KNOWN_AUDIT_TYPES: &[&str] = &[
     "security_bug_audit",
     "architecture_consultative",
     "documentation_audit",
+    "canon_contradiction_audit",
 ];
 
 /// Run every config validation check and return a structured report.
@@ -7713,6 +7714,65 @@ audits:
         let cfg = Config::load_from(&path).unwrap();
         validate_audit_type_names(&cfg, &["architecture_brightline"])
             .expect("registered audit must pass validation");
+    }
+
+    /// a75 (task 6.7): `validate_audit_type_names` accepts the new
+    /// `canon_contradiction_audit` slug AND still rejects an unknown one,
+    /// listing the registered slugs in the error.
+    #[test]
+    fn validate_audit_type_names_accepts_canon_contradiction_audit() {
+        let known = &[
+            "architecture_brightline",
+            "architecture_consultative",
+            "drift_audit",
+            "missing_tests_audit",
+            "security_bug_audit",
+            "canon_contradiction_audit",
+        ];
+
+        // Accepts the new slug.
+        let ok_yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    canon_contradiction_audit: monthly
+"#;
+        let (_d1, p1) = write_config(ok_yaml);
+        let cfg_ok = Config::load_from(&p1).unwrap();
+        validate_audit_type_names(&cfg_ok, known)
+            .expect("canon_contradiction_audit must be accepted");
+
+        // Rejects an unknown slug, naming it AND listing the registered set.
+        let bad_yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github: {}
+audits:
+  defaults:
+    not_a_real_audit: monthly
+"#;
+        let (_d2, p2) = write_config(bad_yaml);
+        let cfg_bad = Config::load_from(&p2).unwrap();
+        let err = validate_audit_type_names(&cfg_bad, known)
+            .expect_err("unknown slug must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not_a_real_audit"), "names the unknown slug: {msg}");
+        assert!(
+            msg.contains("canon_contradiction_audit"),
+            "lists the registered slugs including the new one: {msg}"
+        );
     }
 
     #[test]
