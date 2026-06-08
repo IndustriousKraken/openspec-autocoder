@@ -1480,6 +1480,71 @@ mod tests {
         assert!(!p.contains("control.sock"));
     }
 
+    // Generality regression: the control socket frequently resolves to a path
+    // UNDER `$HOME` (the non-server, no-`$XDG_RUNTIME_DIR` deployment shape —
+    // e.g. `~/.local/state/autocoder/runtime/control.sock`). Under the allowlist
+    // policy `$HOME` is masked, so a masked-home agentic role (reviewer, audits)
+    // can only reach the socket if the bind RE-EXPOSES it AFTER the home mask.
+    // These assert that for each mechanism — i.e. the fix works for more than
+    // the one setup whose socket happens to sit outside the masked tree.
+    const HOME_SOCK: &str = "/home/u/.local/state/autocoder/runtime/control.sock";
+
+    fn allow_plan_with_home_socket() -> SandboxPlan {
+        let mut p = allow_plan(false, true);
+        p.extra_ro_paths.push(PathBuf::from(HOME_SOCK));
+        p
+    }
+
+    #[test]
+    fn bwrap_allowlist_rebinds_home_resident_socket_after_home_tmpfs() {
+        let a = osv(&bwrap_argv(&allow_plan_with_home_socket(), &inner()));
+        let bind_at = a
+            .windows(3)
+            .position(|w| w == ["--ro-bind-try", HOME_SOCK, HOME_SOCK]);
+        assert!(
+            bind_at.is_some(),
+            "bwrap must ro-bind a home-resident control socket: {a:?}"
+        );
+        let home_tmpfs_at = a
+            .windows(2)
+            .position(|w| w == ["--tmpfs", "/home/u"])
+            .expect("the allowlist masks home with a tmpfs");
+        assert!(
+            bind_at.unwrap() > home_tmpfs_at,
+            "socket bind must come AFTER the home tmpfs so it re-exposes the masked path: {a:?}"
+        );
+    }
+
+    #[test]
+    fn systemd_allowlist_binds_home_resident_socket_under_masked_home() {
+        let a = osv(&systemd_run_argv(&allow_plan_with_home_socket(), &inner()));
+        assert!(
+            a.iter().any(|x| x == "--property=ProtectHome=tmpfs"),
+            "the allowlist masks home: {a:?}"
+        );
+        assert!(
+            a.iter()
+                .any(|x| x == &format!("--property=BindReadOnlyPaths={HOME_SOCK}")),
+            "systemd must bind the home-resident control socket even under the masked home: {a:?}"
+        );
+    }
+
+    #[test]
+    fn seatbelt_allowlist_allows_home_resident_socket_after_home_deny() {
+        let profile = seatbelt_profile(&allow_plan_with_home_socket());
+        let allow = format!("(allow file-read* (literal \"{HOME_SOCK}\"))");
+        let deny_home = profile
+            .find("(deny file-read* file-write* (subpath \"/home/u\"))")
+            .expect("the allowlist denies the home subtree");
+        let allow_sock = profile
+            .find(&allow)
+            .expect("the home-resident socket is re-allowed");
+        assert!(
+            allow_sock > deny_home,
+            "socket allow must follow the home deny so it wins (last-match): {profile}"
+        );
+    }
+
     // a013: the bwrap executor denylist binds home read-write then masks each
     // entry (dir → tmpfs; file → ro-bind /dev/null).
     #[test]
