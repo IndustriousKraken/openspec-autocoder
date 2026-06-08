@@ -6482,13 +6482,15 @@ The autocoder config schema SHALL define a single canonical `LlmProvider` enum w
 
 `LlmProvider` SHALL be the type of the `provider` field across every LLM-touching config block: `reviewer:`, `canonical_rag:`, AND `executor.change_internal_contradiction_check_llm:`. Backward compatibility: the existing `RagProvider` AND `ReviewerProvider` enum names SHALL be retained as type aliases (`pub type RagProvider = LlmProvider;` etc.) so external-crate or test-code consumers compile unchanged. Existing config files using `provider: anthropic`, `provider: openai_compatible`, AND `provider: ollama` parse identically post-spec.
 
-The `api_key` field's mandatory-ness SHALL be determined by the resolved provider, NOT by the subsystem:
+The `api_key` field's mandatory-ness SHALL be determined by the resolved **consumer** first, then the provider:
 
-- `anthropic` → `api_key` REQUIRED (either via `api_key.value` inline OR `api_key_env` pointing at a set env var). Config-load fails-fast if absent.
-- `openai_compatible` → `api_key` REQUIRED. Same fail-fast rule.
-- `ollama` → `api_key` FORBIDDEN. Config-load fails-fast if the operator sets one with the message `<subsystem>: ollama does not authenticate; remove api_key field`. This is a behavioral departure from "silently ignore" — operators learn the auth model at startup rather than carrying dummy values forward.
+- **CLI / agentic consumer** (the resolved model is driven by a CLI strategy — `claude` / `opencode` / `agy`): `api_key` is **OPTIONAL for every provider**. The CLI self-authenticates from its own login/store, AND a supplied key is passed to the CLI (see the executor "CLI strategies … credential" requirement). Config-load SHALL NOT fail for a missing key on a CLI/agentic role.
+- **In-process HTTP consumer** (the non-agentic `oneshot` reviewer OR a RAG/embedding call — the daemon calls the provider directly): the provider rule applies, since an HTTP call needs the key in the daemon's process:
+  - `anthropic` → `api_key` REQUIRED (inline `api_key.value` OR `api_key_env` pointing at a set env var). Config-load fails-fast if absent.
+  - `openai_compatible` → `api_key` REQUIRED. Same fail-fast rule.
+  - `ollama` → `api_key` FORBIDDEN (Ollama does not authenticate). Config-load fails-fast if one is set, with `<subsystem>: ollama does not authenticate; remove api_key field`. (For a CLI/agentic ollama role the key is simply optional AND ignored — Ollama has no auth to use it.)
 
-The `api_base_url` field's mandatory-ness SHALL similarly be provider-driven:
+The `api_base_url` field's mandatory-ness SHALL be provider-driven:
 
 - `anthropic` → OPTIONAL (defaults to `https://api.anthropic.com`).
 - `openai_compatible` → REQUIRED (no sensible default for a generic compat endpoint).
@@ -6514,21 +6516,26 @@ Validation runs ONCE at config-load (not lazily). A misconfigured provider surfa
 - **THEN** the names resolve to `LlmProvider` via type aliases
 - **AND** no source-code change is required to consumers of the old type names
 
-#### Scenario: `anthropic` requires `api_key`
-- **WHEN** a config block sets `provider: anthropic` AND omits both `api_key` AND `api_key_env`
+#### Scenario: A CLI/agentic role does not require `api_key`
+- **WHEN** a CLI/agentic role (e.g. a verifier gate or the agentic reviewer) resolves to a model whose `provider` is `anthropic` OR `openai_compatible` AND no `api_key` / `api_key_env` is configured
+- **THEN** config-load succeeds
+- **AND** no key is required (the CLI self-authenticates at run time)
+
+#### Scenario: `anthropic` requires `api_key` for an in-process HTTP consumer
+- **WHEN** an in-process HTTP consumer (the `oneshot` reviewer OR a RAG/embedding call) sets `provider: anthropic` AND omits both `api_key` AND `api_key_env`
 - **THEN** config-load fails with `<subsystem>: anthropic requires api_key; set <subsystem>.api_key.value or <subsystem>.api_key_env`
 - **AND** the daemon exits non-zero before any polling task is spawned
 
-#### Scenario: `openai_compatible` requires `api_key`
-- **WHEN** a config block sets `provider: openai_compatible` AND omits both `api_key` AND `api_key_env`
+#### Scenario: `openai_compatible` requires `api_key` for an in-process HTTP consumer
+- **WHEN** an in-process HTTP consumer sets `provider: openai_compatible` AND omits both `api_key` AND `api_key_env`
 - **THEN** config-load fails with `<subsystem>: openai_compatible requires api_key; set <subsystem>.api_key.value or <subsystem>.api_key_env`
 
 #### Scenario: `openai_compatible` requires `api_base_url`
 - **WHEN** a config block sets `provider: openai_compatible` AND omits `api_base_url`
 - **THEN** config-load fails with `<subsystem>: openai_compatible requires api_base_url; set the field to e.g. https://api.openai.com/v1`
 
-#### Scenario: `ollama` forbids `api_key`
-- **WHEN** a config block sets `provider: ollama` AND sets `api_key.value` OR `api_key_env`
+#### Scenario: `ollama` forbids `api_key` for an in-process HTTP consumer
+- **WHEN** an in-process HTTP consumer sets `provider: ollama` AND sets `api_key.value` OR `api_key_env`
 - **THEN** config-load fails with `<subsystem>: ollama does not authenticate; remove api_key field`
 - **AND** the failure message names that Ollama silently ignores Authorization headers
 

@@ -296,7 +296,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         // a003: the contradiction check runs agentically (a59) through a CLI
         // strategy, which authenticates from its own login — so a configured
         // `api_key` is unused. Warn once at startup; the strategy ignores it.
-        if let Some(warn) = crate::agentic_run::cli_role_unused_key_warning(
+        if let Some(warn) = crate::agentic_run::cli_role_key_exposure_warning(
             "executor.change_internal_contradiction_check_llm",
             !model.api_key.is_empty(),
         ) {
@@ -351,7 +351,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             .context("resolving canon-contradiction-check model from config")?;
         // a003: agentic CLI gate (a62) — a configured `api_key` is unused (the
         // CLI authenticates itself). Warn once at startup; the strategy ignores it.
-        if let Some(warn) = crate::agentic_run::cli_role_unused_key_warning(
+        if let Some(warn) = crate::agentic_run::cli_role_key_exposure_warning(
             "executor.change_canonical_contradiction_check_llm",
             !model.api_key.is_empty(),
         ) {
@@ -405,7 +405,7 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             .context("resolving code-implements-spec-check model from config")?;
         // a003: agentic CLI gate (a63) — a configured `api_key` is unused (the
         // CLI authenticates itself). Warn once at startup; the strategy ignores it.
-        if let Some(warn) = crate::agentic_run::cli_role_unused_key_warning(
+        if let Some(warn) = crate::agentic_run::cli_role_key_exposure_warning(
             "executor.code_implements_spec_check_llm",
             !model.api_key.is_empty(),
         ) {

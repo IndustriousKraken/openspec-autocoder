@@ -1547,34 +1547,37 @@ Because the `[out]` gate is advisory (per the orchestrator-cli requirement AND t
 - **AND** the tool layer does NOT raise an error — the orchestrator-cli caller omits the advisory section AND proceeds (the gate never blocks)
 
 ### Requirement: CLI strategies pass no LLM credential to the wrapped subprocess
-No `CliStrategy` implementation SHALL pass an LLM credential (the resolved `api_key`) to the wrapped CLI — NOT by writing it into a config file in the workspace (`opencode.json`, `mcp_config.json`, `.gemini/*`, etc.), and NOT by setting it in the subprocess environment. A strategy SHALL select the model (e.g. `--model`) and rely on the CLI's **own** authentication — the CLI's own credential store or login (`claude login`, opencode / Big-Pickle, `agy` login), or the operator's out-of-band CLI provider config (e.g. opencode → OpenRouter configured in opencode's own config). This supersedes any prior per-strategy credential passing: the `claude` strategy SHALL NOT set `ANTHROPIC_AUTH_TOKEN`, AND the `opencode` strategy's `opencode.json` SHALL carry the MCP block + the permission/sandbox config + the provider's model/base-URL, but NOT the `api_key`.
+An agentic CLI role's credential handling SHALL depend on whether the operator supplied an `api_key`, per the two cases below:
 
-The rationale is that the model never needs the credential: the CLI **process** authenticates by injecting the key into the request in its own memory; the model is tunneled across that connection. A credential written to a workspace file can be committed; a credential in the subprocess env is readable from the agent's Bash (and, for Anthropic, an env key also forces pay-per-token off the operator's subscription).
+- **No key (the default).** No `CliStrategy` SHALL place any LLM credential in the wrapped subprocess — NOT in a workspace file (`opencode.json`, `mcp_config.json`, `.gemini/*`, etc.), AND NOT in the subprocess environment. The strategy SHALL select the model (e.g. `--model`) AND rely on the CLI's **own** authentication — its credential store or login (`claude login`, opencode / its provider config, `agy` login), or the operator's out-of-band CLI provider config (e.g. opencode → OpenRouter). This is the safe default: no credential ever reaches the model.
+- **Key supplied (an explicit opt-in).** When a CLI role has a configured `api_key`, the strategy SHALL pass it to the CLI so the CLI uses that key — uniformly across the three CLIs: `claude` via `ANTHROPIC_API_KEY`, the `opencode` strategy via opencode's own provider config, AND `agy` via `AV_API_KEY`. A supplied key SHALL be placed where the existing config-store protection covers it — the CLI's own config store, reached by the `engine_deny` tool denylist — AND SHALL NEVER be written into a workspace file (a workspace file can be committed AND is freely readable by the model).
 
-A resolved `api_key` SHALL flow only to autocoder's **in-process** HTTP clients (the non-agentic `oneshot` reviewer AND the contradiction-check LLM block), which the daemon calls directly so the key stays in the daemon's process and never reaches a model. When a role that resolves to a CLI strategy has a configured `api_key`, the strategy SHALL ignore it AND the daemon SHALL emit exactly one startup WARN noting the key is unused for CLI roles.
+The supplied-key path cannot fully isolate the credential from the model: the model AND the wrapped CLI are the **same process AND uid**, so a key the CLI can use is one the model can ultimately reach. `engine_deny` is deterrence, not a bound (see the os-hide/engine-deny requirement), AND a CLI that accepts a key only via the subprocess environment (e.g. `claude` → `ANTHROPIC_API_KEY`) leaves the key readable from the model's own environment. Supplying a key is therefore an explicit operator opt-in to that exposure; the no-key default preserves the no-credential posture. The daemon SHALL document this residual rather than claim isolation it cannot provide.
 
-#### Scenario: opencode.json carries no api_key
-- **WHEN** the `opencode` strategy writes `opencode.json` for a role whose resolved model has a non-empty `api_key`
-- **THEN** the written `opencode.json` contains the MCP block, the permission/sandbox config, AND the provider's model + base URL
-- **AND** it does NOT contain the `api_key`
+A resolved `api_key` SHALL still flow to autocoder's **in-process** HTTP clients (the non-agentic `oneshot` reviewer AND any RAG/embedding HTTP call), which the daemon calls directly so the key stays in the daemon's process; those are not subprocesses AND are unaffected by the CLI-role rules above.
 
-#### Scenario: claude strategy sets no auth token
-- **WHEN** the `claude` strategy builds an invocation for a role whose resolved model has an `api_key`
-- **THEN** the invocation sets NO `ANTHROPIC_AUTH_TOKEN`
-- **AND** claude authenticates from its own login/credential store
+#### Scenario: No-key CLI role passes no credential to the subprocess
+- **WHEN** a CLI role's resolved model has no `api_key`
+- **THEN** the strategy writes no credential into any workspace file
+- **AND** sets no credential in the subprocess environment
+- **AND** the CLI authenticates from its own login / credential store
 
-#### Scenario: no strategy writes a credential to a workspace file or env
-- **WHEN** any `CliStrategy` builds its invocation AND/OR writes its config
-- **THEN** no credential (the resolved `api_key`) appears in any file written into the workspace
-- **AND** no credential appears in the subprocess environment
+#### Scenario: A supplied key is passed to the CLI
+- **WHEN** a CLI role's resolved model has a non-empty `api_key`
+- **THEN** the strategy makes the CLI use that key — `claude` via `ANTHROPIC_API_KEY`, `opencode` via its provider config, `agy` via `AV_API_KEY`
 
-#### Scenario: a configured CLI-role key is ignored with one warning
-- **WHEN** a role that resolves to a CLI strategy is configured with an `api_key`
-- **THEN** the strategy ignores it (the CLI uses its own auth)
-- **AND** the daemon emits exactly one startup WARN that the key is unused for CLI roles
+#### Scenario: A supplied key is never written to a workspace file
+- **WHEN** any `CliStrategy` writes its config for a role whose resolved model has an `api_key`
+- **THEN** no credential appears in any file written into the workspace (e.g. the workspace `opencode.json` carries the MCP block, the permission/sandbox config, AND the provider's model + base URL, but NOT the `api_key`)
+- **AND** a supplied key is placed only in a location covered by `engine_deny` (the CLI's own config store) OR, for a CLI that accepts a key only via the environment, in the subprocess environment with the residual documented
 
-#### Scenario: in-process HTTP roles still receive the key
-- **WHEN** the non-agentic `oneshot` reviewer (or the contradiction-check LLM block) runs with a configured `api_key`
+#### Scenario: The supplied-key location is engine-deny covered
+- **WHEN** a key is supplied AND written to the CLI's config store
+- **THEN** that location is included in the `engine_deny` tool-denylist applied for the run
+- **AND** the protection is understood as deterrence, not a bound (same-process / same-uid residual)
+
+#### Scenario: In-process HTTP roles still receive the key
+- **WHEN** the non-agentic `oneshot` reviewer (or a RAG/embedding HTTP call) runs with a configured `api_key`
 - **THEN** the key is used by the daemon's in-process HTTP client for that call
 - **AND** the key is never passed to a subprocess (file or env)
 

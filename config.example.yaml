@@ -322,11 +322,18 @@ executor:
   # individually well-formed but contradict each other (e.g. ADDED A
   # "all secrets in env vars" + ADDED B "API key in config.yaml").
   #
-  # The check runs an LLM against the change's concatenated spec-delta
-  # files. Costs ~$0.01 per checked change at current pricing. Failures
-  # (network, parse, malformed response) fail OPEN — log a WARN AND
-  # proceed to the executor; the daemon does NOT gate work on a failed
-  # check.
+  # TRANSPORT (a59/a62/a63): this gate AND its two siblings below (the
+  # `[canon]` and `[out]` gates) run AGENTICALLY — a wrapped CLI session — NOT
+  # one-shot HTTP calls. The LLM block's `provider` selects the CLI:
+  # `anthropic`→`claude`, `openai_compatible`/`ollama`→`opencode`,
+  # `google`→`antigravity` (the selected CLI must be installed). The agent reads
+  # the relevant files on demand in a read-only sandbox AND returns its result
+  # via an MCP `submit_*` tool over the daemon's control socket (so that socket
+  # must be reachable inside the OS sandbox — it is, by default). `api_key_env` /
+  # `api_base_url` configure the provider the resolved CLI uses, AND `model` may
+  # name a top-level `models:` nickname. Failures (CLI unavailable, no
+  # submission) fail OPEN — log a WARN AND proceed; the daemon does NOT gate
+  # work on a failed check.
   #
   # Disabled by default. To enable, set the mode below AND configure the
   # LLM block. Enabling without configuring the LLM block is a fail-fast
@@ -347,16 +354,17 @@ executor:
   # change_internal_contradiction_check_llm:
   #   provider: anthropic               # `anthropic` | `openai_compatible` | `ollama`
   #   model: claude-haiku-4-5-20251001  # cheap; the prompt is small
-  #   api_key_env: ANTHROPIC_API_KEY    # REQUIRED for anthropic / openai_compatible,
-  #                                     # FORBIDDEN for ollama (rejected at config-load).
+  #   api_key_env: ANTHROPIC_API_KEY    # OPTIONAL for these CLI/agentic gates — the CLI
+  #                                     # self-authenticates; a key is required only for an
+  #                                     # in-process HTTP consumer (oneshot reviewer / RAG).
   #   # Inline alternative: when `api_key` is set, `api_key_env` is ignored.
   #   # api_key:
   #   #   value: "sk-ant-yourkeyhere"
   #   # api_base_url: https://api.anthropic.com
-  #   #                                 # API ROOT; client appends the path
-  #   #                                 # (`/v1/messages` for anthropic,
-  #   #                                 # `/chat/completions` for openai_compatible,
-  #   #                                 # `/api/chat` for ollama).
+  #   #                                 # provider endpoint the resolved CLI uses
+  #   #                                 # (a custom base for the selected
+  #   #                                 # anthropic/openai_compatible/ollama
+  #   #                                 # provider); omit for the provider default.
   #
   # --- The [canon] gate: change-vs-canonical contradiction pre-flight ---
   #
@@ -383,8 +391,9 @@ executor:
   # change_canonical_contradiction_check_llm:
   #   provider: anthropic               # `anthropic` | `openai_compatible` | `ollama`
   #   model: claude-haiku-4-5-20251001  # cheap; the prompt is small
-  #   api_key_env: ANTHROPIC_API_KEY    # REQUIRED for anthropic / openai_compatible,
-  #                                     # FORBIDDEN for ollama (rejected at config-load).
+  #   api_key_env: ANTHROPIC_API_KEY    # OPTIONAL for these CLI/agentic gates — the CLI
+  #                                     # self-authenticates; a key is required only for an
+  #                                     # in-process HTTP consumer (oneshot reviewer / RAG).
   #
   # Code-implements-spec verification — the `[out]` gate of the verifier
   # framework (a63). Runs AFTER the executor implements a change, in a
@@ -410,8 +419,9 @@ executor:
   # code_implements_spec_check_llm:
   #   provider: anthropic               # `anthropic` | `openai_compatible` | `ollama`
   #   model: claude-haiku-4-5-20251001  # cheap; the prompt is small
-  #   api_key_env: ANTHROPIC_API_KEY    # REQUIRED for anthropic / openai_compatible,
-  #                                     # FORBIDDEN for ollama (rejected at config-load).
+  #   api_key_env: ANTHROPIC_API_KEY    # OPTIONAL for these CLI/agentic gates — the CLI
+  #                                     # self-authenticates; a key is required only for an
+  #                                     # in-process HTTP consumer (oneshot reviewer / RAG).
 
 github:
   # Name of the env var holding the GitHub PAT. The token is read once

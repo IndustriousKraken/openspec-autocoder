@@ -155,6 +155,12 @@ CLI config stores get two protection layers, each an independent toggle under `e
 
 The running role's own CLI store stays readable by that same-uid subprocess because the CLI must read it to authenticate. Disclosure of that one store means a model could impersonate that CLI to *its own* provider — never reach another provider's credential or another secret. That residual is bounded by the single-store blast radius plus `engine_deny` deterrence.
 
+### Supplied LLM keys for CLI roles (opt-in exposure)
+
+A CLI/agentic role (a verifier gate, the agentic reviewer, an audit) authenticates **by default** from the wrapped CLI's own login/store — no LLM credential reaches the subprocess. That is the recommended, no-exposure default: **omit `api_key`** for these roles, and `api_key` is not required at config-load for them.
+
+If you *do* supply an `api_key` for a CLI role, it is passed to the CLI so the CLI uses that key — `claude`/`agy` via the subprocess env (`ANTHROPIC_API_KEY` / `AV_API_KEY`), `opencode` via an `{env:...}` reference in the workspace `opencode.json` resolved from the env (the raw secret is never written into that committed file). Because the model and the wrapped CLI share the **same process and uid**, a key the CLI can use is one the model can ultimately read: `engine_deny` deters file reads but cannot bound an env read. Supplying a key is therefore a deliberate **opt-in to that exposure**; the daemon logs one startup WARN per keyed CLI role as a reminder. For untrusted inputs, prefer the no-key default. In-process HTTP roles (the `oneshot` reviewer, RAG) are unaffected — their key stays in the daemon process and never reaches a subprocess.
+
 ### Presets (documentation over the two switches)
 
 | Preset | `os_hide` | `engine_deny` | When |

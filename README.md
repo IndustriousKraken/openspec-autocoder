@@ -126,11 +126,9 @@ Everything beyond the quick install lives under [`docs/`](docs/README.md) — gr
 
 The seven capabilities listed under [How it works](#how-it-works) are all **implemented and tested**. autocoder runs end-to-end against real GitHub repositories with the Claude CLI as executor and (optionally) Slack as the officially-supported escalation channel. The four experimental ChatOps backends (Discord, Teams, Mattermost, Matrix) compile and have unit-test coverage against recorded fixtures but no live-service validation; operators who deliberately select one are the ones surfacing bugs.
 
-The following capability is **explicitly aspirational**:
+**Spec verification has shipped** as the opt-in **verifier-gate framework** (all gates off by default). Two pre-flight gates run before the executor and block a change that contradicts itself (the `[in]` gate, `change_internal_contradiction_check`) or existing canon (the `[canon]` gate, `change_canonical_contradiction_check`); the `[out]` gate (`code_implements_spec_check`) runs after the executor and asks "did the diff actually implement the spec?", rendering an advisory `## Spec Verification` section in the PR body alongside the reviewer's `## Code Review` — it informs the human reviewer and never blocks. All three run agentically (a wrapped CLI session relaying via MCP `submit_*` tools); the code reviewer still assesses code quality, not spec compliance. See [docs/CONFIG.md](docs/CONFIG.md) and [docs/OPERATIONS.md → Pre-flight checks](docs/OPERATIONS.md#pre-flight-checks). The periodic `drift_audit` remains a complementary, repo-wide spec-vs-code divergence signal.
 
-- **Verifier** *(planned; not in any active change)*: a spec-audit step that runs alongside the code reviewer and asks "did the diff actually implement the spec?" The reviewer agent currently focuses on code quality and explicitly does not assess spec compliance. Until the verifier ships, spec correctness is a human-review concern. The shipped `drift_audit` is a related but distinct signal — periodic spec-vs-code divergence detection across the whole repo, separate from per-change verification.
-
-Other items deferred without a current owner:
+Items deferred without a current owner:
 
 - **Multi-instance distributed deployment.** autocoder assumes single-instance ownership of each configured workspace; running two daemons against the same `local_path` would race. Out of scope for the current architecture.
 - **Per-repo executor configuration overrides.** The `executor:` block is global; mixing Claude on one repo and a different backend on another in the same config is not supported.

@@ -384,17 +384,44 @@ pub fn validate_llm_provider_config(
     api_base_url: Option<&str>,
     subsystem: &str,
 ) -> Result<()> {
+    // In-process HTTP consumer (oneshot reviewer, RAG/embedding): the daemon
+    // calls the provider directly, so a key is genuinely required.
+    validate_llm_provider_config_inner(provider, api_key_present, api_base_url, subsystem, true)
+}
+
+/// Like [`validate_llm_provider_config`] but for a **CLI / agentic** consumer
+/// (a model driven by `claude` / `opencode` / `agy`). The CLI self-authenticates
+/// from its own login/store, AND a supplied key is passed to the CLI (see the
+/// executor credential requirement), so `api_key` is OPTIONAL for every provider
+/// — including ollama, where a key is simply ignored rather than forbidden. The
+/// `api_base_url` requirements are unchanged (a base URL is not a credential).
+pub fn validate_llm_provider_config_cli(
+    provider: LlmProvider,
+    api_key_present: bool,
+    api_base_url: Option<&str>,
+    subsystem: &str,
+) -> Result<()> {
+    validate_llm_provider_config_inner(provider, api_key_present, api_base_url, subsystem, false)
+}
+
+fn validate_llm_provider_config_inner(
+    provider: LlmProvider,
+    api_key_present: bool,
+    api_base_url: Option<&str>,
+    subsystem: &str,
+    require_key: bool,
+) -> Result<()> {
     let has_base = api_base_url.map(|s| !s.trim().is_empty()).unwrap_or(false);
     match provider {
         LlmProvider::Anthropic => {
-            if !api_key_present {
+            if require_key && !api_key_present {
                 return Err(anyhow!(
                     "{subsystem}: anthropic requires api_key; set {subsystem}.api_key.value or {subsystem}.api_key_env"
                 ));
             }
         }
         LlmProvider::OpenAiCompatible => {
-            if !api_key_present {
+            if require_key && !api_key_present {
                 return Err(anyhow!(
                     "{subsystem}: openai_compatible requires api_key; set {subsystem}.api_key.value or {subsystem}.api_key_env"
                 ));
@@ -406,7 +433,10 @@ pub fn validate_llm_provider_config(
             }
         }
         LlmProvider::Ollama => {
-            if api_key_present {
+            // Ollama never authenticates. For an in-process HTTP consumer a key
+            // is a footgun (rejected). For a CLI/agentic consumer a key is
+            // optional AND ignored — no forbid — so the rule is uniform.
+            if require_key && api_key_present {
                 return Err(anyhow!(
                     "{subsystem}: ollama does not authenticate; remove api_key field (Ollama silently ignores Authorization headers, so a configured key is a footgun)"
                 ));
@@ -3031,7 +3061,12 @@ impl Config {
         if let Some(registry) = models.as_ref() {
             for (nick, entry) in registry {
                 let key_present = entry.api_key.is_some() || entry.api_key_env.is_some();
-                validate_llm_provider_config(
+                // a55 registry entries are CLI-capable (each resolves to a
+                // claude/opencode/agy strategy), so `api_key` is optional here —
+                // the CLI self-authenticates, and a supplied key is passed to it.
+                // An in-process HTTP consumer that references a keyless entry
+                // (RAG, oneshot reviewer) still enforces the key at ITS site.
+                validate_llm_provider_config_cli(
                     entry.provider,
                     key_present,
                     entry.api_base_url.as_deref(),
@@ -3104,12 +3139,23 @@ impl Config {
             let provider = rev.provider.expect("reviewer.provider resolved at config-load");
             validate_provider_for_subsystem(provider, SubsystemKind::Reviewer)?;
             let key_present = rev.api_key.is_some() || rev.api_key_env.is_some();
-            validate_llm_provider_config(
-                provider,
-                key_present,
-                rev.api_base_url.as_deref(),
-                "reviewer",
-            )?;
+            // The reviewer is agentic (CLI self-auth → api_key optional) OR
+            // oneshot (in-process HTTP → api_key required per provider).
+            if matches!(rev.kind, ReviewerKind::Agentic) {
+                validate_llm_provider_config_cli(
+                    provider,
+                    key_present,
+                    rev.api_base_url.as_deref(),
+                    "reviewer",
+                )?;
+            } else {
+                validate_llm_provider_config(
+                    provider,
+                    key_present,
+                    rev.api_base_url.as_deref(),
+                    "reviewer",
+                )?;
+            }
         }
         if let Some(llm) = cfg
             .executor
@@ -3135,7 +3181,8 @@ impl Config {
                 .expect("change_internal_contradiction_check_llm.provider resolved at config-load");
             validate_provider_for_subsystem(provider, SubsystemKind::ContradictionCheck)?;
             let key_present = llm.api_key.is_some() || llm.api_key_env.is_some();
-            validate_llm_provider_config(
+            // The verifier gates are always CLI/agentic → api_key optional.
+            validate_llm_provider_config_cli(
                 provider,
                 key_present,
                 llm.api_base_url.as_deref(),
@@ -3166,7 +3213,8 @@ impl Config {
                 .expect("change_canonical_contradiction_check_llm.provider resolved at config-load");
             validate_provider_for_subsystem(provider, SubsystemKind::CanonContradictionCheck)?;
             let key_present = llm.api_key.is_some() || llm.api_key_env.is_some();
-            validate_llm_provider_config(
+            // The verifier gates are always CLI/agentic → api_key optional.
+            validate_llm_provider_config_cli(
                 provider,
                 key_present,
                 llm.api_base_url.as_deref(),
@@ -3193,7 +3241,8 @@ impl Config {
                 .expect("code_implements_spec_check_llm.provider resolved at config-load");
             validate_provider_for_subsystem(provider, SubsystemKind::CodeImplementsSpecCheck)?;
             let key_present = llm.api_key.is_some() || llm.api_key_env.is_some();
-            validate_llm_provider_config(
+            // The verifier gates are always CLI/agentic → api_key optional.
+            validate_llm_provider_config_cli(
                 provider,
                 key_present,
                 llm.api_base_url.as_deref(),
@@ -4478,6 +4527,56 @@ github:
         let (_dir, path) = write_config(&yaml);
         Config::load_from(&path)
             .expect_err("an unknown key under `cache:` must be rejected (deny_unknown_fields)");
+    }
+
+    #[test]
+    fn keyless_cli_roles_load_end_to_end() {
+        // The boot fix (agentic-key-optional-and-used Part 1): a keyless `models:`
+        // registry (openai_compatible + anthropic + ollama) referenced by the
+        // three verifier gates loads — CLI/agentic roles self-authenticate, so
+        // `api_key` is optional. (Previously every keyless registry entry failed
+        // config-load with "requires api_key".)
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 300
+models:
+  reviewer_q:
+    provider: openai_compatible
+    model: qwen/qwen3.7-max
+    api_base_url: https://openrouter.ai/api/v1
+    cli: opencode
+  claude_sonnet:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    api_base_url: https://api.anthropic.com
+  local_spec_check:
+    provider: ollama
+    model: q:latest
+    api_base_url: http://10.42.11.10:11434
+    cli: opencode
+executor:
+  kind: claude_cli
+  command: claude
+  timeout_secs: 1800
+  change_internal_contradiction_check: enabled
+  change_internal_contradiction_check_llm:
+    model: local_spec_check
+  change_canonical_contradiction_check: enabled
+  change_canonical_contradiction_check_llm:
+    model: claude_sonnet
+  code_implements_spec_check: enabled
+  code_implements_spec_check_llm:
+    model: reviewer_q
+github:
+  token_env: GITHUB_TOKEN
+"#;
+        let (_dir, path) = write_config(yaml);
+        Config::load_from(&path).expect(
+            "keyless CLI/agentic roles (registry + verifier gates) must load — api_key optional",
+        );
     }
 
     #[test]
@@ -9582,6 +9681,58 @@ github:
         .expect("anthropic with api_key + no base_url must pass");
     }
 
+    // ---- validate_llm_provider_config_cli (CLI/agentic: api_key OPTIONAL) ----
+
+    #[test]
+    fn cli_validator_allows_missing_key_for_anthropic_and_openai_compatible() {
+        // A CLI/agentic role self-authenticates → no api_key required at load.
+        validate_llm_provider_config_cli(LlmProvider::Anthropic, false, None, "models.claude_sonnet")
+            .expect("anthropic CLI role needs no api_key");
+        validate_llm_provider_config_cli(
+            LlmProvider::OpenAiCompatible,
+            false,
+            Some("https://openrouter.ai/api/v1"),
+            "models.reviewer_q",
+        )
+        .expect("openai_compatible CLI role needs no api_key");
+    }
+
+    #[test]
+    fn cli_validator_still_requires_openai_compatible_base_url() {
+        // base_url is not a credential → still required even for a CLI role.
+        let err = validate_llm_provider_config_cli(
+            LlmProvider::OpenAiCompatible,
+            false,
+            None,
+            "models.reviewer_q",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("requires api_base_url"), "{err:#}");
+    }
+
+    #[test]
+    fn cli_validator_tolerates_ollama_key_but_http_still_forbids() {
+        // For a CLI/agentic ollama role a key is optional AND ignored (no forbid).
+        validate_llm_provider_config_cli(
+            LlmProvider::Ollama,
+            true,
+            Some("http://localhost:11434"),
+            "models.local_spec_check",
+        )
+        .expect("ollama CLI role tolerates an (ignored) key");
+        // The in-process HTTP validator still forbids it.
+        assert!(
+            validate_llm_provider_config(
+                LlmProvider::Ollama,
+                true,
+                Some("http://localhost:11434"),
+                "canonical_rag",
+            )
+            .is_err(),
+            "HTTP ollama still forbids a key"
+        );
+    }
+
     #[test]
     fn validate_openai_compatible_requires_api_key() {
         let err = validate_llm_provider_config(
@@ -9768,15 +9919,18 @@ github:
   token_env: GITHUB_TOKEN
 reviewer:
   enabled: true
+  kind: oneshot
   provider: ollama
   model: qwen2.5-coder:32b
   api_base_url: http://localhost:11434
   api_key:
     value: "anything"
 "#;
+        // `kind: oneshot` → in-process HTTP consumer → ollama still forbids a key.
+        // (An agentic reviewer would tolerate-and-ignore it; see the agentic test.)
         let (_dir, path) = write_config(yaml);
         let err = Config::load_from(&path)
-            .expect_err("reviewer ollama + api_key must fail");
+            .expect_err("oneshot reviewer ollama + api_key must fail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("reviewer: ollama does not authenticate"),
@@ -9826,17 +9980,46 @@ github:
   token_env: GITHUB_TOKEN
 reviewer:
   enabled: true
+  kind: oneshot
+  provider: openai_compatible
+  model: gpt-4o
+  api_base_url: https://api.openai.com/v1
+"#;
+        // `kind: oneshot` → in-process HTTP consumer → api_key still required.
+        // (An agentic reviewer needs no key; see the agentic test.)
+        let (_dir, path) = write_config(yaml);
+        let err = Config::load_from(&path)
+            .expect_err("oneshot openai_compatible without api_key must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("openai_compatible requires api_key"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn agentic_reviewer_loads_without_api_key() {
+        // The default (agentic) reviewer is CLI-driven → api_key optional; the
+        // CLI self-authenticates. (The oneshot reviewer above still requires it.)
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token_env: GITHUB_TOKEN
+reviewer:
+  enabled: true
   provider: openai_compatible
   model: gpt-4o
   api_base_url: https://api.openai.com/v1
 "#;
         let (_dir, path) = write_config(yaml);
-        let err = Config::load_from(&path)
-            .expect_err("openai_compatible without api_key must fail");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("openai_compatible requires api_key"),
-            "{msg}"
+        Config::load_from(&path).expect(
+            "an agentic reviewer (default kind) needs no api_key — the CLI self-authenticates",
         );
     }
 
@@ -10186,17 +10369,18 @@ github:
   token_env: GITHUB_TOKEN
 models:
   bad_local:
-    provider: ollama
-    model: qwen2.5-coder:32b
-    api_base_url: http://localhost:11434
-    api_key:
-      value: should-not-be-here
+    provider: openai_compatible
+    model: gpt-4o
 "#;
+        // Registry entries are CLI-capable, so api_key is optional — but the
+        // structural rules still apply: an openai_compatible entry MUST have an
+        // api_base_url, even unreferenced. (A missing key no longer fails here.)
         let (_dir, path) = write_config(yaml);
-        let err = Config::load_from(&path).expect_err("ollama entry with api_key must fail");
+        let err =
+            Config::load_from(&path).expect_err("entry missing required api_base_url must fail");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("models.bad_local: ollama does not authenticate"),
+            msg.contains("models.bad_local") && msg.contains("requires api_base_url"),
             "must name the entry AND the rule: {msg}"
         );
     }
