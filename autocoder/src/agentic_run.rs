@@ -1190,15 +1190,19 @@ pub async fn agentic_run(opts: AgenticRunOpts<'_>) -> Result<AgenticRunOutcome> 
             resume_session_id: opts.resume_session_id,
             workspace: opts.workspace,
             model: opts.model,
-            // The submission roles that drive opencode (reviewer a58,
-            // contradiction check a59) currently write their own `.mcp.json`
-            // via `write_mcp_config` and key the role there; threading the
-            // role through to the opencode strategy's `opencode.json` writer
-            // is the call-site change those roles make when they opt into
-            // opencode end-to-end. This change registers the strategy AND
-            // exposes the seam (`BuildContext::mcp_role`); it does not modify
-            // a58/a59, so the production build leaves it `None`.
-            mcp_role: None,
+            // Thread the role into the strategy's own MCP config (opencode's
+            // `opencode.json`, agy's `mcp_config.json`) so its `submit_*` /
+            // query tools carry `ORCH_MCP_CHANGE` / `ORCH_MCP_ROLE` and route to
+            // the submission store. `opts.change` IS that key for every caller
+            // (the reviewer/gate/audit role, or the executor's change slug), AND
+            // it is what the post-run `try_consume_submission(change)` reads back.
+            // Gated on `include_autocoder_tools`: only meaningful when the
+            // autocoder MCP child is advertised. The `claude` strategy ignores
+            // this (its MCP config comes from the caller's `write_mcp_config`);
+            // opencode/agy previously got `None`, so their submissions silently
+            // never routed — an opencode reviewer recorded "no submission" AND
+            // opencode gates fail-open'd as "no findings".
+            mcp_role: opts.include_autocoder_tools.then_some(opts.change),
         };
         let mut inner_cmd = opts.strategy.build_command(&ctx);
         opts.strategy.apply_model_selection(&mut inner_cmd, opts.model);
