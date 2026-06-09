@@ -1044,13 +1044,10 @@ fn audit_strategy(
     match model {
         Some(m) => {
             let cli = crate::config::default_cli_for(m.provider);
-            let resolved_command = if cli != crate::config::CliKind::Claude
-                && command == crate::config::default_executor_command()
-            {
-                cli.default_command().to_string()
-            } else {
-                command.to_string()
-            };
+            // A non-claude CLI uses its own binary, NOT the (claude) executor
+            // command — even when that command is a custom claude path. See
+            // `resolve_cli_command`.
+            let resolved_command = crate::config::resolve_cli_command(command, cli);
             crate::agentic_run::strategy_for_cli(cli, resolved_command, Vec::new())
         }
         None => Ok(Box::new(crate::agentic_run::ClaudeStrategy::new(

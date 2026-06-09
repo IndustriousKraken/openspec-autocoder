@@ -1219,11 +1219,12 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
 fn resolve_reviewer_strategy(
     reviewer: &CodeReviewer,
 ) -> Result<Box<dyn crate::agentic_run::CliStrategy>> {
-    crate::agentic_run::strategy_for_provider(
-        reviewer.provider,
-        reviewer.command.clone(),
-        Vec::new(),
-    )
+    // `reviewer.command` defaults to the `claude` binary; a non-claude reviewer
+    // (opencode/agy) must spawn its OWN binary, not claude. See
+    // `resolve_cli_command`.
+    let cli = crate::config::default_cli_for(reviewer.provider);
+    let command = crate::config::resolve_cli_command(&reviewer.command, cli);
+    crate::agentic_run::strategy_for_cli(cli, command, Vec::new())
 }
 
 /// Whether `cli` resolves to an executable on the daemon host. An absolute

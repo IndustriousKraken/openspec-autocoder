@@ -99,8 +99,10 @@ executor:
   # authenticated on this host. No API key in this file — authentication
   # lives in ~/.claude/ from `claude auth login`.
   kind: claude_cli
-  # Override only if you have a wrapper script or `claude` is not on $PATH:
-  # command: /usr/local/bin/claude
+  # The daemon spawns each CLI by its canonical name (`claude` / `opencode` /
+  # `agy`) on your captured login PATH. Make sure the binary is on the daemon
+  # user's PATH; for a fork/clone, symlink the canonical name to it (a wrapper
+  # script can also inject flags). No per-binary path lives in this file.
   timeout_secs: 1800
   # Optional tool-use sandbox. Absent → restrictive safe defaults apply
   # (blocks curl/wget/nc/ssh/scp/git-push, denies reads of ~/.ssh and

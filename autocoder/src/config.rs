@@ -212,6 +212,24 @@ pub fn default_cli_for(provider: LlmProvider) -> CliKind {
     }
 }
 
+/// The binary a role should spawn for its resolved `cli`. The `configured`
+/// command — `executor.command` for the gates/audits, the reviewer's `command`
+/// — defaults to (and the daemon's only executor is) the `claude` binary. That
+/// is correct ONLY for a claude role: an `opencode` / `agy` strategy cannot run
+/// the `claude` binary (it would invoke claude with foreign flags → claude fails
+/// to authenticate / never submits, which the gates then hold on). So a
+/// non-claude CLI uses its OWN default binary ([`CliKind::default_command`],
+/// resolved on `PATH`); a claude role keeps the configured command (honoring a
+/// custom claude path). There is no per-CLI command override for the non-claude
+/// CLIs — they use the standard binary name.
+pub fn resolve_cli_command(configured: &str, cli: CliKind) -> String {
+    if cli == CliKind::Claude {
+        configured.to_string()
+    } else {
+        cli.default_command().to_string()
+    }
+}
+
 /// Canonical-spec RAG configuration (a21).
 ///
 /// When `Some` with `enabled: true`, the daemon embeds every
@@ -1087,6 +1105,13 @@ fn default_upstream_branch() -> String {
 #[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {
     pub kind: ExecutorKind,
+    /// DEPRECATED: the daemon resolves each CLI by its canonical binary name
+    /// (`claude` / `opencode` / `agy`) on the captured login PATH (a014). Put
+    /// the binary on the daemon user's PATH, and symlink the canonical name to a
+    /// fork/clone (or a flag-injecting wrapper) if needed. Still parsed AND
+    /// honored — a set value points the `claude` implementer at that binary — for
+    /// backward compatibility, but it is undocumented (omitted from
+    /// config.example.yaml AND CONFIG.md per the deprecated-field carve-out).
     #[serde(default = "default_executor_command")]
     pub command: String,
     /// a70: the agentic CLI the implementer runs through. Unset → `claude`
@@ -10396,6 +10421,27 @@ models:
         );
         // a69: the Google/Antigravity provider maps to the `agy` CLI.
         assert_eq!(default_cli_for(LlmProvider::Google), CliKind::Antigravity);
+    }
+
+    #[test]
+    fn resolve_cli_command_uses_own_binary_for_non_claude() {
+        // Claude role keeps the configured (possibly custom) command.
+        assert_eq!(
+            resolve_cli_command("/home/u/.local/bin/claude", CliKind::Claude),
+            "/home/u/.local/bin/claude"
+        );
+        // Non-claude roles spawn their OWN binary, NOT the (custom) claude
+        // command — regression for an ollama/opencode gate that ran the claude
+        // binary and got "Not logged in" instead of reaching opencode.
+        assert_eq!(
+            resolve_cli_command("/home/u/.local/bin/claude", CliKind::Opencode),
+            "opencode"
+        );
+        assert_eq!(resolve_cli_command("claude", CliKind::Opencode), "opencode");
+        assert_eq!(
+            resolve_cli_command("/home/u/.local/bin/claude", CliKind::Antigravity),
+            "agy"
+        );
     }
 
     /// a69 / task 3.1: the Antigravity CLI is configured as `cli: antigravity`

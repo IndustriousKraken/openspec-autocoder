@@ -317,7 +317,10 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             crate::attribution::AttributionSurface::attribution(llm_cfg);
         Some(Arc::new(
             crate::preflight::change_contradiction::ContradictionCheckCtx {
-                command: cfg.executor.command.clone(),
+                command: crate::config::resolve_cli_command(
+                    &cfg.executor.command,
+                    crate::config::default_cli_for(model.provider),
+                ),
                 model,
                 prompt_template,
                 attribution: Some(attribution),
@@ -371,7 +374,10 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         let attribution = crate::attribution::AttributionSurface::attribution(llm_cfg);
         Some(Arc::new(
             crate::preflight::canon_contradiction::CanonContradictionCheckCtx {
-                command: cfg.executor.command.clone(),
+                command: crate::config::resolve_cli_command(
+                    &cfg.executor.command,
+                    crate::config::default_cli_for(model.provider),
+                ),
                 model,
                 prompt_template,
                 attribution: Some(attribution),
@@ -425,7 +431,10 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         let attribution = crate::attribution::AttributionSurface::attribution(llm_cfg);
         Some(Arc::new(
             crate::code_implements_spec::CodeImplementsSpecCheckCtx {
-                command: cfg.executor.command.clone(),
+                command: crate::config::resolve_cli_command(
+                    &cfg.executor.command,
+                    crate::config::default_cli_for(model.provider),
+                ),
                 model,
                 prompt_template,
                 attribution: Some(attribution),

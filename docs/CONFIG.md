@@ -93,10 +93,11 @@ Cross-link:
 
 ## `executor:` (required)
 
+The daemon spawns each CLI by its canonical binary name (`claude` / `opencode` / `agy`) on the captured login PATH — put the binary on the daemon user's PATH, and symlink the canonical name to a fork/clone (or a flag-injecting wrapper) if you need a different one. (`executor.command` is a deprecated, undocumented escape hatch that pins the implementer's binary; still honored if set, but prefer PATH.)
+
 | Field                       | Required | Default       | Description |
 |-----------------------------|----------|---------------|-------------|
 | `kind`                      | yes      | —             | Currently only `claude_cli` is supported. |
-| `command`                   | no       | `claude`      | Path to the wrapped CLI. Set only if `claude` isn't on `$PATH`. |
 | `timeout_secs`              | no       | `1800`        | Wall-clock budget per change. Killed-and-Failed on overrun. |
 | `sandbox`                   | no       | safe defaults | Tool-use restrictions (`allowed_tools`, `disallowed_bash_patterns`, `disallowed_read_paths`) applied to every executor invocation — see [Executor tool sandbox](SECURITY.md#8-executor-tool-sandbox) — **plus** the a006 OS-level sandbox credential toggles `os_hide` / `engine_deny` (both default ON) and the `allow_unsandboxed` no-mechanism opt-in (default `false`, daemon-wide). See [§9 OS-level agentic sandbox](SECURITY.md#9-os-level-agentic-sandbox-a006). |
 | `implementer_prompt_path`   | no       | _embedded_    | Path to a file overriding the built-in implementer prompt template. The template must contain the literal `{{change_body}}` placeholder, which is replaced with `openspec instructions apply` output at each invocation. Unset means use the template compiled into the binary. Operators with override templates MAY mention `query_canonical_specs` (a21 — see `canonical_rag:`) in their prompt OR ignore the new tool entirely; the tool stays registered regardless. |
