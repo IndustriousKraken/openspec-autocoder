@@ -1140,6 +1140,10 @@ trait ReviewSessionRunner: Send + Sync {
 struct CliReviewSessionRunner<'a> {
     workspace: &'a Path,
     strategy: &'a dyn crate::agentic_run::CliStrategy,
+    /// The reviewer's resolved CLI, so the OS sandbox admits THIS CLI's own
+    /// credential store (and binds its binary) instead of masking it as a
+    /// foreign CLI's. Must match `strategy`'s CLI.
+    cli: crate::config::CliKind,
     settings_dir: Option<&'a Path>,
     timeout: Duration,
 }
@@ -1181,8 +1185,12 @@ impl ReviewSessionRunner for CliReviewSessionRunner<'_> {
             track_subprocess_marker: false,
             etxtbsy_retry_spawn: true,
             // a006: the agentic reviewer is a read-only role — read-only
-            // workspace. It drives `claude` (no per-run model override here).
-            os_sandbox: crate::sandbox::current_run_sandbox(crate::config::CliKind::Claude, false),
+            // workspace. The OS sandbox MUST match the reviewer's actual CLI so
+            // the role's OWN credential store is admitted (not masked as a
+            // foreign CLI's) AND its binary is bound. Previously hardcoded to
+            // `Claude`, which masked an `opencode`/`agy` reviewer's own store →
+            // the CLI could not authenticate → "no valid submit_review submission".
+            os_sandbox: crate::sandbox::current_run_sandbox(self.cli, false),
             },
             true,
             None,
@@ -1336,6 +1344,9 @@ pub async fn run_agentic_review(
     let runner = CliReviewSessionRunner {
         workspace,
         strategy: strategy.as_ref(),
+        // Match the sandbox to the reviewer's actual CLI (provider → CLI), so an
+        // opencode/agy reviewer's own store is admitted, not masked as foreign.
+        cli: crate::config::default_cli_for(reviewer.provider),
         settings_dir: None,
         timeout: AGENTIC_REVIEW_TIMEOUT,
     };
