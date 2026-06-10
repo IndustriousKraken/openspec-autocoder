@@ -60,6 +60,7 @@ mod state;
 mod submission_store;
 #[cfg(test)]
 mod testing;
+mod tool_probe;
 mod verifier_gate;
 mod workspace;
 mod workspace_cache;

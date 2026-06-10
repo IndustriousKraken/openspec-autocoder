@@ -126,6 +126,13 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     // when a required one is missing or unusable.
     crate::dependency_preflight::run_startup_preflight(&cfg)?;
 
+    // Tool-capability probe: the agentic gates/reviewer require their model to
+    // emit tool calls (Read the change, then call a submit_* MCP tool). Probe
+    // each agentic registry endpoint once and WARN if it cannot — so a toolless
+    // model (older family, abliterated template) is surfaced now, not via a
+    // cryptic fail-closed hold mid-run. Best-effort; never blocks startup.
+    crate::tool_probe::run_tool_capability_preflight(&cfg).await;
+
     // Shared startup-time validation: schema, token-route, workspace
     // collision, audit slug, path collision, secret source. Errors block
     // startup with an aggregated message; warnings log and continue.

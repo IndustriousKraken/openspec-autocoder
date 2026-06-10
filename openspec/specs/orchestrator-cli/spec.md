@@ -4165,6 +4165,8 @@ The following knobs SHALL NOT be accessible via `--reconfigure`:
 ### Requirement: `check-config` subcommand validates a config file without side effects
 autocoder SHALL ship a `check-config` subcommand alongside `run`, `reload`, `rewind`, `audit run`, and `install`. The subcommand SHALL accept `--config <path>` (required) AND `--json` (optional flag). It SHALL run the same validation pipeline `autocoder run` executes at startup (YAML parse, schema validation, token-route resolution, workspace-collision check, audit-slug validation, path-collision check, secret-source check) AND exit with one of three codes: `0` on a fully-valid config, `1` on a config that passes hard-error checks but has at least one WARN-level finding, `2` on at least one hard error. The subcommand SHALL NOT spawn any daemon work, SHALL NOT mutate any file, AND SHALL NOT contact any external service.
 
+Schema validation SHALL additionally emit an ADVISORY WARN-level finding (category `schema`, never a hard error) when a `models:` registry entry whose provider is `openai_compatible` or `ollama` has a **path-less** `api_base_url` — a host[:port] with no path segment, or a bare trailing slash (e.g. `http://host:11434`). A registry model always drives an agentic CLI, which posts to `<base>/chat/completions`, so a path-less base typically returns 404; most OpenAI-compatible endpoints (Ollama included) serve under `/v1`. The WARN SHALL name the model AND carry the `config_pointer` `models/<name>/api_base_url`. It is scoped to the registry; the one-shot HTTP Ollama path (native `/api/chat`, bare base) SHALL NOT be flagged.
+
 A shared free function `validate_config(config: &Config) -> ValidationReport` SHALL host every check. The `check-config` subcommand AND the `autocoder run` startup path SHALL both call this function so the surface stays in sync — there is no "check-config validates extra things" OR "autocoder run skips a check" drift.
 
 #### Scenario: Valid config exits 0 with OK lines
@@ -4187,6 +4189,13 @@ A shared free function `validate_config(config: &Config) -> ValidationReport` SH
 - **AND** stdout contains a line starting with `WARN: secret-source:` naming the env var
 - **AND** stderr contains `check-config: 0 error(s), 1 warning(s) in <path>`
 - **AND** the WARN does not block: a config that has only WARNs but no ERRORs still exits 1 (not 2)
+
+#### Scenario: Path-less registry base produces an advisory WARN
+- **WHEN** the config's `models:` registry has an entry with `provider: ollama` (or `openai_compatible`) AND `api_base_url: http://host:11434` (no path segment)
+- **AND** the operator runs `autocoder check-config --config <path>`
+- **THEN** the subcommand exits 1 (advisory only — not a hard error)
+- **AND** stdout contains a line starting with `WARN: schema:` naming the model AND carrying `config_pointer` `models/<name>/api_base_url`, suggesting the base include its path (e.g. `/v1`)
+- **AND** a registry entry whose `api_base_url` already includes a path (e.g. `http://host:11434/v1`) produces no such WARN
 
 #### Scenario: Parse failure exits 2 with the serde_yaml diagnostic
 - **WHEN** the config file contains malformed YAML
@@ -7528,4 +7537,37 @@ Periodic audits SHALL support an optional `model` field under `audits.settings.<
 - **WHEN** an operator does not specify a `model` field under `audits.settings.<audit_type>`
 - **THEN** the audit runner receives `None` for the model configuration
 - **AND** the audit executes using the default `claude` CLI strategy with no model override, preserving backward compatibility
+
+### Requirement: Startup tool-capability probe for agentic model endpoints
+The agentic roles (the verifier gates `[in]`/`[canon]`/`[out]` AND the agentic reviewer) drive their model through a tool-using CLI session — the model must emit tool calls (read the change, then call a `submit_*` MCP tool). A model whose endpoint cannot emit tool calls cannot serve these roles, and the fail-closed gate would hold every change with an opaque cause. To surface this BEFORE a change is held, the daemon SHALL run a tool-capability probe at startup.
+
+After the dependency preflight AND before the first polling iteration, the daemon SHALL, for each `models:` registry entry whose provider is `openai_compatible` or `ollama`, send ONE tool-calling request to `<api_base_url>/chat/completions` (the path the agentic CLI uses) carrying a trivial tool definition, AND inspect the response:
+- A response that carries a tool call → an INFO log line that the model is usable for agentic roles.
+- A response that carries no tool call, OR a 4xx that rejects the tools request → a WARN-level log line naming the model AND the remedy (use a model whose template supports tools; `ollama show <model>` lists `tools`).
+- A probe that cannot complete (connection error, timeout, 5xx, undecodable body) → a WARN-level "could not run" line; tool support is left unverified.
+
+The probe SHALL be best-effort AND time-bounded: it SHALL NEVER block or fail startup, regardless of outcome. It SHALL skip `anthropic`/`google` registry entries (their `claude`/`agy` CLIs self-authenticate AND are known tool-capable, and no key is available to probe them) AND SHALL skip an `openai_compatible` entry with no resolvable config key (no way to authenticate the probe). Because the probe makes a network call, it is a startup-only behavior AND SHALL NOT be part of the side-effect-free `check-config` pipeline.
+
+#### Scenario: A toolless model is flagged at startup
+- **WHEN** the daemon starts with a `models:` registry entry for an `ollama` model whose endpoint answers the probe in prose without a tool call (OR rejects the tools request)
+- **THEN** the daemon emits a WARN-level log line identifying that model AND stating the agentic gates require tool calling
+- **AND** startup proceeds normally (the probe never blocks startup)
+
+#### Scenario: A tool-capable model logs an info line
+- **WHEN** the daemon starts with a registry `ollama`/`openai_compatible` model whose endpoint returns a tool call to the probe
+- **THEN** the daemon emits an INFO-level log line that the model is usable for agentic roles
+- **AND** no WARN is emitted for that model
+
+#### Scenario: An unreachable endpoint does not block startup
+- **WHEN** a probed model's endpoint cannot be reached (connection error or timeout) at startup
+- **THEN** the daemon emits a WARN-level "could not run" line for that model
+- **AND** the daemon continues startup and enters its normal polling state
+
+#### Scenario: CLI-self-authenticating providers are not probed
+- **WHEN** a `models:` registry entry's provider is `anthropic` or `google`
+- **THEN** the daemon does NOT probe it (the `claude`/`agy` CLIs self-authenticate AND are known tool-capable)
+
+#### Scenario: The probe is not part of check-config
+- **WHEN** an operator runs `autocoder check-config`
+- **THEN** no tool-capability probe is performed (check-config contacts no external service)
 

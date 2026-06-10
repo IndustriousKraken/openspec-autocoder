@@ -517,7 +517,12 @@ github:
 #   fast_local:
 #     provider: ollama
 #     model: qwen2.5-coder:32b
-#     api_base_url: http://localhost:11434
+#     # Full OpenAI-compatible base INCLUDING the path. A registry model drives an
+#     # agentic CLI (opencode), which appends `/chat/completions` to this base — so
+#     # a path-less base (`http://localhost:11434`) hits the wrong path and 404s.
+#     # Ollama serves the OpenAI-compatible API under /v1. (check-config WARNs on a
+#     # path-less openai_compatible/ollama base.)
+#     api_base_url: http://localhost:11434/v1
 #     # no api_key — Ollama does not authenticate
 #
 # With the registry above, a role can reference a nickname (no `provider:`)…

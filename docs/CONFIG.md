@@ -180,13 +180,24 @@ fields the per-subsystem blocks use, plus an optional `cli:` override:
 |---|---|---|---|
 | `provider` | yes | — | `anthropic`, `openai_compatible`, or `ollama`. Always inline on a registry entry (the nickname shorthand lives on the *referencing* block, not here). |
 | `model` | yes | — | Provider-specific model identifier. |
-| `api_base_url` | depends | provider default | Required for `openai_compatible` and `ollama`; optional for `anthropic` (defaults to `https://api.anthropic.com`). |
+| `api_base_url` | depends | provider default | Required for `openai_compatible` and `ollama`. Give the **full OpenAI-compatible base, including its path** — a registry model drives an agentic CLI (opencode), which appends `/chat/completions`, so a path-less base (e.g. `http://host:11434`) hits the wrong path and 404s. Use `http://host:11434/v1` for Ollama, `https://openrouter.ai/api/v1` for OpenRouter, etc. `check-config` WARNs on a path-less `openai_compatible`/`ollama` base. Optional for `anthropic` (defaults to `https://api.anthropic.com`). |
 | `api_key_env` / `api_key` | depends | _absent_ | Provider API key (env-var name, or inline `{ value: "..." }`). Required for `anthropic`/`openai_compatible`; **forbidden** for `ollama`. Inline wins over `api_key_env` (dual-set logs a WARN). |
 | `cli` | no | from `provider` | Overrides the default agentic CLI for this model (`claude` \| `opencode`). |
 
 Each entry is validated at config-load via the same per-provider auth rules
 as an inline block — e.g. an `ollama` entry with an `api_key` fails load even
 if no block references it.
+
+**Tool-capability probe (startup).** A registry model drives an agentic CLI, and
+the verifier gates / agentic reviewer require the model to emit **tool calls**
+(read the change, then call a `submit_*` tool). At startup the daemon sends one
+tool-calling probe to each `openai_compatible`/`ollama` registry endpoint and
+emits a `WARN` if the model can't return a tool call — so a model whose template
+lacks tool support (older families, abliterated finetunes) is flagged before it
+holds a change, rather than failing mid-run with an inscrutable cause. Confirm a
+candidate model first with `ollama show <model>` (its Capabilities should list
+`tools`). The probe is best-effort and never blocks startup; it is a network call,
+so it is not part of the side-effect-free `check-config`.
 
 ### Nickname references (omit `provider`)
 

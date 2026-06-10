@@ -3620,7 +3620,66 @@ pub fn validate_config(config: &Config) -> ValidationReport {
     check_audit_slugs(config, &mut report);
     check_path_collisions(config, &mut report);
     check_secret_sources(config, &mut report);
+    check_model_base_urls(config, &mut report);
     report
+}
+
+/// True when `url` has no path segment beyond the host[:port] — e.g.
+/// `http://host:11434` or `http://host:11434/` (a bare trailing slash). Used to
+/// flag an OpenAI-compatible base that is missing its path (commonly `/v1`).
+fn is_pathless_base(url: &str) -> bool {
+    let after_scheme = url
+        .trim()
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url.trim());
+    match after_scheme.split_once('/') {
+        None => true,
+        Some((_authority, path)) => path.trim_matches('/').is_empty(),
+    }
+}
+
+/// Advisory check: a registry model (which always drives an agentic CLI) whose
+/// OpenAI-compatible / Ollama `api_base_url` has no path segment. The agentic CLI
+/// (opencode) talks to these providers through the `@ai-sdk/openai-compatible`
+/// SDK, which POSTs to `<base>/chat/completions`; a path-less base hits the wrong
+/// path and the endpoint typically returns 404. Most OpenAI-compatible endpoints
+/// — Ollama's `/v1` included — serve under a path. A WARN, never an error: a few
+/// endpoints genuinely serve chat-completions at the root.
+fn check_model_base_urls(config: &Config, report: &mut ValidationReport) {
+    let Some(models) = &config.models else {
+        return;
+    };
+    for (name, entry) in models {
+        if !matches!(
+            entry.provider,
+            LlmProvider::OpenAiCompatible | LlmProvider::Ollama
+        ) {
+            continue;
+        }
+        let Some(base) = entry
+            .api_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if is_pathless_base(base) {
+            report.push_warn(
+                FindingCategory::Schema,
+                format!(
+                    "model `{name}` (provider {}): api_base_url `{base}` has no path segment. \
+                     The agentic CLI appends `/chat/completions`, so an OpenAI-compatible \
+                     endpoint usually needs the base to include its path — append `/v1` \
+                     (e.g. `{base}/v1`). A path-less base commonly returns 404; ignore this \
+                     only if your endpoint serves chat-completions at the root.",
+                    entry.provider.as_str()
+                ),
+                Some(format!("models/{name}/api_base_url")),
+            );
+        }
+    }
 }
 
 /// Schema check: required fields are non-empty and value-range invariants
@@ -5040,6 +5099,74 @@ github:
                 "executor.change_internal_contradiction_check is enabled but executor.change_internal_contradiction_check_llm is not configured"
             ),
             "expected fail-fast error message; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pathless_base_detection() {
+        // Path-less: host[:port] with no path, or only a trailing slash.
+        assert!(is_pathless_base("http://10.42.11.10:11434"));
+        assert!(is_pathless_base("http://10.42.11.10:11434/"));
+        assert!(is_pathless_base("10.42.11.10:11434")); // no scheme
+        // Has a path: not flagged.
+        assert!(!is_pathless_base("http://10.42.11.10:11434/v1"));
+        assert!(!is_pathless_base("https://api.openai.com/v1"));
+        assert!(!is_pathless_base("http://host:11434/v1/"));
+    }
+
+    #[test]
+    fn registry_pathless_openai_base_warns_not_errors() {
+        let yaml = r#"
+repositories:
+  - url: "git@github.com:owner/repo.git"
+    base_branch: main
+    agent_branch: agent-q
+    poll_interval_sec: 60
+executor:
+  kind: claude_cli
+github:
+  token:
+    value: ghp_test
+models:
+  pathless:
+    provider: ollama
+    model: qwen-aggressive:latest
+    api_base_url: http://10.42.11.10:11434
+  with_path:
+    provider: ollama
+    model: qwen:latest
+    api_base_url: http://10.42.11.10:11434/v1
+"#;
+        let (_dir, path) = write_config(yaml);
+        let cfg = Config::load_from(&path).expect("config parses");
+        let report = validate_config(&cfg);
+        // Advisory only — a path-less base must NOT block startup.
+        assert!(
+            !report.has_errors(),
+            "path-less base must not error: {:?}",
+            report.errors
+        );
+        // Exactly the path-less model is flagged, located by pointer.
+        let flagged: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|w| w.config_pointer.as_deref() == Some("models/pathless/api_base_url"))
+            .collect();
+        assert_eq!(
+            flagged.len(),
+            1,
+            "the path-less model warns: {:?}",
+            report.warnings
+        );
+        assert!(flagged[0].message.contains("/v1"), "warning suggests /v1");
+        // A base that already has a path is NOT flagged.
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.config_pointer.as_deref() == Some("models/with_path/api_base_url")),
+            "a base with a path is not flagged: {:?}",
+            report.warnings
         );
     }
 
