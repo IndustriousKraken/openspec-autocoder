@@ -563,6 +563,18 @@ At startup, `autocoder run` invokes `openspec --version` once. If the binary is 
 
 If you see `openspec preflight failed: binary not found on PATH`, add the install directory to the systemd unit's `Environment="PATH=..."` line (see [Deployment](DEPLOYMENT.md)).
 
+## Fork-setup failure degrades gracefully (per repo)
+
+In fork-PR mode (`github.fork_owner` set), autocoder ensures each configured repository has a reachable fork before spawning its polling task: it probes the derived fork URL with `git ls-remote`, creates a missing fork via the GitHub API, then polls (up to 60s) for reachability. A fork-setup failure for **one** repository — creation returns non-2xx (e.g. the PAT lacks fork permission, or upstream is inaccessible), or the fork is not reachable within the timeout — **no longer aborts the daemon**. Instead, autocoder:
+
+- records the failure and **skips that repository for the process lifetime** (no polling task is spawned for it — the same per-repo skip used when a fork URL cannot be derived);
+- emits a **ChatOps alert** naming the repository and the remedy (the alert is deliverable because the ChatOps backend is initialized before fork setup runs);
+- continues setting up and serving **every other repository AND ChatOps**.
+
+The daemon never exits non-zero for a per-repo fork-setup failure — even if *every* configured repository fails fork setup, it stays up (serving ChatOps, having emitted one alert per failed repo) so an operator can remediate. A common trigger is an upstream rename: GitHub keeps one fork per network under its original name, so the derived (renamed) fork URL probes as "created but not reachable within 60s".
+
+**Recovery:** fix the fork (ensure it exists under `fork_owner` and is reachable at the derived URL), then **restart or `reload`** the daemon. On the next start/reload the skipped repository passes the per-repo startup check and its polling task is spawned. (No daemon downtime is needed for the *other* repositories — only the previously-skipped repo needs the restart/reload to re-enter the polling set.)
+
 ## Fork recreation on workspace reinitialization
 
 The default workspace-deleted recovery (see [Workspace directory deleted](#workspace-directory-deleted)) preserves whatever state lives on the fork. That is the right behavior when you have open PRs from that fork — losing their head refs would close the PRs. But the same preservation is a liability when the fork has accumulated stale branches no one cares about, or when the fork's state is genuinely worthless and you'd rather start from a pristine mirror of upstream.

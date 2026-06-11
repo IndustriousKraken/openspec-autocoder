@@ -29,6 +29,7 @@ use crate::github_credentials::resolve_token_with_source;
 use crate::{alert_state_migration, git, migration, paths, polling_loop, workspace};
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -199,7 +200,53 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
             "github.recreate_fork_on_reinit is true but fork_owner is unset; flag will have no effect"
         );
     }
-    ensure_forks_exist(&cfg.github, &cfg.repositories).await?;
+
+    // Initialize the ChatOps outbound backend BEFORE per-repo fork setup so a
+    // fork-setup failure is reportable via a chatops alert — the alert path
+    // requires a live backend, and a per-repo fork-setup failure degrades to
+    // skip-for-lifetime + alert rather than aborting startup. (This block was
+    // historically built later; it is hoisted here so the backend exists
+    // before `ensure_forks_exist` runs.)
+    let chatops_initial: Option<ChatOpsSlot> = match cfg.chatops.as_ref() {
+        Some(co) => {
+            let backend = chatops::from_config(co)
+                .await
+                .context("initializing chatops backend from config")?;
+            emit_chatops_startup_log(backend.provider_name(), backend.is_experimental());
+            Some(ChatOpsSlot {
+                backend,
+                default_channel_id: co.default_channel_id.clone(),
+                start_work_enabled: NotificationsConfig::start_work_enabled(Some(co)),
+                failure_alerts_enabled: NotificationsConfig::failure_alerts_enabled(Some(co)),
+                pr_opened_enabled: NotificationsConfig::pr_opened_enabled(Some(co)),
+            })
+        }
+        None => {
+            tracing::info!("ChatOps escalation disabled (no chatops: config block)");
+            None
+        }
+    };
+
+    // Lifecycle signal: post a one-line version + repo-count notification
+    // before any polling task starts (and before the fork-setup alerts below,
+    // so the operator sees "started" first). Independent of `notifications.*`
+    // flags. Suppressed (with a journalctl-bound INFO log) when no chatops
+    // backend is configured.
+    dispatch_startup_notification(chatops_initial.as_ref(), cfg.repositories.len()).await;
+
+    // Per-repo fork setup (fork-PR mode). A per-repo failure — fork URL
+    // underivable, PAT unresolvable, creation non-2xx, OR the fork not
+    // reachable within the timeout — NO LONGER aborts startup: each failure is
+    // recorded AND returned, the daemon emits one chatops alert per failed
+    // repository, AND those repositories are skipped for the process lifetime
+    // (no polling task spawned) — the same per-repo skip the
+    // fork-URL-derivation path already uses. Every reachable repository AND
+    // chatops keep running; even an all-repos-fail boot stays up so an operator
+    // can remediate (fix the fork, then restart or reload).
+    let fork_failures = ensure_forks_exist(&cfg.github, &cfg.repositories).await;
+    alert_fork_setup_failures(chatops_initial.as_ref(), &cfg.repositories, &fork_failures).await;
+    let forks_skipped_for_lifetime: std::collections::HashSet<String> =
+        fork_failures.iter().map(|f| f.repo_url.clone()).collect();
 
     let executor: Arc<dyn Executor> = match cfg.executor.kind {
         ExecutorKind::ClaudeCli => Arc::new(
@@ -499,32 +546,6 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     };
 
-    let chatops_initial: Option<ChatOpsSlot> = match cfg.chatops.as_ref() {
-        Some(co) => {
-            let backend = chatops::from_config(co)
-                .await
-                .context("initializing chatops backend from config")?;
-            emit_chatops_startup_log(backend.provider_name(), backend.is_experimental());
-            Some(ChatOpsSlot {
-                backend,
-                default_channel_id: co.default_channel_id.clone(),
-                start_work_enabled: NotificationsConfig::start_work_enabled(Some(co)),
-                failure_alerts_enabled: NotificationsConfig::failure_alerts_enabled(Some(co)),
-                pr_opened_enabled: NotificationsConfig::pr_opened_enabled(Some(co)),
-            })
-        }
-        None => {
-            tracing::info!("ChatOps escalation disabled (no chatops: config block)");
-            None
-        }
-    };
-
-    // Lifecycle signal: post a one-line version + repo-count notification
-    // before any polling task starts. Independent of `notifications.*`
-    // flags. Suppressed (with a journalctl-bound INFO log) when no chatops
-    // backend is configured.
-    dispatch_startup_notification(chatops_initial.as_ref(), cfg.repositories.len()).await;
-
     // Hot-swappable holders. The control socket swaps into these on
     // `autocoder reload`; the polling loops read snapshots once per pass.
     let github_holder: GithubHolder = Arc::new(ArcSwap::from_pointee(cfg.github.clone()));
@@ -782,6 +803,19 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
     });
 
     for repo in cfg.repositories.iter().cloned() {
+        // Skip repositories whose fork setup failed: they were recorded by
+        // `ensure_forks_exist`, already alerted via chatops, AND are skipped
+        // for the process lifetime (no polling task). The daemon keeps serving
+        // every other repository AND chatops; recovery is to fix the fork, then
+        // restart or reload.
+        if forks_skipped_for_lifetime.contains(&repo.url) {
+            tracing::warn!(
+                url = %repo.url,
+                "skipping repository for the process lifetime: fork setup failed at startup \
+                 (chatops alert emitted; fix the fork, then restart or reload to recover)"
+            );
+            continue;
+        }
         match spawn_repo(repo) {
             SpawnOutcome::Spawned => {}
             SpawnOutcome::AlreadyPresent => {
@@ -1531,91 +1565,253 @@ pub fn validate_github_token_routes(
     Ok(())
 }
 
+/// A single repository's fork-setup failure. Recorded (instead of aborting
+/// startup) so the daemon can skip the repository for the process lifetime
+/// AND emit a chatops alert while every other repository keeps running.
+/// Carries the upstream URL, the expected fork URL (absent only when the
+/// fork URL could not be derived), AND a one-line cause.
+#[derive(Debug, Clone)]
+pub struct ForkSetupFailure {
+    /// The configured upstream repository URL.
+    pub repo_url: String,
+    /// The derived fork URL the daemon expected to reach. `None` when the
+    /// failure occurred before a fork URL could be derived.
+    pub fork_url: Option<String>,
+    /// One-line cause: the HTTP status + body snippet for creation failures,
+    /// the reachability-timeout message, or the derive/PAT-resolution error.
+    pub cause: String,
+}
+
+/// Abstraction over the two network operations fork setup performs, so the
+/// per-repo policy (probe → create → poll → record-or-continue) is
+/// unit-testable without real GitHub access. Production uses
+/// [`GithubForkProvisioner`]; tests inject a fake.
+#[async_trait]
+trait ForkProvisioner: Send + Sync {
+    /// Probe whether the fork at `fork_url` is reachable (one `git ls-remote`).
+    async fn probe_reachable(&self, fork_url: &str) -> bool;
+    /// Create the fork via the GitHub fork API. `Err` carries the cause
+    /// (HTTP status + truncated body snippet).
+    async fn create_fork(
+        &self,
+        upstream_owner: &str,
+        upstream_repo: &str,
+        token: &str,
+    ) -> Result<()>;
+}
+
+/// Production [`ForkProvisioner`]: a real `git ls-remote` probe AND a real
+/// GitHub fork-creation POST.
+struct GithubForkProvisioner;
+
+#[async_trait]
+impl ForkProvisioner for GithubForkProvisioner {
+    async fn probe_reachable(&self, fork_url: &str) -> bool {
+        crate::git::ls_remote_head(fork_url).is_ok()
+    }
+    async fn create_fork(
+        &self,
+        upstream_owner: &str,
+        upstream_repo: &str,
+        token: &str,
+    ) -> Result<()> {
+        crate::github::create_fork(upstream_owner, upstream_repo, token).await
+    }
+}
+
 /// When fork-PR mode is active, ensure each configured repository has a
 /// reachable fork at the derived URL. Missing forks are created via the
 /// GitHub REST API, then probed via `git ls-remote` with a 60-second
-/// timeout. Aggregates failures into a single startup error.
+/// timeout.
+///
+/// A per-repo fork-setup failure — fork URL underivable, PAT unresolvable,
+/// creation non-2xx, OR the fork not reachable within the timeout — is
+/// RECORDED and RETURNED, never fatal. The caller skips each returned
+/// repository for the process lifetime AND emits a chatops alert, then
+/// continues serving every other repository. The returned `Vec` is empty
+/// when every configured fork is reachable (or fork-PR mode is off).
 pub async fn ensure_forks_exist(
     github: &GithubConfig,
     repos: &[RepositoryConfig],
-) -> Result<()> {
+) -> Vec<ForkSetupFailure> {
+    ensure_forks_exist_with(
+        github,
+        repos,
+        &GithubForkProvisioner,
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(2),
+    )
+    .await
+}
+
+/// Inner fork-setup policy, generic over the [`ForkProvisioner`] AND the
+/// reachability poll timeout/interval so the per-repo skip-and-record
+/// behavior is unit-testable without real network access. Never returns an
+/// error: every per-repo failure is appended to the returned `Vec` and
+/// processing continues with the next repository.
+async fn ensure_forks_exist_with(
+    github: &GithubConfig,
+    repos: &[RepositoryConfig],
+    provisioner: &dyn ForkProvisioner,
+    poll_timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Vec<ForkSetupFailure> {
+    let mut failures: Vec<ForkSetupFailure> = Vec::new();
     let Some(fork_owner) = github.fork_owner.as_deref() else {
-        return Ok(());
+        return failures;
     };
-    let mut failures: Vec<String> = Vec::new();
     for repo in repos {
         let fork_url = match crate::github::derive_fork_url(&repo.url, fork_owner) {
             Ok(u) => u,
             Err(e) => {
-                failures.push(format!("repo `{}`: {e:#}", repo.url));
+                failures.push(ForkSetupFailure {
+                    repo_url: repo.url.clone(),
+                    fork_url: None,
+                    cause: format!("{e:#}"),
+                });
                 continue;
             }
         };
         // Quick probe: if the fork is already there, do nothing.
-        if crate::git::ls_remote_head(&fork_url).is_ok() {
+        if provisioner.probe_reachable(&fork_url).await {
             continue;
         }
         // Missing fork → POST to GitHub.
         let (upstream_owner, upstream_repo) = match parse_repo_url(&repo.url) {
             Ok(t) => t,
             Err(e) => {
-                failures.push(format!("repo `{}`: {e:#}", repo.url));
+                failures.push(ForkSetupFailure {
+                    repo_url: repo.url.clone(),
+                    fork_url: Some(fork_url),
+                    cause: format!("{e:#}"),
+                });
                 continue;
             }
         };
         let token = match resolve_token_with_source(github, &upstream_owner) {
             Ok((tok, _src)) => tok,
             Err(e) => {
-                failures.push(format!("repo `{}`: cannot resolve PAT for fork creation: {e:#}", repo.url));
+                failures.push(ForkSetupFailure {
+                    repo_url: repo.url.clone(),
+                    fork_url: Some(fork_url),
+                    cause: format!("cannot resolve PAT for fork creation: {e:#}"),
+                });
                 continue;
             }
         };
-        tracing::info!(
-            "creating fork for {} → {fork_url}",
-            repo.url
-        );
-        if let Err(e) =
-            crate::github::create_fork(&upstream_owner, &upstream_repo, &token).await
+        tracing::info!("creating fork for {} → {fork_url}", repo.url);
+        if let Err(e) = provisioner
+            .create_fork(&upstream_owner, &upstream_repo, &token)
+            .await
         {
-            failures.push(format!(
-                "repo `{}`: fork creation POST failed: {e:#}",
-                repo.url
-            ));
+            failures.push(ForkSetupFailure {
+                repo_url: repo.url.clone(),
+                fork_url: Some(fork_url),
+                cause: format!("fork creation POST failed: {e:#}"),
+            });
             continue;
         }
-        // Poll until reachable, up to 60 seconds.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        // Poll until reachable, up to the timeout.
+        let deadline = std::time::Instant::now() + poll_timeout;
         let mut reachable = false;
         tracing::info!(
-            "waiting for fork `{fork_url}` to become reachable (up to 60s)"
+            "waiting for fork `{fork_url}` to become reachable (up to {}s)",
+            poll_timeout.as_secs()
         );
         while std::time::Instant::now() < deadline {
-            if crate::git::ls_remote_head(&fork_url).is_ok() {
+            if provisioner.probe_reachable(&fork_url).await {
                 reachable = true;
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(poll_interval).await;
         }
         if reachable {
-            tracing::info!(
-                "created fork {fork_url} from upstream {}",
-                repo.url
-            );
+            tracing::info!("created fork {fork_url} from upstream {}", repo.url);
         } else {
-            failures.push(format!(
-                "repo `{}`: fork creation succeeded but `{fork_url}` was not reachable within 60s",
-                repo.url
-            ));
+            failures.push(ForkSetupFailure {
+                repo_url: repo.url.clone(),
+                fork_url: Some(fork_url.clone()),
+                cause: format!(
+                    "fork creation succeeded but the fork at `{fork_url}` was not reachable within {}s",
+                    poll_timeout.as_secs()
+                ),
+            });
         }
     }
-    if !failures.is_empty() {
-        return Err(anyhow!(
-            "fork-PR mode: {} repository(ies) could not be set up under `{fork_owner}`:\n  - {}",
-            failures.len(),
-            failures.join("\n  - ")
-        ));
+    failures
+}
+
+/// Compose the chatops alert text for a single fork-setup failure. Names the
+/// repository, the cause, AND a brief remedy hint (ensure the fork exists and
+/// is reachable, then restart or reload). The fork URL is included when known.
+pub fn fork_setup_alert_message(
+    repo_url: &str,
+    fork_url: Option<&str>,
+    cause: &str,
+) -> String {
+    let fork_clause = match fork_url {
+        Some(u) => format!("the fork `{u}`"),
+        None => "the fork".to_string(),
+    };
+    format!(
+        "⚠️ `{repo_url}`: fork setup failed — this repository is skipped for the \
+         process lifetime; every other repository and chatops keep running. \
+         Cause: {cause}. Remedy: ensure {fork_clause} exists and is reachable, then \
+         restart or reload autocoder to recover."
+    )
+}
+
+/// Resolve the chatops channel for a per-repo alert: the repository's own
+/// `chatops_channel_id` when set AND non-empty, otherwise the default channel.
+fn resolve_alert_channel<'a>(
+    repos: &'a [RepositoryConfig],
+    repo_url: &str,
+    default_channel: &'a str,
+) -> &'a str {
+    repos
+        .iter()
+        .find(|r| r.url == repo_url)
+        .and_then(|r| r.chatops_channel_id.as_deref())
+        .filter(|c| !c.is_empty())
+        .unwrap_or(default_channel)
+}
+
+/// Emit one chatops alert per fork-setup failure through the standard
+/// outbound notification path. Best-effort: a failed post logs at WARN and
+/// never blocks startup. When no chatops backend is configured, each failure
+/// is logged at ERROR so operators still have a journal signal. This is a
+/// startup-degradation lifecycle signal (like the version notification) and
+/// is NOT gated by `notifications.failure_alerts` — without it the operator
+/// has no indication a repository was silently skipped.
+pub async fn alert_fork_setup_failures(
+    chatops: Option<&ChatOpsSlot>,
+    repos: &[RepositoryConfig],
+    failures: &[ForkSetupFailure],
+) {
+    if failures.is_empty() {
+        return;
     }
-    Ok(())
+    let Some(slot) = chatops else {
+        for f in failures {
+            tracing::error!(
+                url = %f.repo_url,
+                "fork setup failed and no chatops backend is configured to alert; \
+                 repository skipped for the process lifetime: {}",
+                f.cause
+            );
+        }
+        return;
+    };
+    for f in failures {
+        let channel = resolve_alert_channel(repos, &f.repo_url, &slot.default_channel_id);
+        let text = fork_setup_alert_message(&f.repo_url, f.fork_url.as_deref(), &f.cause);
+        if let Err(e) = slot.backend.post_notification(channel, &text).await {
+            tracing::warn!(
+                url = %f.repo_url,
+                "fork-setup-failure chatops alert failed; continuing: {e:#}"
+            );
+        }
+    }
 }
 
 /// Initialize the workspace and check for a dirty working tree. Returns
@@ -1914,18 +2110,20 @@ mod tests {
             recreate_fork_on_reinit: false,
             command_authorization: Default::default(),
         };
-        // No repos to validate; no fork_owner means the function returns Ok
-        // without probing anything.
+        // No fork_owner means the function returns an empty failure list
+        // without probing anything → every repo spawns.
         let repos = vec![repo("git@github.com:any/repo.git")];
-        ensure_forks_exist(&github, &repos)
-            .await
-            .expect("direct-push mode skips fork probing");
+        let failures = ensure_forks_exist(&github, &repos).await;
+        assert!(
+            failures.is_empty(),
+            "direct-push mode records no fork-setup failures"
+        );
     }
 
     #[tokio::test]
-    async fn ensure_forks_exist_errors_on_unsupported_url_scheme() {
+    async fn ensure_forks_exist_records_failure_on_unsupported_url_scheme() {
         // Non-github URL combined with fork-PR mode → derive_fork_url
-        // rejects → validation aggregates the failure.
+        // rejects → recorded as a per-repo failure (NOT a fatal error).
         let github = GithubConfig {
             token_env: "X".into(),
             token: None,
@@ -1935,13 +2133,411 @@ mod tests {
             command_authorization: Default::default(),
         };
         let repos = vec![repo("ssh://git@github.com/upstream/repo.git")];
-        let err = ensure_forks_exist(&github, &repos)
-            .await
-            .expect_err("unsupported URL scheme must error in fork mode");
-        let msg = format!("{err:#}");
+        let failures = ensure_forks_exist(&github, &repos).await;
+        assert_eq!(
+            failures.len(),
+            1,
+            "unsupported URL in fork mode → one recorded failure (not fatal)"
+        );
+        assert_eq!(failures[0].repo_url, "ssh://git@github.com/upstream/repo.git");
         assert!(
-            msg.contains("upstream/repo.git"),
-            "error must name the offending URL; got: {msg}"
+            failures[0].fork_url.is_none(),
+            "fork URL underivable → None"
+        );
+        assert!(
+            failures[0].cause.contains("repo"),
+            "cause names the offending URL; got: {}",
+            failures[0].cause
+        );
+    }
+
+    // ====================================================================
+    // fork-setup graceful-degradation tests
+    // (fork-setup-failure-degrades-gracefully)
+    // ====================================================================
+
+    use crate::config::SecretSource;
+    use std::collections::HashSet;
+
+    /// GitHub config in fork-PR mode with an inline token so
+    /// `resolve_token_with_source` succeeds and fork setup reaches the
+    /// create step.
+    fn github_fork_mode(fork_owner: &str) -> GithubConfig {
+        GithubConfig {
+            token_env: "X".into(),
+            token: Some(SecretSource::Inline {
+                value: "test-token".into(),
+            }),
+            owner_tokens: None,
+            fork_owner: Some(fork_owner.into()),
+            recreate_fork_on_reinit: false,
+            command_authorization: Default::default(),
+        }
+    }
+
+    /// Configurable fake [`ForkProvisioner`] so the per-repo skip-and-record
+    /// policy is exercised without real GitHub access.
+    #[derive(Default)]
+    struct FakeProvisioner {
+        /// Used to reconstruct the fork URL inside `create_fork`.
+        fork_owner: String,
+        /// Fork URLs reachable on the first probe (no creation needed).
+        reachable_now: HashSet<String>,
+        /// "owner/repo" keys whose `create_fork` returns `Err`.
+        create_returns_err: HashSet<String>,
+        /// Fork URLs that become reachable after a successful `create_fork`.
+        reachable_after_create: HashSet<String>,
+        /// Observed `create_fork` calls as "owner/repo".
+        create_calls: Mutex<Vec<String>>,
+        /// Fork URLs marked reachable because `create_fork` succeeded.
+        created_reachable: Mutex<HashSet<String>>,
+    }
+
+    #[async_trait]
+    impl ForkProvisioner for FakeProvisioner {
+        async fn probe_reachable(&self, fork_url: &str) -> bool {
+            self.reachable_now.contains(fork_url)
+                || self.created_reachable.lock().unwrap().contains(fork_url)
+        }
+        async fn create_fork(
+            &self,
+            upstream_owner: &str,
+            upstream_repo: &str,
+            _token: &str,
+        ) -> Result<()> {
+            let key = format!("{upstream_owner}/{upstream_repo}");
+            self.create_calls.lock().unwrap().push(key.clone());
+            if self.create_returns_err.contains(&key) {
+                return Err(anyhow!("github fork POST {key} returned 404 Not Found"));
+            }
+            let fork_url = format!("git@github.com:{}/{upstream_repo}.git", self.fork_owner);
+            if self.reachable_after_create.contains(&fork_url) {
+                self.created_reachable.lock().unwrap().insert(fork_url);
+            }
+            Ok(())
+        }
+    }
+
+    fn set_of<const N: usize>(items: [&str; N]) -> HashSet<String> {
+        items.into_iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Happy path (3.3): every fork already reachable → no failures AND no
+    /// fork-creation POSTs.
+    #[tokio::test]
+    async fn fork_setup_all_reachable_records_nothing_and_creates_nothing() {
+        let github = github_fork_mode("bot");
+        let repos = vec![
+            repo("git@github.com:up/alpha.git"),
+            repo("git@github.com:up/beta.git"),
+        ];
+        let prov = FakeProvisioner {
+            fork_owner: "bot".into(),
+            reachable_now: set_of([
+                "git@github.com:bot/alpha.git",
+                "git@github.com:bot/beta.git",
+            ]),
+            ..Default::default()
+        };
+        let failures = ensure_forks_exist_with(
+            &github,
+            &repos,
+            &prov,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(failures.is_empty(), "all reachable → no failures");
+        assert!(
+            prov.create_calls.lock().unwrap().is_empty(),
+            "no fork-creation POSTs when every fork already exists"
+        );
+    }
+
+    /// Happy path (3.3): a fork is created and becomes reachable → no failure,
+    /// create attempted exactly once.
+    #[tokio::test]
+    async fn fork_setup_create_then_reachable_records_no_failure() {
+        let github = github_fork_mode("bot");
+        let repos = vec![repo("git@github.com:up/gamma.git")];
+        let prov = FakeProvisioner {
+            fork_owner: "bot".into(),
+            reachable_after_create: set_of(["git@github.com:bot/gamma.git"]),
+            ..Default::default()
+        };
+        let failures = ensure_forks_exist_with(
+            &github,
+            &repos,
+            &prov,
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(failures.is_empty(), "created + reachable → no failure");
+        assert_eq!(
+            prov.create_calls.lock().unwrap().as_slice(),
+            &["up/gamma".to_string()]
+        );
+    }
+
+    /// 3.1: one repo's fork setup fails AND another's succeeds → only the
+    /// failed repo is recorded; the reachable repo is absent from the skip
+    /// set (its polling task spawns); no fatal error (returns a `Vec`).
+    #[tokio::test]
+    async fn fork_setup_one_fails_one_succeeds_records_only_the_failure() {
+        let github = github_fork_mode("bot");
+        let repos = vec![
+            repo("git@github.com:up/ok.git"),
+            repo("git@github.com:up/broken.git"),
+        ];
+        let prov = FakeProvisioner {
+            fork_owner: "bot".into(),
+            reachable_now: set_of(["git@github.com:bot/ok.git"]),
+            create_returns_err: set_of(["up/broken"]),
+            ..Default::default()
+        };
+        let failures = ensure_forks_exist_with(
+            &github,
+            &repos,
+            &prov,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(failures.len(), 1, "exactly one failure recorded");
+        assert_eq!(failures[0].repo_url, "git@github.com:up/broken.git");
+        assert_eq!(
+            failures[0].fork_url.as_deref(),
+            Some("git@github.com:bot/broken.git")
+        );
+        assert!(
+            failures[0].cause.contains("fork creation POST failed"),
+            "cause names the POST failure: {}",
+            failures[0].cause
+        );
+        // The reachable repo was never created; only the broken one was tried.
+        let calls = prov.create_calls.lock().unwrap();
+        assert!(calls.contains(&"up/broken".to_string()));
+        assert!(!calls.contains(&"up/ok".to_string()));
+        drop(calls);
+        // The skip set (as `execute` builds it) excludes the reachable repo.
+        let skip: HashSet<String> = failures.iter().map(|f| f.repo_url.clone()).collect();
+        assert!(skip.contains("git@github.com:up/broken.git"));
+        assert!(!skip.contains("git@github.com:up/ok.git"));
+    }
+
+    /// 3.1: fork created but never reachable within the timeout → recorded
+    /// with the reachability-timeout cause; create attempted once.
+    #[tokio::test]
+    async fn fork_setup_created_but_unreachable_records_timeout_failure() {
+        let github = github_fork_mode("bot");
+        let repos = vec![repo("git@github.com:up/slow.git")];
+        let prov = FakeProvisioner {
+            fork_owner: "bot".into(),
+            // create succeeds but the fork is never reachable.
+            ..Default::default()
+        };
+        let failures = ensure_forks_exist_with(
+            &github,
+            &repos,
+            &prov,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].cause.contains("not reachable within"),
+            "cause: {}",
+            failures[0].cause
+        );
+        assert_eq!(
+            prov.create_calls.lock().unwrap().len(),
+            1,
+            "create attempted once"
+        );
+    }
+
+    /// 3.2: every repo's fork setup fails → one failure per repo, processing
+    /// continued past each failure, and the function returns a `Vec` (never
+    /// `Err`) so the daemon does not exit.
+    #[tokio::test]
+    async fn fork_setup_every_repo_fails_records_one_failure_each() {
+        let github = github_fork_mode("bot");
+        let repos = vec![
+            repo("git@github.com:up/one.git"),
+            repo("git@github.com:up/two.git"),
+            repo("git@github.com:up/three.git"),
+        ];
+        let prov = FakeProvisioner {
+            fork_owner: "bot".into(),
+            create_returns_err: set_of(["up/one", "up/two", "up/three"]),
+            ..Default::default()
+        };
+        let failures = ensure_forks_exist_with(
+            &github,
+            &repos,
+            &prov,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(failures.len(), 3, "one failure per failed repo");
+        assert_eq!(
+            prov.create_calls.lock().unwrap().len(),
+            3,
+            "processing continued past each failure (all three attempted)"
+        );
+    }
+
+    /// A `ChatOpsBackend` that records every `post_notification` call so the
+    /// alert path can be asserted.
+    struct RecordingBackend {
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingBackend {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::chatops::ChatOpsBackend for RecordingBackend {
+        fn provider_name(&self) -> &'static str {
+            "recording"
+        }
+        fn is_experimental(&self) -> bool {
+            true
+        }
+        async fn post_question(
+            &self,
+            _channel: &str,
+            _change: &str,
+            _question: &str,
+        ) -> Result<String> {
+            unreachable!()
+        }
+        async fn poll_thread_for_human_reply(
+            &self,
+            _channel: &str,
+            _handle: &str,
+        ) -> Result<Option<crate::chatops::HumanReply>> {
+            unreachable!()
+        }
+        async fn post_notification(&self, channel: &str, text: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((channel.to_string(), text.to_string()));
+            Ok(())
+        }
+    }
+
+    fn slot_with(
+        backend: Arc<dyn crate::chatops::ChatOpsBackend>,
+        default_channel: &str,
+    ) -> ChatOpsSlot {
+        ChatOpsSlot {
+            backend,
+            default_channel_id: default_channel.into(),
+            start_work_enabled: true,
+            failure_alerts_enabled: true,
+            pr_opened_enabled: true,
+        }
+    }
+
+    /// 2.1 / 3.1 / 3.2: one alert per failure, routed to the per-repo channel
+    /// when set (else the default), each naming the repo AND a remedy hint.
+    #[tokio::test]
+    async fn alert_fork_setup_failures_posts_one_alert_per_failure() {
+        let backend = Arc::new(RecordingBackend::new());
+        let slot = slot_with(backend.clone(), "C_DEFAULT");
+        let mut r1 = repo("git@github.com:up/alpha.git");
+        r1.chatops_channel_id = Some("C_ALPHA".into());
+        let r2 = repo("git@github.com:up/beta.git"); // no per-repo channel
+        let repos = vec![r1, r2];
+        let failures = vec![
+            ForkSetupFailure {
+                repo_url: "git@github.com:up/alpha.git".into(),
+                fork_url: Some("git@github.com:bot/alpha.git".into()),
+                cause: "fork creation POST failed: 404".into(),
+            },
+            ForkSetupFailure {
+                repo_url: "git@github.com:up/beta.git".into(),
+                fork_url: None,
+                cause: "could not derive fork URL".into(),
+            },
+        ];
+        alert_fork_setup_failures(Some(&slot), &repos, &failures).await;
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "one alert per failure");
+        // alpha → per-repo channel; names repo + fork URL + remedy.
+        assert_eq!(calls[0].0, "C_ALPHA");
+        assert!(calls[0].1.contains("up/alpha.git"));
+        assert!(calls[0].1.contains("bot/alpha.git"));
+        assert!(calls[0].1.contains("restart or reload"));
+        // beta → default channel; no fork URL clause but still has remedy.
+        assert_eq!(calls[1].0, "C_DEFAULT");
+        assert!(calls[1].1.contains("up/beta.git"));
+        assert!(calls[1].1.contains("restart or reload"));
+    }
+
+    /// With no chatops backend configured, the alert path is a no-op (logs to
+    /// the journal) and never panics.
+    #[tokio::test]
+    async fn alert_fork_setup_failures_no_chatops_is_noop() {
+        let repos = vec![repo("git@github.com:up/alpha.git")];
+        let failures = vec![ForkSetupFailure {
+            repo_url: "git@github.com:up/alpha.git".into(),
+            fork_url: None,
+            cause: "x".into(),
+        }];
+        alert_fork_setup_failures(None, &repos, &failures).await;
+    }
+
+    #[test]
+    fn fork_setup_alert_message_names_repo_and_remedy() {
+        let with_fork = fork_setup_alert_message(
+            "git@github.com:up/r.git",
+            Some("git@github.com:bot/r.git"),
+            "boom",
+        );
+        assert!(with_fork.contains("up/r.git"));
+        assert!(with_fork.contains("bot/r.git"));
+        assert!(with_fork.contains("boom"));
+        assert!(with_fork.contains("restart or reload"));
+        let without_fork =
+            fork_setup_alert_message("git@github.com:up/r.git", None, "boom");
+        assert!(without_fork.contains("up/r.git"));
+        assert!(without_fork.contains("restart or reload"));
+    }
+
+    #[test]
+    fn resolve_alert_channel_prefers_repo_channel() {
+        let mut r1 = repo("git@github.com:up/a.git");
+        r1.chatops_channel_id = Some("C_A".into());
+        let mut r2 = repo("git@github.com:up/b.git");
+        r2.chatops_channel_id = Some(String::new()); // empty → default
+        let r3 = repo("git@github.com:up/c.git"); // none → default
+        let repos = vec![r1, r2, r3];
+        assert_eq!(
+            resolve_alert_channel(&repos, "git@github.com:up/a.git", "DEF"),
+            "C_A"
+        );
+        assert_eq!(
+            resolve_alert_channel(&repos, "git@github.com:up/b.git", "DEF"),
+            "DEF"
+        );
+        assert_eq!(
+            resolve_alert_channel(&repos, "git@github.com:up/c.git", "DEF"),
+            "DEF"
+        );
+        assert_eq!(
+            resolve_alert_channel(&repos, "git@github.com:up/missing.git", "DEF"),
+            "DEF"
         );
     }
 
