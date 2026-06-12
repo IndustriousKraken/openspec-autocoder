@@ -44,6 +44,7 @@ pub fn resolve_paths_from_env() -> Result<crate::paths::DaemonPaths> {
                 crate::config::ContradictionCheckMode::Disabled,
             code_implements_spec_check_prompt_path: None,
             code_implements_spec_check_llm: None,
+            verifier_gate_retries: crate::config::default_verifier_gate_retries(),
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,

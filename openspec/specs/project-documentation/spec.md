@@ -42,9 +42,11 @@ The reference is NOT a user-facing spec — it does not describe runtime behavio
 - **AND** the report MAY note that the originally-named test was unlocatable, so future operators don't reopen the same investigation looking for the same ghost
 
 ### Requirement: config.example.yaml is the canonical operator reference for the YAML schema
-The repository SHALL maintain `config.example.yaml` at the repo root as the operator-facing reference for every configurable field accepted by `Config` and its nested types. Every YAML-deserializable field — including fields whose default behavior makes them safe to omit — SHALL appear in the example, either as an active default value or as a commented annotation explaining what it does and what values are accepted. When a change ships a new configurable field, the change's commit MUST also update `config.example.yaml` so the example never lags the schema.
+The repository SHALL maintain `config.example.yaml` at the repo root as the operator-facing reference for every configurable field accepted by `Config` and its nested types. Every YAML-deserializable field — including fields whose default behavior makes them safe to omit — SHALL appear in the example, either as an active default value or as a commented annotation explaining what it does and what values are accepted, EXCEPT a field marked **deprecated** in the source. When a change ships a new configurable field, the change's commit MUST also update `config.example.yaml` so the example never lags the schema.
 
-A CI-enforceable check (typically a unit test under `config::tests`) SHALL fail when a documented field name does not appear as a substring in the example file. This catches omissions at build time rather than at operator-onboarding time.
+A field marked deprecated in the source (a `DEPRECATED:` doc comment on the field) is **intentionally absent** from the operator-facing surfaces: it SHALL be removed from `config.example.yaml` AND from `docs/CONFIG.md`, so those references carry no cruft. A deprecated field SHALL remain **accepted by the deserializer AND honored** (no behavior change) so existing configs do not break; it is simply no longer advertised. New operators are steered to the supported alternative in the relevant docs section.
+
+A CI-enforceable check (typically a unit test under `config::tests`) SHALL fail when a NON-deprecated documented field name does not appear as a substring in the example file. This catches omissions at build time rather than at operator-onboarding time. A deprecated field is NOT required to appear; when its name is not shared with a live field, it SHALL be removed from the check's field-name list (when the name is still live via another field, it MAY remain).
 
 #### Scenario: Adding a new configurable field
 - **WHEN** an implementing agent adds a new YAML-deserializable field
@@ -91,6 +93,12 @@ A CI-enforceable check (typically a unit test under `config::tests`) SHALL fail 
 - **AND** each nested field within the commented block SHALL appear
   at least once so an operator who uncomments the block sees every
   knob the feature exposes
+
+#### Scenario: A deprecated field is undocumented
+- **WHEN** a configurable field is marked deprecated in the source (a `DEPRECATED:` doc comment)
+- **THEN** it is removed from `config.example.yaml` AND from `docs/CONFIG.md`, so neither operator-facing reference advertises it
+- **AND** it remains accepted by the deserializer AND honored at runtime, so an existing config that sets it does NOT break
+- **AND** the coverage test does NOT require it to appear in the example (it is removed from the field-name list unless the name is still live via another, non-deprecated field)
 
 ### Requirement: Install script is a thin bootstrap for `autocoder install`
 The repository SHALL ship `install.sh` at the repo root as a minimal bootstrap (target ≤ 80 lines including comments) whose sole responsibilities are: detect OS + architecture, resolve a binary version (default latest production tag from the GitHub Releases API; overridable via `--version` flag or `AUTOCODER_VERSION` env var), download the binary and its SHA-256 checksum, verify the checksum, place the binary on PATH, and `exec autocoder install "$@"`. All wizard logic, system-user creation, config generation, systemd unit rendering, and optional Claude-CLI bootstrap SHALL live in the `autocoder install` subcommand (a tested Rust subcommand), NOT in bash.
@@ -625,7 +633,7 @@ The rule prevents two failure modes: (a) test fixtures leaking into production s
 - **AND** the section cross-links back to OPERATIONS.md for the underlying queue-blocking model
 
 ### Requirement: CONFIG.md and OPERATIONS.md document the contradiction-check fields and cost model
-`docs/CONFIG.md`'s `executor:` table SHALL include rows for the three new fields (`change_internal_contradiction_check`, `change_internal_contradiction_check_prompt_path`, `change_internal_contradiction_check_llm`). `docs/OPERATIONS.md` SHALL include a "Pre-flight checks" section enumerating the layered pre-executor checks (validate → archivability → contradiction) AND noting the contradiction check's opt-in posture, LLM cost, AND fail-open behavior.
+`docs/CONFIG.md`'s `executor:` table SHALL include rows for the three new fields (`change_internal_contradiction_check`, `change_internal_contradiction_check_prompt_path`, `change_internal_contradiction_check_llm`). `docs/OPERATIONS.md` SHALL include a "Pre-flight checks" section enumerating the layered pre-executor checks (validate → archivability → contradiction) AND noting the contradiction check's opt-in posture, LLM cost, AND its **fail-CLOSED** behavior (a blocking gate that cannot run HOLDS the change rather than letting work proceed — superseding the original fail-open posture, per the "Control-plane gatekeepers fail closed, never to a passing verdict" requirement).
 
 #### Scenario: CONFIG.md documents all three new fields
 - **WHEN** an operator reads `docs/CONFIG.md`'s `executor:` table
@@ -635,13 +643,13 @@ The rule prevents two failure modes: (a) test fixtures leaking into production s
 #### Scenario: OPERATIONS.md enumerates the pre-flight layers
 - **WHEN** an operator reads `docs/OPERATIONS.md`'s pre-flight-checks section
 - **THEN** the section enumerates the three layered checks: `openspec validate --strict` (well-formedness, free), `a17`'s archivability check (mechanical, free), AND `a19`'s contradiction check (LLM, opt-in, small per-change cost)
-- **AND** each layer's purpose is named AND the failure mode (marker + chatops alert + executor-skip) is described
+- **AND** each layer's purpose is named AND the failure mode (marker + chatops alert + change held) is described
 - **AND** the contradiction check's opt-in posture is explained: operators trading a small per-change LLM cost for the catch of semantic self-contradictions enable it; default-off operators see no behavior change
 
-#### Scenario: OPERATIONS.md describes the fail-open posture
+#### Scenario: OPERATIONS.md describes the fail-closed posture
 - **WHEN** an operator reads the contradiction-check description in OPERATIONS.md
-- **THEN** the section notes that LLM failures (transport, parse, etc.) fail OPEN — the executor proceeds, the operator sees a WARN in journalctl
-- **AND** the section explains why: a failed check should not block work; operators decide whether to investigate based on the WARN cadence
+- **THEN** the section notes that a gate that cannot run (transport/parse error, unavailable CLI, OR no submission) fails CLOSED — the change is HELD with a `.needs-spec-revision.json` failed-to-run marker AND a chatops alert naming the gate AND the cause, NOT waved through with a WARN
+- **AND** the section explains why: a control-plane gatekeeper that cannot run must not let work proceed as if it passed (gatekeepers fail closed); the operator fixes the gate AND clears the marker to retry
 
 ### Requirement: DEPLOYMENT.md and CHATOPS.md explain the version-string format and the source-vs-binary distinction
 `docs/DEPLOYMENT.md` SHALL include a "Version-string format" section explaining how the daemon resolves its version string at build time, what operators see in different build contexts (clean tag, dev commit past tag, dirty working tree, source tarball without `.git/`), AND the Cargo.toml-bump convention. `docs/CHATOPS.md` SHALL update the `🆙` startup-notification example to show both the clean-tag form AND the development-build form.
@@ -1165,4 +1173,38 @@ This requirement gives the project's largest historical bloat hotspot a durable 
 - **WHEN** the polling-loop test suite is evaluated against the `Tests assert behavior or derivation, never message wording` requirement
 - **THEN** no test asserts a hand-authored substring of a shipped alert, notification, PR-body, OR marker message
 - **AND** message-content intent is carried by requirement prose (verified by the drift audit), not by unit-test substring checks
+
+### Requirement: Control-plane gatekeepers fail closed, never to a passing verdict
+
+A **control-plane gatekeeper** — any component whose role is to decide whether work may proceed OR to attest that work meets a standard (the pre-flight contradiction gates `[in]` AND `[canon]`, the code-implements-spec gate `[out]`, the code reviewer, any future verifier, AND audits that gate an operator's `send it`) — SHALL NOT represent an inability to run as a passing OR permissive outcome. The absence of a SUCCESSFUL evaluation SHALL be a distinct, surfaced, non-passing state. A control that fails open is not a control.
+
+This invariant SHALL hold by inspection — so the periodic `drift_audit` AND the `[canon]`/`[out]` gates can flag a violation — and applies across every gatekeeper:
+
+- **Verdict defaults AND initializers SHALL be the non-passing state.** A verdict variable, accumulator, or struct default SHALL initialize to blocked / errored / unknown — NEVER to approve / pass. An aggregation over zero evaluated items SHALL NOT yield a passing result.
+- **Error paths SHALL NOT collapse into pass.** A spawn OR timeout failure, an unavailable or unregistered CLI / tool, a missing or unparseable result, a schema-rejected submission the agent never corrects, OR "no result recorded" SHALL be treated as ERRORED — never as "no findings" / "approved" / "verified".
+- **The errored state SHALL be operator-visible**, surfaced via chatops AND/OR the artifact the gatekeeper writes, naming the gatekeeper AND the cause — so "ran AND passed" is distinguishable from "could not run".
+- **The action on error follows the gatekeeper's role, but none is silent-pass.** A BLOCKING gatekeeper SHALL NOT let the gated work proceed as if it passed: it holds the work in an explicit failed-to-run state an operator clears (distinct from a "found a problem" verdict). An ADVISORY gatekeeper SHALL render an explicit "failed to run" result rather than omit its output OR report success.
+- **Transient-failure tolerance is bounded retry, NOT fail-open.** Where a gatekeeper retries transient failures to avoid wedging on a blip, it SHALL — after exhausting the retry bound — enter the errored state, never pass.
+
+A developer-facing standards doc SHALL record this invariant so contributors apply it to new gatekeepers.
+
+#### Scenario: A gatekeeper that cannot run does not pass
+- **WHEN** a gatekeeper's evaluation cannot complete (CLI/tool unavailable, spawn/timeout error, no result recorded, OR an uncorrected schema-rejected submission)
+- **THEN** the outcome is the errored state, surfaced with the gatekeeper name AND the cause
+- **AND** it is NOT reported as passed / approved / verified / "no findings"
+
+#### Scenario: A blocking gatekeeper holds rather than waving work through
+- **WHEN** a blocking gatekeeper (e.g. an `[in]` or `[canon]` pre-flight) enters the errored state
+- **THEN** the gated work does NOT proceed as if the gate passed
+- **AND** the work is held in an explicit failed-to-run state an operator clears, distinct from a "found a problem" verdict
+
+#### Scenario: An advisory gatekeeper reports "failed to run", not success
+- **WHEN** an advisory gatekeeper (e.g. the `[out]` gate) enters the errored state
+- **THEN** it renders an explicit "failed to run" result naming the cause
+- **AND** it does NOT omit its output NOR report success / verified
+
+#### Scenario: Verdict defaults and zero-item aggregations are non-passing
+- **WHEN** a gatekeeper initializes a verdict OR aggregates a verdict over zero evaluated items
+- **THEN** the initial / default / zero-item result is a non-passing state (blocked / errored / unknown)
+- **AND** no code path yields approve / pass from a default OR from zero evaluated items
 

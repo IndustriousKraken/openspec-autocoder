@@ -424,6 +424,17 @@ executor:
   #   api_key_env: ANTHROPIC_API_KEY    # OPTIONAL for these CLI/agentic gates — the CLI
   #                                     # self-authenticates; a key is required only for an
   #                                     # in-process HTTP consumer (oneshot reviewer / RAG).
+  #
+  # Bounded retry of an agentic verifier-gate session ([in]/[canon]/[out])
+  # when it ends with NO submission — the flaky case where a weak local model
+  # reads the spec then never calls its `submit_*` MCP tool. The SAME
+  # model+change submits non-deterministically, so a bounded retry catches the
+  # "sometimes works" case before the gate fails closed. Counts ADDITIONAL
+  # attempts: `2` (the default) is up to 3 total attempts; `0` disables retry
+  # (one attempt). Only the no-submission case retries — a successful
+  # submission, a timeout, AND an unregistered-strategy / CLI-unavailable error
+  # are NOT retried; after the bound is exhausted the gate still fails closed.
+  # verifier_gate_retries: 2
 
 github:
   # Name of the env var holding the GitHub PAT. The token is read once

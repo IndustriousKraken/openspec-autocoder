@@ -182,6 +182,7 @@ pub(crate) fn out_gate_ctx(
         },
         prompt_template: "T".into(),
         attribution: Some("anthropic/claude-test".into()),
+        retries: 0,
         test_submission: Some(submission),
     }
 }
@@ -557,6 +558,7 @@ pub(crate) fn cc_test_ctx(
         },
         prompt_template: "TEST_PROMPT".into(),
         attribution,
+        retries: 0,
         test_submission: Some(submission),
     }
 }
@@ -579,6 +581,7 @@ pub(crate) fn canon_test_ctx(
         },
         prompt_template: "TEST_PROMPT".into(),
         attribution,
+        retries: 0,
         test_submission: Some(submission),
     }
 }

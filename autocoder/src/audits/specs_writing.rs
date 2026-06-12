@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 use super::{
-    AuditContext, AuditLogWriter, AuditOutcome, build_validation_addendum,
+    AuditContext, AuditLogWriter, AuditOutcome, WritePolicy, build_validation_addendum,
     post_proposal_created_notification, post_validation_exhausted_notification,
     read_proposal_why_first_line, workspace_is_valid, workspace_unavailable_outcome,
 };
@@ -194,6 +194,10 @@ pub(crate) async fn run_specs_writing_audit(
                 params.settings_dir,
                 audit_type,
                 params.model,
+                // Writability derives from the WritePolicy this harness serves
+                // (OpenSpecOnly → writable) so the agent can create the change
+                // dir; a read-only mount would silently yield 0 proposals.
+                WritePolicy::OpenSpecOnly.workspace_writable(),
             )
             .await
         } else {
@@ -205,6 +209,10 @@ pub(crate) async fn run_specs_writing_audit(
                 Duration::from_secs(params.executor_timeout_secs),
                 params.settings_dir,
                 params.model,
+                // Writability derives from the WritePolicy this harness serves
+                // (OpenSpecOnly → writable) so the agent can create the change
+                // dir; a read-only mount would silently yield 0 proposals.
+                WritePolicy::OpenSpecOnly.workspace_writable(),
             )
             .await
         }

@@ -95,6 +95,12 @@ pub struct ContradictionCheckCtx {
     /// findings alert. `None` only for test contexts built without a
     /// resolved config block.
     pub attribution: Option<String>,
+    /// Bounded retry of the agentic session on a no-submission outcome
+    /// (`executor.verifier_gate_retries`). Counts ADDITIONAL attempts; `0`
+    /// is the historical single-attempt behavior. Only the flaky
+    /// no-submission case retries — the gate still fails closed after the
+    /// bound is exhausted (gatekeepers-fail-closed standard).
+    pub retries: u32,
     /// Test-only injected `submit_contradictions` submission, bypassing the
     /// CLI subprocess AND the control socket. `Some(Some(p))` stands in for
     /// a recorded payload; `Some(None)` simulates "agent never submitted";
@@ -241,6 +247,12 @@ pub fn register_contradiction_submission_schema(
 struct ContradictionSessionOutcome {
     submission: Option<serde_json::Value>,
     stdout_excerpt: String,
+}
+
+impl crate::verifier_gate::SessionSubmission for ContradictionSessionOutcome {
+    fn has_submission(&self) -> bool {
+        self.submission.is_some()
+    }
 }
 
 /// Abstracts "run ONE contradiction-check session AND drain its submission"
@@ -446,7 +458,19 @@ async fn run_agentic_contradiction_check_with_runner(
     // label so it is attributable to the gate. The gate FAILS CLOSED: any
     // could-not-run path is `Errored` (the change is held), never `Clean`.
     let label = VerifierGate::In.label();
-    match runner.run_session(&prompt).await {
+    // Bounded retry of the agentic session on the flaky no-submission case
+    // (`executor.verifier_gate_retries`); a successful submission, a session
+    // error, a timeout, AND an unregistered-strategy / CLI-unavailable error
+    // are NOT retried. After the bound is exhausted the gate still fails
+    // closed (gatekeepers-fail-closed standard).
+    let session = crate::verifier_gate::run_session_with_retry(
+        VerifierGate::In,
+        change_slug,
+        ctx.retries,
+        || runner.run_session(&prompt),
+    )
+    .await;
+    match session {
         Err(e) => {
             let cause = format!("session failed: {e:#}");
             tracing::warn!(
@@ -575,6 +599,38 @@ mod tests {
         }
     }
 
+    /// Test runner that plays back a SCRIPTED sequence of session submissions
+    /// (one per call) AND counts invocations; the last entry repeats once the
+    /// script is exhausted. Drives the shared retry-loop tests.
+    struct ScriptedContradictionRunner {
+        script: Vec<Option<serde_json::Value>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedContradictionRunner {
+        fn new(script: Vec<Option<serde_json::Value>>) -> Self {
+            Self {
+                script,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ContradictionSessionRunner for ScriptedContradictionRunner {
+        async fn run_session(&self, _prompt: &str) -> Result<ContradictionSessionOutcome> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let idx = n.min(self.script.len().saturating_sub(1));
+            Ok(ContradictionSessionOutcome {
+                submission: self.script[idx].clone(),
+                stdout_excerpt: String::new(),
+            })
+        }
+    }
+
     fn test_model() -> ResolvedModel {
         ResolvedModel {
             provider: LlmProvider::Anthropic,
@@ -590,6 +646,9 @@ mod tests {
             model: test_model(),
             prompt_template: "TEST_PROMPT".into(),
             attribution: None,
+            // Default to no retry so the canned-runner tests below run the
+            // session exactly once; the retry behavior has its own tests.
+            retries: 0,
             test_submission: None,
         }
     }
@@ -763,6 +822,77 @@ mod tests {
             matches!(out, ContradictionCheckOutcome::Errored { .. }),
             "session error must fail CLOSED (held): {out:?}"
         );
+    }
+
+    // ---- bounded retry on the flaky no-submission case (shared seam) ----
+
+    /// No submission on attempt 1, an empty (clean) submission on attempt 2 →
+    /// the gate succeeds (Clean), not held. The flaky case is retried.
+    #[tokio::test]
+    async fn no_submission_then_clean_succeeds_on_retry() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx();
+        ctx.retries = 2;
+        let runner = ScriptedContradictionRunner::new(vec![
+            None,
+            Some(serde_json::json!({ "contradictions": [] })),
+        ]);
+        let out = run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
+        assert!(
+            matches!(out, ContradictionCheckOutcome::Clean),
+            "a retry that submits an empty result is Clean: {out:?}"
+        );
+        assert_eq!(runner.call_count(), 2, "exactly two attempts (1 retry)");
+    }
+
+    /// No submission on EVERY attempt → after `retries` retries the gate fails
+    /// closed (Errored → held), invoked exactly `retries + 1` times.
+    #[tokio::test]
+    async fn no_submission_every_attempt_fails_closed_after_bound() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx();
+        ctx.retries = 2;
+        let runner = ScriptedContradictionRunner::new(vec![None]);
+        let out = run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
+        assert!(
+            matches!(out, ContradictionCheckOutcome::Errored { .. }),
+            "exhausted retries must fail closed (held): {out:?}"
+        );
+        assert_eq!(runner.call_count(), 3, "retries(2) + 1 = 3 attempts");
+    }
+
+    /// `retries == 0` → exactly one attempt, fails closed on no submission
+    /// (historical single-attempt behavior preserved).
+    #[tokio::test]
+    async fn zero_retries_is_one_attempt() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx();
+        ctx.retries = 0;
+        let runner = ScriptedContradictionRunner::new(vec![None]);
+        let out = run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
+        assert!(matches!(out, ContradictionCheckOutcome::Errored { .. }));
+        assert_eq!(runner.call_count(), 1, "retries=0 means exactly one attempt");
+    }
+
+    /// A valid submission on attempt 1 → exactly one attempt (no needless
+    /// retry), even with a non-zero retry bound.
+    #[tokio::test]
+    async fn valid_first_attempt_does_not_retry() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx();
+        ctx.retries = 2;
+        let runner = ScriptedContradictionRunner::new(vec![Some(serde_json::json!({
+            "contradictions": [
+                { "requirement_a": "A", "requirement_b": "B", "summary": "x" }
+            ]
+        }))]);
+        let out = run_agentic_contradiction_check_with_runner(&ctx, ws, "c1", &runner).await;
+        assert!(matches!(out, ContradictionCheckOutcome::Found(_)));
+        assert_eq!(runner.call_count(), 1, "a submission on attempt 1 needs no retry");
     }
 
     /// A non-`claude` provider resolves to a CLI with no registered strategy

@@ -292,6 +292,10 @@ impl Audit for CanonContradictionAudit {
             self.settings_dir.as_deref(),
             Self::TYPE,
             model.as_ref(),
+            // Writability derives from the declared WritePolicy (None →
+            // read-only) so the mount can never drift from the policy the
+            // post-hoc check enforces.
+            self.write_policy().workspace_writable(),
         )
         .await
         .context("spawning canon-contradiction-audit CLI subprocess")?;
@@ -835,6 +839,7 @@ mod tests {
             code_implements_spec_check: crate::config::ContradictionCheckMode::Disabled,
             code_implements_spec_check_prompt_path: None,
             code_implements_spec_check_llm: None,
+            verifier_gate_retries: crate::config::default_verifier_gate_retries(),
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,

@@ -80,6 +80,27 @@ pub enum WritePolicy {
     Approved,
 }
 
+impl WritePolicy {
+    /// Whether an audit with this policy needs a read-write workspace so its
+    /// wrapped agent can persist output. `OpenSpecOnly` audits create change
+    /// dirs under `openspec/changes/`; `Approved` may write anywhere; `None`
+    /// audits are strictly advisory and run read-only.
+    ///
+    /// This is the SINGLE source from which the audit CLI runners derive BOTH
+    /// the OS-sandbox workspace mount AND the CLI-settings `deny_writes` flag,
+    /// so the two can never disagree. A disagreement is silent and severe: a
+    /// writing audit denied either gate cannot create its change dir, and the
+    /// specs-writing harness reads "0 new dirs" as a passing "no findings" run
+    /// — which is exactly how a real `security_bug_audit` finding was once
+    /// discarded while the audit logged green.
+    pub fn workspace_writable(self) -> bool {
+        match self {
+            WritePolicy::None => false,
+            WritePolicy::OpenSpecOnly | WritePolicy::Approved => true,
+        }
+    }
+}
+
 /// Severity of a single finding in a reported outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -983,6 +1004,14 @@ pub(crate) async fn run_audit_cli(
     timeout: std::time::Duration,
     settings_dir: Option<&Path>,
     model: Option<&crate::agentic_run::ResolvedModel>,
+    // `WritePolicy::OpenSpecOnly` audits (the specs-writing harness) pass
+    // `true` so the agent can create change dirs under `openspec/changes/`
+    // (the post-hoc OpenSpecOnly check reverts any write outside it);
+    // `WritePolicy::None` advisory audits pass `false`. Governs BOTH the
+    // CLI-settings write-deny AND the OS-sandbox workspace mount, which must
+    // agree — denying either one leaves a writing audit unable to persist
+    // findings while the harness reads "0 new dirs" as a silent pass.
+    workspace_writable: bool,
 ) -> Result<crate::agentic_run::AgenticRunOutcome> {
     // audit-model-selection: select the CLI strategy from the resolved
     // model's provider (or default to `claude` when no model is configured).
@@ -1000,7 +1029,7 @@ pub(crate) async fn run_audit_cli(
             allowed_tools: sandbox.allowed_tools.clone(),
             disallowed_bash_patterns: sandbox.disallowed_bash_patterns.clone(),
             disallowed_read_paths: sandbox.disallowed_read_paths.clone(),
-            deny_writes: true,
+            deny_writes: !workspace_writable,
         },
         model,
         output_mode: crate::agentic_run::OutputMode::Capture,
@@ -1012,10 +1041,13 @@ pub(crate) async fn run_audit_cli(
         resume_session_id: None,
         track_subprocess_marker: false,
         etxtbsy_retry_spawn: true,
-        // a006: audits are read-only roles — workspace mounted read-only. The
-        // OS-sandbox CLI kind follows the resolved model's provider (the
-        // wrapped CLI's self-store is admitted ro for auth); default `claude`.
-        os_sandbox: crate::sandbox::current_run_sandbox(audit_cli_kind(model), false),
+        // Workspace mount follows the audit's WritePolicy: OpenSpecOnly audits
+        // get a read-write workspace (so they can create `openspec/changes/`
+        // dirs — the post-hoc OpenSpecOnly check reverts writes outside it),
+        // WritePolicy::None audits stay read-only. Kept in lock-step with
+        // `deny_writes` above. The OS-sandbox CLI kind follows the resolved
+        // model's provider (self-store admitted ro for auth); default `claude`.
+        os_sandbox: crate::sandbox::current_run_sandbox(audit_cli_kind(model), workspace_writable),
         },
         true,
         None,
@@ -1112,6 +1144,13 @@ pub(crate) async fn run_audit_cli_with_submit(
     settings_dir: Option<&Path>,
     role: &str,
     model: Option<&crate::agentic_run::ResolvedModel>,
+    // `true` for the OpenSpecOnly specs-writing harness (e.g.
+    // canon_consolidation via its RAG/`query_canonical_specs` path, which
+    // still writes a `consolidate-` change dir), `false` for WritePolicy::None
+    // advisory audits (drift, canon_contradiction, documentation,
+    // architecture_consultative) that only submit findings. Governs both the
+    // CLI write-deny AND the OS mount.
+    workspace_writable: bool,
 ) -> Result<crate::agentic_run::AgenticRunOutcome> {
     // Allow the role's submit tool in addition to the read-only tools AND
     // the auto-included autocoder MCP tools (`ask_user` /
@@ -1143,7 +1182,7 @@ pub(crate) async fn run_audit_cli_with_submit(
             allowed_tools,
             disallowed_bash_patterns: sandbox.disallowed_bash_patterns.clone(),
             disallowed_read_paths: sandbox.disallowed_read_paths.clone(),
-            deny_writes: true,
+            deny_writes: !workspace_writable,
         },
         model,
         output_mode: crate::agentic_run::OutputMode::Capture,
@@ -1155,10 +1194,13 @@ pub(crate) async fn run_audit_cli_with_submit(
         resume_session_id: None,
         track_subprocess_marker: false,
         etxtbsy_retry_spawn: true,
-        // a006: advisory audits are read-only roles too — read-only workspace.
-        // The OS-sandbox CLI kind follows the resolved model's provider
-        // (self-store admitted ro for auth); default `claude`.
-        os_sandbox: crate::sandbox::current_run_sandbox(audit_cli_kind(model), false),
+        // Workspace mount follows the audit's WritePolicy: OpenSpecOnly audits
+        // (specs-writing harness RAG path) get read-write so they can create
+        // `openspec/changes/` dirs; WritePolicy::None advisory audits stay
+        // read-only. Kept in lock-step with `deny_writes` above. The OS-sandbox
+        // CLI kind follows the resolved model's provider (self-store admitted
+        // ro for auth); default `claude`.
+        os_sandbox: crate::sandbox::current_run_sandbox(audit_cli_kind(model), workspace_writable),
         },
         true,
         None,
@@ -1692,6 +1734,29 @@ mod tests {
     use super::test_support::{RecordingBackend, make_recording_ctx};
     use super::*;
     use tempfile::TempDir;
+
+    /// The audit write-gate is derived from a single source — `WritePolicy` —
+    /// from which the CLI runners set BOTH the OS-sandbox workspace mount AND
+    /// the `deny_writes` settings flag. This pins that mapping. Regression
+    /// guard: a writing audit (`OpenSpecOnly`) mounted read-only silently
+    /// produced 0 proposals, and the specs-writing harness reported the dead
+    /// run as a passing "no findings" — discarding a real security finding.
+    #[test]
+    fn write_policy_workspace_writable_mapping() {
+        assert!(
+            !WritePolicy::None.workspace_writable(),
+            "advisory (None) audits must run read-only"
+        );
+        assert!(
+            WritePolicy::OpenSpecOnly.workspace_writable(),
+            "specs-writing (OpenSpecOnly) audits MUST get a writable workspace \
+             or they cannot create openspec/changes/ proposal dirs"
+        );
+        assert!(
+            WritePolicy::Approved.workspace_writable(),
+            "Approved audits have full write access"
+        );
+    }
 
     #[test]
     fn format_proposal_created_message_first_attempt_omits_parenthetical() {

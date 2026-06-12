@@ -202,6 +202,10 @@ impl Audit for DriftAudit {
             self.settings_dir.as_deref(),
             Self::TYPE,
             model.as_ref(),
+            // Writability derives from the declared WritePolicy (None →
+            // read-only) so the mount can never drift from the policy the
+            // post-hoc check enforces.
+            self.write_policy().workspace_writable(),
         )
         .await
         .context("spawning drift-audit CLI subprocess")?;
@@ -436,6 +440,7 @@ mod tests {
                 crate::config::ContradictionCheckMode::Disabled,
             code_implements_spec_check_prompt_path: None,
             code_implements_spec_check_llm: None,
+            verifier_gate_retries: crate::config::default_verifier_gate_retries(),
             implementer: None,
             changelog_stylist: None,
             implementer_revision: None,
@@ -929,6 +934,9 @@ mod tests {
         assert_eq!(audit.audit_type(), "drift_audit");
         assert!(audit.requires_head_change());
         assert!(matches!(audit.write_policy(), WritePolicy::None));
+        // Advisory — must NOT get a writable workspace (the post-hoc diff
+        // check requires a clean tree).
+        assert!(!audit.write_policy().workspace_writable());
     }
 
     /// Workspace-validity gate: missing workspace → WorkspaceUnavailable

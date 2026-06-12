@@ -291,6 +291,12 @@ pub struct CodeImplementsSpecCheckCtx {
     /// `*Spec verification: <provider>/<model>*`. `None` only for test
     /// contexts built without a resolved config block.
     pub attribution: Option<String>,
+    /// Bounded retry of the agentic session on a no-submission outcome
+    /// (`executor.verifier_gate_retries`). Counts ADDITIONAL attempts; `0`
+    /// is the historical single-attempt behavior. Only the flaky
+    /// no-submission case retries — the advisory gate still renders FAILED
+    /// TO RUN after the bound is exhausted (gatekeepers-fail-closed standard).
+    pub retries: u32,
     /// Test-only injected `submit_verdict` submission, bypassing the CLI
     /// subprocess AND the control socket. `Some(Some(p))` stands in for a
     /// recorded payload; `Some(None)` simulates "agent never submitted";
@@ -354,6 +360,12 @@ pub enum SpecVerificationOutcome {
 struct VerdictSessionOutcome {
     submission: Option<serde_json::Value>,
     stdout_excerpt: String,
+}
+
+impl crate::verifier_gate::SessionSubmission for VerdictSessionOutcome {
+    fn has_submission(&self) -> bool {
+        self.submission.is_some()
+    }
 }
 
 /// Abstracts "run ONE code-implements-spec session AND drain its submission"
@@ -469,6 +481,45 @@ impl VerdictSessionRunner for CannedVerdictRunner {
     }
 }
 
+/// Test-only runner that plays back a SCRIPTED sequence of session outcomes,
+/// one per `run_session` call, AND counts invocations. Each scripted entry is
+/// the session's `submission` (`Some(payload)` for a recorded submission,
+/// `None` for the flaky no-submission case). When the script is exhausted, the
+/// last entry repeats — so a single-element `[None]` script models "every
+/// attempt fails to submit." Drives the retry-loop tests.
+#[cfg(test)]
+struct ScriptedVerdictRunner {
+    script: Vec<Option<serde_json::Value>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl ScriptedVerdictRunner {
+    fn new(script: Vec<Option<serde_json::Value>>) -> Self {
+        Self {
+            script,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl VerdictSessionRunner for ScriptedVerdictRunner {
+    async fn run_session(&self, _prompt: &str) -> Result<VerdictSessionOutcome> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let idx = n.min(self.script.len().saturating_sub(1));
+        Ok(VerdictSessionOutcome {
+            submission: self.script[idx].clone(),
+            stdout_excerpt: String::new(),
+        })
+    }
+}
+
 /// Run the code-implements-spec `[out]` gate for `change_slugs` under
 /// `workspace_root` (a63). Production entry point invoked from the polling
 /// loop AFTER the executor implements the change(s), before PR-body assembly.
@@ -566,7 +617,19 @@ async fn run_code_implements_spec_check_with_runner(
     // verifier-gate label so the finding is attributable to the gate.
     let label = VerifierGate::Out.label();
     let changes = change_slugs.join(",");
-    match runner.run_session(&prompt).await {
+    // Bounded retry of the agentic session on the flaky no-submission case
+    // (`executor.verifier_gate_retries`); a successful submission, a session
+    // error, a timeout, AND an unregistered-strategy / CLI-unavailable error
+    // are NOT retried. After the bound is exhausted the advisory gate still
+    // renders FAILED TO RUN (gatekeepers-fail-closed standard).
+    let session = crate::verifier_gate::run_session_with_retry(
+        VerifierGate::Out,
+        &changes,
+        ctx.retries,
+        || runner.run_session(&prompt),
+    )
+    .await;
+    match session {
         Err(e) => {
             let cause = format!("session failed: {e:#}");
             tracing::warn!(
@@ -800,6 +863,9 @@ mod tests {
             model: test_model(),
             prompt_template: "TEST_PROMPT".into(),
             attribution: Some("anthropic/claude-test".into()),
+            // Default to no retry so the canned-runner tests below run the
+            // session exactly once; the retry behavior has its own tests.
+            retries: 0,
             test_submission: None,
         }
     }
@@ -1064,6 +1130,134 @@ mod tests {
         assert!(
             matches!(out, SpecVerificationOutcome::FailedToRun { .. }),
             "session error must be Unavailable: {out:?}"
+        );
+    }
+
+    // ---- bounded retry on the flaky no-submission case (shared seam) ----
+
+    fn implemented_payload() -> serde_json::Value {
+        serde_json::json!({ "verdict": "implemented", "summary": "ok", "gaps": [] })
+    }
+
+    /// No submission on attempt 1, a valid submission on attempt 2 → the gate
+    /// succeeds (Verified), no FAILED TO RUN. The flaky case is retried.
+    #[tokio::test]
+    async fn no_submission_then_valid_succeeds_on_retry() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx();
+        ctx.retries = 2;
+        let runner = ScriptedVerdictRunner::new(vec![None, Some(implemented_payload())]);
+        let out = run_code_implements_spec_check_with_runner(
+            &ctx,
+            ws,
+            &["c1".to_string()],
+            "diff",
+            &[],
+            &runner,
+        )
+        .await;
+        assert!(
+            matches!(out, SpecVerificationOutcome::Verified(_)),
+            "a retry that submits must yield Verified: {out:?}"
+        );
+        assert_eq!(runner.call_count(), 2, "exactly two attempts (1 retry)");
+    }
+
+    /// No submission on EVERY attempt → after `retries` retries the gate fails
+    /// closed (FailedToRun), and the runner was invoked exactly `retries + 1`
+    /// times.
+    #[tokio::test]
+    async fn no_submission_every_attempt_fails_closed_after_bound() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx();
+        ctx.retries = 2;
+        let runner = ScriptedVerdictRunner::new(vec![None]);
+        let out = run_code_implements_spec_check_with_runner(
+            &ctx,
+            ws,
+            &["c1".to_string()],
+            "diff",
+            &[],
+            &runner,
+        )
+        .await;
+        assert!(
+            matches!(out, SpecVerificationOutcome::FailedToRun { .. }),
+            "exhausted retries must fail closed: {out:?}"
+        );
+        assert_eq!(runner.call_count(), 3, "retries(2) + 1 = 3 attempts");
+    }
+
+    /// `retries == 0` → exactly one attempt, fails closed on no submission
+    /// (the historical single-attempt behavior is preserved).
+    #[tokio::test]
+    async fn zero_retries_is_one_attempt() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx();
+        ctx.retries = 0;
+        let runner = ScriptedVerdictRunner::new(vec![None]);
+        let out = run_code_implements_spec_check_with_runner(
+            &ctx,
+            ws,
+            &["c1".to_string()],
+            "diff",
+            &[],
+            &runner,
+        )
+        .await;
+        assert!(
+            matches!(out, SpecVerificationOutcome::FailedToRun { .. }),
+            "no submission with retries=0 fails closed: {out:?}"
+        );
+        assert_eq!(runner.call_count(), 1, "retries=0 means exactly one attempt");
+    }
+
+    /// A valid submission on attempt 1 → exactly one attempt (no needless
+    /// retry), even with a non-zero retry bound.
+    #[tokio::test]
+    async fn valid_first_attempt_does_not_retry() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx();
+        ctx.retries = 2;
+        let runner = ScriptedVerdictRunner::new(vec![Some(implemented_payload())]);
+        let out = run_code_implements_spec_check_with_runner(
+            &ctx,
+            ws,
+            &["c1".to_string()],
+            "diff",
+            &[],
+            &runner,
+        )
+        .await;
+        assert!(matches!(out, SpecVerificationOutcome::Verified(_)));
+        assert_eq!(runner.call_count(), 1, "a submission on attempt 1 needs no retry");
+    }
+
+    /// A session ERROR is NOT retried (a timeout would just time out again; an
+    /// unregistered-strategy / CLI-unavailable error is config-level). The
+    /// error short-circuits on the first attempt.
+    #[tokio::test]
+    async fn session_error_is_not_retried() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx();
+        ctx.retries = 5;
+        let out = run_code_implements_spec_check_with_runner(
+            &ctx,
+            ws,
+            &["c1".to_string()],
+            "diff",
+            &[],
+            &ErrorVerdictRunner,
+        )
+        .await;
+        assert!(
+            matches!(out, SpecVerificationOutcome::FailedToRun { .. }),
+            "a session error fails closed: {out:?}"
         );
     }
 

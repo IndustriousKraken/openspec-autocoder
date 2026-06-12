@@ -359,15 +359,9 @@ implementation.
 - **AND** per-repository fork-owner overrides are NOT supported
 
 ### Requirement: Startup verification of fork existence
-When `github.fork_owner` is set, autocoder SHALL ensure each configured
-repository has a reachable fork at the derived URL before spawning any
-polling task. Forks that are missing or unreachable SHALL be created
-automatically via `POST /repos/{upstream-owner}/{upstream-repo}/forks`
-using the PAT resolved for the upstream owner; the daemon then polls
-the fork URL via `git ls-remote` until it becomes reachable or until a
-60-second timeout elapses. If creation fails (non-2xx) OR polling
-times out, autocoder SHALL aggregate the failures into a single
-startup error and exit non-zero before any polling task is spawned.
+When `github.fork_owner` is set, autocoder SHALL ensure each configured repository has a reachable fork at the derived URL before spawning that repository's polling task. Forks that are missing or unreachable SHALL be created automatically via `POST /repos/{upstream-owner}/{upstream-repo}/forks` using the PAT resolved for the upstream owner; the daemon then polls the fork URL via `git ls-remote` until it becomes reachable or until a 60-second timeout elapses.
+
+A fork-setup failure for one repository — creation returns non-2xx, OR the fork is not reachable within the timeout — SHALL NOT abort daemon startup. The daemon SHALL instead: record the failure (the upstream URL, the expected fork URL, AND the cause); **skip that repository for the process lifetime** (no polling task is spawned for it) — the same per-repo skip-for-lifetime behavior already used when a fork URL cannot be derived; emit a chatops alert through the standard outbound notification path that identifies the repository AND carries a brief remedy hint; AND continue setting up AND serving every other repository. A fork-setup failure for one repository SHALL NEVER prevent the daemon from starting, from serving other repositories, OR from serving chatops. The daemon exits non-zero at startup only for non-per-repo fatal conditions (e.g. config-load failure) — NEVER for a per-repo fork-setup failure, even when every configured repository fails fork setup (it stays up so an operator can remediate AND recover the repository by fixing the fork, then restarting or reloading).
 
 #### Scenario: All forks already exist
 - **WHEN** autocoder starts with `github.fork_owner` set AND every
@@ -398,11 +392,11 @@ startup error and exit non-zero before any polling task is spawned.
 - **THEN** that repository's failure is recorded with the upstream
   URL, the expected fork URL, and the HTTP status (plus a body snippet
   truncated to 200 chars)
-- **AND** autocoder continues attempting the remaining repositories'
-  forks before aggregating failures
-- **AND** after all repositories are processed, if any failed,
-  autocoder exits non-zero with a single error listing every failed
-  repo
+- **AND** autocoder skips that repository for the process lifetime (no
+  polling task is spawned for it) AND emits a chatops alert that
+  identifies the repository AND carries a remedy hint
+- **AND** autocoder continues setting up the remaining repositories AND
+  the daemon does NOT exit
 
 #### Scenario: Fork-creation succeeds but the fork is not yet reachable
 - **WHEN** the POST returns 2xx AND `git ls-remote <fork-url> HEAD`
@@ -410,8 +404,10 @@ startup error and exit non-zero before any polling task is spawned.
 - **THEN** that repository's failure is recorded as
   "fork creation succeeded but the fork at `<fork-url>` was not
   reachable within 60s"
-- **AND** the failure is included in the aggregated startup error
-  (the daemon does NOT proceed with this repo missing)
+- **AND** that repository is skipped for the process lifetime AND a
+  chatops alert identifying it is emitted
+- **AND** the daemon proceeds to serve the other repositories without
+  exiting
 
 #### Scenario: A fork already exists when creation is attempted
 - **WHEN** autocoder issues the fork-creation POST AND the upstream
@@ -420,6 +416,23 @@ startup error and exit non-zero before any polling task is spawned.
   metadata (idempotent behavior)
 - **AND** autocoder treats this as success and proceeds with the
   reachability probe normally
+
+#### Scenario: One repository's fork failure does not take down the others
+- **WHEN** autocoder starts with multiple repositories AND one
+  repository's fork cannot be set up (creation fails OR the fork is not
+  reachable within the timeout) AND the other repositories' forks are
+  reachable
+- **THEN** the daemon spawns polling tasks for the reachable
+  repositories AND enters normal polling
+- **AND** chatops is served (the daemon does not exit)
+- **AND** the failed repository is absent from the active polling set
+  until the operator remediates AND restarts or reloads
+
+#### Scenario: Every repository's fork fails
+- **WHEN** every configured repository fails fork setup
+- **THEN** the daemon still starts AND stays up serving chatops, having
+  emitted one chatops alert per failed repository
+- **AND** it does NOT exit non-zero
 
 ### Requirement: Rewind --hard targets fork remote in fork-PR mode
 autocoder SHALL delete the agent branch from the `fork` remote (not
@@ -4686,9 +4699,9 @@ Removal of the underlying blocking marker (e.g. via `@<bot> clear-perma-stuck`) 
 ### Requirement: Change-internal contradiction pre-flight check (opt-in)
 autocoder SHALL provide an opt-in pre-flight check that detects semantic contradictions among the requirements WITHIN a single OpenSpec change before the executor is invoked. The check runs a CLI-wrapped agentic session through the shared `agentic_run` primitive (a56) in a read-only sandbox that reads the change's spec-delta files on demand AND returns a structured listing of contradictions (requirements that cannot all hold simultaneously) via the `submit_contradictions` MCP tool. On non-empty findings, autocoder SHALL write `.needs-spec-revision.json` with `revision_suggestion` populated from the contradictions narrative, post the existing `AlertCategory::SpecNeedsRevision` chatops alert, AND halt the queue walk for this iteration. The executor SHALL NOT be invoked when contradictions are found.
 
-The check SHALL be gated by `executor.change_internal_contradiction_check` (`disabled` default, `enabled` opt-in). The model is configured via `executor.change_internal_contradiction_check_llm` (parallel to the `reviewer:` config block — provider, model, api_key source, optional api_base_url), which a56's CLI strategy translates into the wrapped CLI's model-selection mechanism. The `claude` strategy reaches only Anthropic-shaped endpoints; a model whose provider resolves to a CLI with no registered strategy makes the check fail open (per the fail-open posture below) until that strategy is registered. Enabling the check without configuring the model SHALL fail at daemon startup with a fail-fast validation error.
+The check SHALL be gated by `executor.change_internal_contradiction_check` (`disabled` default, `enabled` opt-in). The model is configured via `executor.change_internal_contradiction_check_llm` (parallel to the `reviewer:` config block — provider, model, api_key source, optional api_base_url), which a56's CLI strategy translates into the wrapped CLI's model-selection mechanism. The `claude` strategy reaches only Anthropic-shaped endpoints; a model whose provider resolves to a CLI with no registered strategy makes the check FAIL CLOSED (per the fail-closed posture below) until that strategy is registered.  Enabling the check without configuring the model SHALL fail at daemon startup with a fail-fast validation error.
 
-The check SHALL fail-open: an agentic-session error (spawn, timeout, OR a resolved CLI strategy that is not registered), a schema-rejected submission the agent never corrects, a session that ends with no submission, OR any other failure log a WARN AND treat the check as "no contradictions found." A schema-invalid `submit_contradictions` call mid-session is a correctable tool error the agent can retry (a56). The daemon does NOT gate work on a failed check — operators see the WARN in journalctl AND can investigate; the executor proceeds.
+The check SHALL FAIL CLOSED (gatekeepers-fail-closed standard): an agentic-session error (spawn, timeout, OR a resolved CLI strategy that is not registered), a schema-rejected submission the agent never corrects, a session that ends with no submission, OR any other could-not-run failure SHALL NOT be treated as "no contradictions found." It SHALL log a WARN AND hold the change in an explicit failed-to-run state: write `.needs-spec-revision.json` with a structured `gate_error` population (the gate label AND the cause) distinct from a findings-based revision, post a distinct "gate FAILED TO RUN — change held" chatops alert (under `AlertCategory::SpecNeedsRevision`), AND halt the queue walk. The change is held because it was NOT evaluated — NOT because a problem was found; an operator clears the marker (after fixing the gate) to retry. A schema-invalid `submit_contradictions` call mid-session is a correctable tool error the agent can retry (a56). A successful session that returns an empty array is a clean result AND proceeds to the executor.
 
 The check runs AFTER `a17`'s mechanical archivability check AND BEFORE the executor. The two checks are layered: `a17` catches structural defects (header mismatches), `a19` catches semantic ones (self-contradictions). Most clean changes pass both with no LLM cost beyond the contradiction check's own.
 
@@ -4713,21 +4726,21 @@ The check runs AFTER `a17`'s mechanical archivability check AND BEFORE the execu
 #### Scenario: Non-empty contradictions submission writes marker and skips executor
 - **WHEN** the agent submits one or more contradictions
 - **THEN** the pipeline writes `.needs-spec-revision.json` with `revision_suggestion` text populated from the contradictions narrative (per the documented format)
-- **AND** the marker's `unarchivable_deltas` AND `unimplementable_tasks` arrays are empty (this case is semantic, not structural)
+- **AND** the marker's `unarchivable_deltas`, `unimplementable_tasks`, AND `gate_error` populations are empty (this case is semantic findings, not structural AND not a gate error)
 - **AND** the chatops alert under `AlertCategory::SpecNeedsRevision` fires (subject to the 24h throttle)
 - **AND** the executor is NOT invoked for this change OR any subsequent change in this iteration
 
-#### Scenario: Session failure fails open
+#### Scenario: Session failure holds the change (fail closed)
 - **WHEN** the agentic session fails (spawn error, timeout, OR the resolved CLI strategy is not registered — e.g. a non-`claude` command whose strategy has not been added)
-- **THEN** the pipeline logs a WARN naming the error
-- **AND** treats the check as "no contradictions found"
-- **AND** proceeds to the executor
-- **AND** the daemon does NOT gate iteration progress on the failed check
+- **THEN** the pipeline logs a WARN (carrying the `[in]` label) naming the cause
+- **AND** writes `.needs-spec-revision.json` with a structured `gate_error` (gate label + cause), NOT a "no contradictions found" result
+- **AND** posts a distinct "gate FAILED TO RUN — change held" chatops alert
+- **AND** the executor is NOT invoked — the change is held until an operator clears the marker
 
-#### Scenario: No valid submission fails open
+#### Scenario: No valid submission holds the change (fail closed)
 - **WHEN** the session ends with no schema-valid `submit_contradictions` call (the agent never submits, OR every submission is schema-rejected and never corrected)
-- **THEN** the pipeline logs a WARN naming a truncated session-output excerpt (200 chars)
-- **AND** treats the check as "no contradictions found" AND proceeds to the executor (the same fail-open posture)
+- **THEN** the pipeline logs a WARN (carrying the `[in]` label) with a truncated session-output excerpt
+- **AND** writes the `.needs-spec-revision.json` marker with a `gate_error` population AND halts the iteration (the same fail-closed hold)
 
 #### Scenario: Enabled without model config fails fast at startup
 - **WHEN** `config.yaml` sets `executor.change_internal_contradiction_check: enabled`
@@ -6942,13 +6955,13 @@ autocoder's change-lifecycle consistency checks SHALL be organized as a verifier
 - the `[canon]` gate — change-vs-canonical consistency, run BEFORE the executor;
 - the `[out]` gate — code-implements-spec, run AFTER the executor.
 
-Each gate SHALL be individually opt-in AND SHALL own its disposition: the pre-executor gates (`[in]`, `[canon]`) are fail-open — a gate's own failure (transport, parse, unregistered strategy, no submission) logs a WARN AND never blocks the iteration; the `[out]` gate is advisory — it annotates operator surfaces AND never auto-acts (no revision, no block). Each gate's diagnostics (log lines AND any operator surface it writes) SHALL carry the gate's stable identifier so a finding is attributable to the gate that produced it.
+Each gate SHALL be individually opt-in AND SHALL own its disposition, but NO gate treats an inability to run as a pass (the gatekeepers-fail-closed standard). The pre-executor gates (`[in]`, `[canon]`) FAIL CLOSED: a gate's own failure (transport, parse, unregistered strategy, no submission) does NOT proceed as "no findings" — it holds the change in an explicit failed-to-run state (the change was NOT evaluated), surfaces a distinct "gate FAILED TO RUN — change held" alert, AND halts the iteration; an operator clears the hold (after fixing the gate) to retry. The `[out]` gate is advisory — it never auto-acts (no revision, no block) — AND fails to a VISIBLE state: on its own failure it renders an explicit "FAILED TO RUN" section rather than silently omitting one. Each gate's diagnostics (log lines AND any operator surface it writes) SHALL carry the gate's stable identifier so a finding — OR a held/failed-to-run state — is attributable to the gate that produced it.
 
-The `[in]` gate IS the existing change-internal contradiction pre-flight check (its own requirement defines its behavior, opt-in gating, fail-open posture, marker, AND alert); this framework reframes that check under the `[in]` identifier WITHOUT changing what it decides, its config key, OR its alert category. The `[canon]` AND `[out]` gates are realized by subsequent changes; until a gate is realized the framework treats it as absent AND invokes nothing for it. This change introduces ONLY the shared gate vocabulary, lifecycle positions, posture rules, AND labeling — it does NOT add a new gate.
+The `[in]` gate IS the existing change-internal contradiction pre-flight check (its own requirement defines its behavior, opt-in gating, fail-closed posture, marker, AND alert); this framework reframes that check under the `[in]` identifier. The `[canon]` AND `[out]` gates are realized by their own requirements; until a gate is realized the framework treats it as absent AND invokes nothing for it.
 
 #### Scenario: The `[in]` gate runs the contradiction check, labeled
 - **WHEN** the `[in]` gate runs for a change
-- **THEN** it executes the change-internal contradiction pre-flight check unchanged in what it decides (same opt-in gating, fail-open posture, marker, AND alert category)
+- **THEN** it executes the change-internal contradiction pre-flight check (same opt-in gating, fail-closed posture, marker, AND alert category)
 - **AND** its emitted log / diagnostic lines carry the `[in]` gate identifier so the finding is attributable to that gate
 
 #### Scenario: An unrealized gate is inert
@@ -6957,8 +6970,10 @@ The `[in]` gate IS the existing change-internal contradiction pre-flight check (
 - **AND** the framework invokes nothing for it — no gate is run speculatively
 
 #### Scenario: Gate disposition follows the gate's lifecycle position
-- **WHEN** a pre-executor gate (`[in]` or `[canon]`) fails for its own reasons
-- **THEN** the framework treats it as fail-open: it logs a WARN AND does NOT block the iteration
+- **WHEN** a pre-executor gate (`[in]` or `[canon]`) fails for its own reasons (transport, parse, unregistered strategy, no submission)
+- **THEN** the framework treats it as fail-CLOSED: it holds the change in an explicit failed-to-run state, surfaces it, AND does NOT proceed to the executor as if the gate passed
+- **WHEN** the `[out]` gate fails for its own reasons
+- **THEN** the framework renders an explicit "FAILED TO RUN" section (advisory, never blocking) rather than omitting one
 - **WHEN** the `[out]` gate produces findings
 - **THEN** the framework treats them as advisory: they annotate operator surfaces AND do NOT auto-trigger a revision or block
 
@@ -6969,7 +6984,7 @@ The check SHALL be gated by `executor.change_canonical_contradiction_check` (`di
 
 Canon access SHALL follow the documentation-audit pattern: the gate reads `openspec/specs/*/spec.md` directly through the sandbox AND additionally uses the `query_canonical_specs` MCP tool when a21's RAG is enabled (focused retrieval for large canon). The gate SHALL function correctly with OR without RAG.
 
-Per the verifier framework (a61), the `[canon]` gate SHALL be fail-open AND SHALL label its diagnostics with the `[canon]` identifier: an agentic-session error (spawn, timeout, OR a resolved CLI strategy that is not registered), a schema-rejected submission the agent never corrects, a session that ends with no submission, OR any other failure log a WARN AND treat the check as "no contradictions found." A schema-invalid `submit_canon_contradictions` call mid-session is a correctable tool error the agent can retry (a56). The daemon does NOT gate work on a failed check.
+Per the verifier framework, the `[canon]` gate SHALL FAIL CLOSED (gatekeepers-fail-closed standard) AND SHALL label its diagnostics with the `[canon]` identifier: an agentic-session error (spawn, timeout, OR a resolved CLI strategy that is not registered), a schema-rejected submission the agent never corrects, a session that ends with no submission, OR any other could-not-run failure SHALL NOT be treated as "no contradictions found." It SHALL log a WARN AND hold the change in an explicit failed-to-run state — write `.needs-spec-revision.json` with a structured `gate_error` population, post a distinct "gate FAILED TO RUN — change held" alert, AND halt the iteration; an operator clears the marker (after fixing the gate) to retry. A schema-invalid `submit_canon_contradictions` call mid-session is a correctable tool error the agent can retry (a56). A successful session that returns an empty array is a clean result AND proceeds to the executor.
 
 #### Scenario: Default-disabled produces no [canon] session
 - **WHEN** `executor.change_canonical_contradiction_check` is unset (default `disabled`)
@@ -6991,7 +7006,7 @@ Per the verifier framework (a61), the `[canon]` gate SHALL be fail-open AND SHAL
 #### Scenario: Non-empty submission writes marker and halts
 - **WHEN** the agent submits one or more change-vs-canonical contradictions
 - **THEN** the pipeline writes `.needs-spec-revision.json` with `revision_suggestion` text populated from the contradictions narrative (each finding naming the conflicting canonical requirement)
-- **AND** the marker's structural arrays (`unarchivable_deltas`, `unimplementable_tasks`) are empty (this case is semantic)
+- **AND** the marker's structural arrays (`unarchivable_deltas`, `unimplementable_tasks`) AND the `gate_error` population are empty (this case is semantic findings)
 - **AND** the chatops alert under `AlertCategory::SpecNeedsRevision` fires (subject to the throttle)
 - **AND** the executor is NOT invoked for this change OR any subsequent change in this iteration
 
@@ -7001,15 +7016,15 @@ Per the verifier framework (a61), the `[canon]` gate SHALL be fail-open AND SHAL
 - **WHEN** `canonical_rag` is disabled AND the gate runs
 - **THEN** the gate reads canon directly via the sandbox's `Read` of `openspec/specs/*/spec.md` AND still produces valid findings
 
-#### Scenario: Session failure fails open
+#### Scenario: Session failure holds the change (fail closed)
 - **WHEN** the agentic session fails (spawn error, timeout, OR the resolved CLI strategy is not registered)
-- **THEN** the gate logs a WARN (carrying the `[canon]` label) naming the error
-- **AND** treats the check as "no contradictions found" AND proceeds to the executor
+- **THEN** the gate logs a WARN (carrying the `[canon]` label) naming the cause
+- **AND** writes `.needs-spec-revision.json` with a structured `gate_error`, posts the "gate FAILED TO RUN — change held" alert, AND does NOT proceed to the executor
 
-#### Scenario: No valid submission fails open
+#### Scenario: No valid submission holds the change (fail closed)
 - **WHEN** the session ends with no schema-valid `submit_canon_contradictions` call (never submitted, OR every submission schema-rejected and never corrected)
 - **THEN** the gate logs a WARN (carrying the `[canon]` label) with a truncated session-output excerpt
-- **AND** treats the check as "no contradictions found" AND proceeds to the executor
+- **AND** writes the `gate_error` hold marker AND halts the iteration (the same fail-closed hold)
 
 #### Scenario: Enabled without model config fails fast at startup
 - **WHEN** `config.yaml` sets `executor.change_canonical_contradiction_check: enabled`
@@ -7020,7 +7035,7 @@ Per the verifier framework (a61), the `[canon]` gate SHALL be fail-open AND SHAL
 ### Requirement: Code-implements-spec verification (the [out] gate, advisory)
 autocoder SHALL provide an opt-in post-executor check — the `[out]` gate of the verifier framework — that judges whether the executor's implementation satisfies the change's spec delta, requirement by requirement AND scenario by scenario. This is the verifier step the code-reviewer requirement defers to ("Do NOT assess whether the diff implements the spec; that is handled separately by the verifier step"). The gate runs a CLI-wrapped agentic session through the shared `agentic_run` primitive (a56) AFTER the executor implements the change, in a read-only sandbox that reads the spec delta, the diff, AND source on demand, AND returns its verdict via the `submit_verdict` MCP tool.
 
-The gate SHALL be advisory: it annotates AND never auto-acts. It renders the verdict as a `## Spec Verification` section in the PR body (parallel to the reviewer's `## Code Review` block) AND posts a chatops note ONLY when gaps are found. It SHALL NEVER open a revision AND SHALL NEVER block PR creation. Per the a61 framework's advisory posture, a gate failure (session error, a resolved CLI strategy that is not registered, a schema-rejected submission never corrected, OR no submission) logs a WARN carrying the `[out]` label AND omits the section (OR writes "verification unavailable"); it never blocks. A schema-invalid `submit_verdict` call mid-session is a correctable tool error the agent can retry (a56).
+The gate SHALL be advisory: it annotates AND never auto-acts. It renders the verdict as a `## Spec Verification` section in the PR body (parallel to the reviewer's `## Code Review` block) AND posts a chatops note ONLY when gaps are found. It SHALL NEVER open a revision AND SHALL NEVER block PR creation. Per the gatekeepers-fail-closed standard, the gate fails CLOSED to a VISIBLE state rather than silence: a gate failure (session error, a resolved CLI strategy that is not registered, a schema-rejected submission never corrected, OR no submission) logs a WARN carrying the `[out]` label AND renders an explicit `## Spec Verification: FAILED TO RUN` section naming the cause — making clear the change was NOT verified (NOT a pass) — rather than omitting the section. It still never blocks PR creation. A schema-invalid `submit_verdict` call mid-session is a correctable tool error the agent can retry (a56).
 
 The check SHALL be gated by `executor.code_implements_spec_check` (`disabled` default, `enabled` opt-in). The model is configured via `executor.code_implements_spec_check_llm`, which a56's CLI strategy translates into the wrapped CLI's model-selection mechanism. Enabling the check without configuring the model SHALL fail at daemon startup with a fail-fast validation error.
 
@@ -7047,10 +7062,10 @@ The check SHALL be gated by `executor.code_implements_spec_check` (`disabled` de
 - **AND** a chatops note is posted as an advisory heads-up
 - **AND** NO revision is opened AND PR creation is NOT blocked — the operator decides what to do
 
-#### Scenario: Gate failure is advisory, never blocking
+#### Scenario: Gate failure renders FAILED TO RUN, never blocking
 - **WHEN** the agentic session fails (spawn error, timeout, unregistered strategy, OR no valid `submit_verdict`)
 - **THEN** the gate logs a WARN carrying the `[out]` label
-- **AND** omits the `## Spec Verification` section (OR writes "verification unavailable")
+- **AND** renders an explicit `## Spec Verification: FAILED TO RUN` section naming the cause (the change is NOT verified — NOT a pass), rather than omitting the section
 - **AND** PR creation proceeds — the gate never blocks
 
 #### Scenario: Enabled without model config fails fast at startup
@@ -7570,4 +7585,60 @@ The probe SHALL be best-effort AND time-bounded: it SHALL NEVER block or fail st
 #### Scenario: The probe is not part of check-config
 - **WHEN** an operator runs `autocoder check-config`
 - **THEN** no tool-capability probe is performed (check-config contacts no external service)
+
+### Requirement: Gate dispositions are enforced by a default-deny verdict ledger rendered in the PR
+The verifier gates' fail-closed disposition SHALL be enforced **structurally** — by a per-change gate-verdict ledger whose default is non-passing — NOT by per-path inspection of a gate's result. Inspection requires every code path (every result arm, every error, every future early-return) to be classified correctly; a single missed path inherits whatever the fall-through is, which is how a gate silently fails open. A default-deny ledger removes that class of bug: "open" requires an affirmative, completed `PASS`, so a crash, an unhandled path, or a runner that never ran leaves the change held by construction.
+
+For each change under gate evaluation, every gate slot (`[in]`, `[canon]`, `[out]`) SHALL have a verdict in the ledger, INITIALIZED to `PENDING` (a non-passing state). A verdict SHALL become `PASS` ONLY by an explicit, completed clean result. The verdict set is: `PENDING` (default — a runner that never recorded a verdict; treated as held), `PASS` (ran, clean), `FAIL` (ran, findings), `FAILED_TO_RUN` (ran, could not produce a verdict), `DISABLED` (gate not configured; non-blocking).
+
+There SHALL be no skip/absent code path for a gate slot: every slot — whether its gate is enabled OR disabled — SHALL run a runner that affirmatively writes a verdict. A disabled gate's runner is a STUB that writes `DISABLED`. This eliminates the disabled-vs-failed ambiguity at the structural level — "disabled" is an explicit recorded verdict, never an absence that a reader must remember to treat as a pass.
+
+The executor SHALL be invoked ONLY when every BLOCKING gate (`[in]`, `[canon]`) is `PASS` or `DISABLED`. A blocking gate that is `PENDING`, `FAIL`, or `FAILED_TO_RUN` SHALL hold the change. Because the default is `PENDING`, any failure to affirmatively record `PASS` holds the change without the holding code having to anticipate the specific failure.
+
+The ledger SHALL be rendered into the PR body as a compliance record: per gate, its identifier, the model that ran it, AND its verdict (with a one-line summary for `FAIL` / `FAILED_TO_RUN`). A `PASS` is therefore VISIBLE in the PR — the operator can see which gate ran, with which model, and that it passed — rather than inferred from the silent absence of an alert. The agentic reviewer's verdict SHALL likewise appear in the PR record.
+
+#### Scenario: A blocking gate left PENDING holds the change
+- **WHEN** a blocking gate's runner does not record a verdict (it crashes, an unhandled path is taken, or it never runs) so the ledger entry remains `PENDING`
+- **THEN** the change is HELD (the executor is NOT invoked) — `PENDING` is non-passing by construction
+- **AND** no code path needs to anticipate the specific failure for the hold to occur
+
+#### Scenario: A disabled gate records DISABLED via a stub
+- **WHEN** a gate is not configured (disabled)
+- **THEN** its slot's stub runner records `DISABLED` (a non-blocking verdict), NOT an absence
+- **AND** the executor proceeds (a disabled gate does not hold the change)
+
+#### Scenario: The executor runs only when blocking gates are PASS or DISABLED
+- **WHEN** the gate ledger for a change is evaluated before the executor
+- **THEN** the executor is invoked ONLY if every blocking gate (`[in]`, `[canon]`) is `PASS` or `DISABLED`
+- **AND** any blocking gate that is `PENDING`, `FAIL`, or `FAILED_TO_RUN` holds the change
+
+#### Scenario: The PR body renders the gate ledger as a compliance record
+- **WHEN** a change reaches PR creation
+- **THEN** the PR body contains a gate-verdict section listing, per gate, its identifier, the model that ran it, AND its verdict
+- **AND** a `PASS` is visible there (not inferred from silence), so an operator can judge whether a verdict came from a model they trust
+
+### Requirement: Install wizard configures the issues lane
+The `autocoder install` wizard SHALL prompt operators about the issues lane during first-time install, after the periodic-audits prompts AND before the config-assembly step, as a single yes/no gate defaulting to NO. Because enabling the lane changes daemon behavior autonomously — per-iteration unit selection becomes `issues > changes > audits`, AND with `features.scout.include_issues` enabled the bot triages open GitHub issues read-only into chatops candidates a maintainer promotes with `send it` — the gate is an explicit opt-in, NOT a default-on feature, AND the prompt body SHALL state these effects so the operator decides informed rather than toggling blind. The wizard SHALL write `features.issues.enabled: true` to config.yaml ONLY when the operator opts in; declining SHALL write no `features.issues` entry, matching the schema's default-off representation. The non-interactive mode SHALL mirror the gate with a `--issues-lane <enabled|disabled>` flag whose default (`disabled`) matches the conservative interactive default, so IaC scripts that predate the flag continue to produce a lane-off install without behavior change.
+
+#### Scenario: Default interactive path leaves the issues lane off
+- **WHEN** an operator runs `autocoder install` AND accepts the issues-lane default (bare-Enter on the gate → no)
+- **THEN** the rendered config.yaml contains no `features.issues` entry
+- **AND** the issues lane is off (the schema's default-off representation)
+
+#### Scenario: Operator opts in interactively
+- **WHEN** the operator answers `y` to the issues-lane gate
+- **THEN** the rendered config.yaml contains `features.issues.enabled: true`
+
+#### Scenario: Non-interactive default leaves the issues lane off
+- **WHEN** an operator runs `autocoder install --non-interactive` with all required flags AND no `--issues-lane` flag
+- **THEN** the rendered config.yaml contains no `features.issues` entry
+- **AND** IaC scripts that pre-date this flag produce the same lane-off install as before
+
+#### Scenario: Non-interactive enable
+- **WHEN** an operator runs `autocoder install --non-interactive --issues-lane enabled` with all other required flags
+- **THEN** the rendered config.yaml contains `features.issues.enabled: true`
+
+#### Scenario: Non-interactive explicit disable
+- **WHEN** an operator passes `--issues-lane disabled`
+- **THEN** the rendered config.yaml contains no `features.issues` entry (same as the default)
 

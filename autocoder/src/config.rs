@@ -1357,6 +1357,27 @@ pub struct ExecutorConfig {
     /// gates' `*_llm` blocks so operators can pick a model independently.
     #[serde(default)]
     pub code_implements_spec_check_llm: Option<ContradictionCheckLlmConfig>,
+    /// Bounded retry of an agentic verifier-gate session ([in]/[canon]/[out])
+    /// when it ends with NO submission — the flaky case where a weak local
+    /// model reads the spec then never calls its `submit_*` MCP tool. The
+    /// SAME model+change submits non-deterministically, so a bounded retry
+    /// catches the "sometimes works" case before the gate fails closed.
+    /// Counts ADDITIONAL attempts: `2` (the default) is up to 3 total
+    /// attempts; `0` disables retry (one attempt — the historical behavior).
+    /// Only the no-submission case retries; a successful submission, a
+    /// timeout, AND an unregistered-strategy / CLI-unavailable error are NOT
+    /// retried (the gatekeepers-fail-closed standard's bounded-retry
+    /// tolerance — after the bound is exhausted the gate still fails closed,
+    /// never fail-open).
+    #[serde(default = "default_verifier_gate_retries")]
+    pub verifier_gate_retries: u32,
+}
+
+/// Default for [`ExecutorConfig::verifier_gate_retries`]: 2 additional
+/// attempts (up to 3 total) per agentic verifier-gate session on a
+/// no-submission outcome.
+pub fn default_verifier_gate_retries() -> u32 {
+    2
 }
 
 /// Opt-in gate for the change-internal contradiction pre-flight (a19).
@@ -4412,6 +4433,7 @@ github:
             "code_implements_spec_check",
             "code_implements_spec_check_prompt_path",
             "code_implements_spec_check_llm",
+            "verifier_gate_retries",
             "allowed_tools",
             "disallowed_bash_patterns",
             "disallowed_read_paths",
