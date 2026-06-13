@@ -163,6 +163,23 @@ impl DaemonPaths {
         self.alert_state_dir().join(format!("{workspace_basename}.json"))
     }
 
+    /// `<state>/pending-audit-runs/` — durable mirror of each repo's
+    /// in-memory on-demand audit-run queue (`pending_audit_runs`). One
+    /// file per workspace, named `<workspace-basename>.json`. Lives under
+    /// `<state>/` (NOT inside the workspace) because it is daemon
+    /// bookkeeping that must never appear in the managed repo's working
+    /// tree, mirroring `alert_state_dir`.
+    pub fn pending_audit_runs_dir(&self) -> PathBuf {
+        self.state.join("pending-audit-runs")
+    }
+
+    /// `<state>/pending-audit-runs/<workspace_basename>.json` — durable
+    /// on-demand audit-run queue file for the named workspace.
+    pub fn pending_audit_runs_path(&self, workspace_basename: &str) -> PathBuf {
+        self.pending_audit_runs_dir()
+            .join(format!("{workspace_basename}.json"))
+    }
+
     /// `<state>/canon-contradiction-state/` — per-workspace re-report
     /// suppression state for the canon-internal contradiction audit (a75).
     /// One file per workspace, named `<workspace-basename>.json` (the audit
@@ -781,6 +798,14 @@ mod tests {
         assert_eq!(
             p.alert_state_path("github_com_owner_repo"),
             PathBuf::from("/srv/state/alert-state/github_com_owner_repo.json")
+        );
+        assert_eq!(
+            p.pending_audit_runs_dir(),
+            PathBuf::from("/srv/state/pending-audit-runs")
+        );
+        assert_eq!(
+            p.pending_audit_runs_path("github_com_owner_repo"),
+            PathBuf::from("/srv/state/pending-audit-runs/github_com_owner_repo.json")
         );
         assert_eq!(
             p.run_logs_dir("github_com_owner_repo"),
