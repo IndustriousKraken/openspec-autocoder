@@ -106,13 +106,135 @@ pub struct ChatOrigin {
 /// Carries the audit-type name AND the originating chat context so the
 /// scheduler can reply where the request came from. Kept in the queue until
 /// the audit has actually run, so a skipped, early-returning, or bounded-out
-/// pass never silently drops an acknowledged request. (Serialize/Deserialize
-/// are derived for a future cross-restart persistence pass.)
+/// pass never silently drops an acknowledged request. Serialize/Deserialize
+/// back the durable mirror written by [`save_pending_audit_runs`] /
+/// [`load_pending_audit_runs`], so the queue also survives a daemon restart
+/// (persist-on-demand-audit-queue).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct QueuedAudit {
     pub audit_type: String,
     #[serde(default)]
     pub origin: Option<ChatOrigin>,
+}
+
+/// Derive the workspace basename used to key a repo's durable
+/// `pending_audit_runs` file. Mirrors `alert_state`'s convention: the
+/// workspace path's final component, or `"unknown"` if absent (which
+/// should never happen for a resolved workspace path).
+fn pending_audit_runs_basename(workspace: &Path) -> String {
+    workspace
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Atomically persist `queue` as the durable mirror of `workspace`'s
+/// on-demand audit-run queue, written via tempfile-then-rename in the
+/// same directory so a torn write can never be observed by a concurrent
+/// reader (mirrors `AlertState::save`). The file is the serialized
+/// `Vec<QueuedAudit>`; an empty queue persists as `[]` so the durable
+/// copy always reflects exactly what remains in memory.
+///
+/// Persistence is best-effort at the call site: callers log a write
+/// failure and keep the in-memory queue authoritative for the live
+/// process.
+pub fn save_pending_audit_runs(
+    paths: &DaemonPaths,
+    workspace: &Path,
+    queue: &[QueuedAudit],
+) -> Result<()> {
+    let basename = pending_audit_runs_basename(workspace);
+    let path = paths.pending_audit_runs_path(&basename);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("destination path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating parent dir {}", parent.display()))?;
+    let tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating tempfile in {}", parent.display()))?;
+    serde_json::to_writer_pretty(&tmp, queue)
+        .with_context(|| format!("serializing pending audit runs for {}", path.display()))?;
+    tmp.persist(&path)
+        .map_err(|e| anyhow!("atomically persisting {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Load the durable on-demand audit-run queue for `workspace_basename`.
+/// Best-effort: a missing file is an empty queue (not an error — the
+/// common case for a repo that has never had an audit queued); an
+/// unreadable OR unparseable file logs a WARN and degrades to an empty
+/// queue, so a corrupt file never panics or aborts the repo's startup.
+pub fn load_pending_audit_runs(
+    paths: &DaemonPaths,
+    workspace_basename: &str,
+) -> Vec<QueuedAudit> {
+    let path = paths.pending_audit_runs_path(workspace_basename);
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+            tracing::warn!(
+                "pending-audit-runs file at {} is corrupt; starting with an empty queue: {e:#}",
+                path.display()
+            );
+            Vec::new()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                "pending-audit-runs file at {} unreadable; starting with an empty queue: {e:#}",
+                path.display()
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Startup orphan reconciliation for the durable on-demand audit-run
+/// queue: remove any `pending-audit-runs/<basename>.json` file whose
+/// workspace basename is no longer in `configured_basenames`, so a
+/// removed repo's stale queue file never resurrects work after a
+/// restart. Matches the other startup marker sweeps; best-effort —
+/// every IO failure is logged and never aborts startup. A missing
+/// directory (no audit has ever been queued) is a no-op.
+pub fn reconcile_pending_audit_runs(
+    paths: &DaemonPaths,
+    configured_basenames: &std::collections::HashSet<String>,
+) {
+    let dir = paths.pending_audit_runs_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(
+                "pending-audit-runs reconcile: cannot read {}: {e:#}",
+                dir.display()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only consider our `<basename>.json` files; ignore tempfiles
+        // and anything else that lands in the directory.
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if configured_basenames.contains(stem) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                "pending-audit-runs reconcile: dropped orphan queue file for unconfigured repo `{stem}` ({})",
+                path.display()
+            ),
+            Err(e) => tracing::warn!(
+                "pending-audit-runs reconcile: failed to remove orphan {}: {e:#}",
+                path.display()
+            ),
+        }
+    }
 }
 
 /// Run the polling loop for a single repository. Each iteration is wrapped in

@@ -234,9 +234,12 @@ pub struct RepoTaskHandle {
     /// onto this list via the `queue_audit` control-socket action; the
     /// polling loop consumes an entry ONLY once it has actually run
     /// (bypassing cadence), so a skipped, early-returning, or bounded-out
-    /// pass never drops an acknowledged request (in-memory durability;
-    /// cross-restart persistence is a planned follow-on). Each entry carries
-    /// the originating chat context so the scheduler can post a terminal
+    /// pass never drops an acknowledged request. The queue is mirrored to
+    /// `<state>/pending-audit-runs/<workspace-basename>.json` on every
+    /// mutation (enqueue + post-run prune) AND reloaded at task spawn, so it
+    /// also survives a daemon restart (persist-on-demand-audit-queue). Each
+    /// entry carries the originating chat context so the scheduler can post a
+    /// terminal
     /// completion notification back to the operator. De-duplicated on insert
     /// so multiple `audit` commands collapse to one run.
     pub pending_audit_runs: Arc<Mutex<Vec<crate::polling_loop::QueuedAudit>>>,
@@ -1590,6 +1593,11 @@ fn handle_queue_audit(parsed: &Value, state: &ControlState) -> Value {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string()),
         });
+    // Resolve the repo's workspace so the mutated queue can be mirrored to
+    // its durable `pending-audit-runs/<basename>.json` file the instant the
+    // enqueue is acknowledged below — closing the enqueue→restart window
+    // (persist-on-demand-audit-queue).
+    let workspace = workspace::resolve_path(&state.paths, &repo);
     {
         let mut g = queue.lock().unwrap();
         if !g.iter().any(|a| a.audit_type == audit_type) {
@@ -1597,6 +1605,17 @@ fn handle_queue_audit(parsed: &Value, state: &ControlState) -> Value {
                 audit_type: audit_type.clone(),
                 origin,
             });
+        }
+        // Persist on every mutation. Best-effort: a write failure is logged
+        // and never fails the enqueue (the in-memory queue stays
+        // authoritative for the live process).
+        if let Err(e) =
+            crate::polling_loop::save_pending_audit_runs(&state.paths, &workspace, g.as_slice())
+        {
+            tracing::warn!(
+                url = %url,
+                "queue_audit: failed to persist pending-audit-runs queue (in-memory queue remains authoritative): {e:#}"
+            );
         }
     }
     json!({

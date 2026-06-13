@@ -817,6 +817,27 @@ pub async fn execute(mut cfg: Config, config_path: PathBuf) -> Result<()> {
         task_map_changed: task_map_changed.clone(),
     });
 
+    // Startup orphan reconciliation for the durable on-demand audit-run
+    // queue (persist-on-demand-audit-queue): drop any persisted
+    // `pending-audit-runs/<basename>.json` whose workspace is no longer in
+    // the configured set, so a removed repo's stale queue never resurrects
+    // work. Matches the other startup marker sweeps above; best-effort. A
+    // repo that IS configured keeps its file so the per-repo spawn below
+    // loads it.
+    {
+        let configured_basenames: std::collections::HashSet<String> = cfg
+            .repositories
+            .iter()
+            .map(|r| {
+                workspace::resolve_path(&daemon_paths, r)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".to_string())
+            })
+            .collect();
+        polling_loop::reconcile_pending_audit_runs(&daemon_paths, &configured_basenames);
+    }
+
     for repo in cfg.repositories.iter().cloned() {
         if skip_fork_urls.contains(&repo.url) {
             // Fork setup failed for this repository at startup; skip it for
@@ -1150,6 +1171,21 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
         if !repo_passes_startup_check(&deps.paths, &repo, &github_snap) {
             return SpawnOutcome::StartupCheckFailed;
         }
+        // Restore any durably-persisted on-demand audit-run queue for this
+        // repo so a restart between an operator's enqueue acknowledgement
+        // and the audit's run does not lose the request
+        // (persist-on-demand-audit-queue). Best-effort: a missing or corrupt
+        // file degrades to an empty queue. Resolve the basename the same way
+        // `save_pending_audit_runs` does (the resolved workspace's final
+        // component) so load and save agree.
+        let initial_pending_audit_runs = {
+            let workspace_for_load = workspace::resolve_path(&deps.paths, &repo);
+            let basename = workspace_for_load
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".to_string());
+            crate::polling_loop::load_pending_audit_runs(&deps.paths, &basename)
+        };
         let child_cancel = deps.global_cancel.child_token();
         let config_holder: Arc<ArcSwap<RepositoryConfig>> =
             Arc::new(ArcSwap::from_pointee(repo));
@@ -1185,7 +1221,7 @@ fn build_spawn_repo_fn(deps: SpawnDeps) -> SpawnRepoFn {
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let pending_triages_for_task = pending_triages.clone();
         let pending_audit_runs: Arc<std::sync::Mutex<Vec<crate::polling_loop::QueuedAudit>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+            Arc::new(std::sync::Mutex::new(initial_pending_audit_runs));
         let pending_audit_runs_for_task = pending_audit_runs.clone();
         let pending_proposal_requests: Arc<
             std::sync::Mutex<Vec<crate::control_socket::ProposalRequest>>,

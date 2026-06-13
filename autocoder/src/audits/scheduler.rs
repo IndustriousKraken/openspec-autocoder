@@ -160,6 +160,19 @@ pub async fn run_due_audits(
                 registry.iter().any(|a| a.audit_type() == q.audit_type)
                     && !ran_via_queue.contains(&q.audit_type)
             });
+            // Mirror the pruned queue to durable storage so the on-disk copy
+            // reflects exactly what remains (persist-on-demand-audit-queue):
+            // an audit that ran is dropped from the file, so a restart cannot
+            // re-run it. Best-effort — a write failure is logged and never
+            // aborts the iteration.
+            if let Err(e) =
+                crate::polling_loop::save_pending_audit_runs(paths, workspace, g.as_slice())
+            {
+                tracing::warn!(
+                    url = %repo.url,
+                    "run_due_audits: failed to persist pruned pending-audit-runs queue (in-memory queue remains authoritative): {e:#}"
+                );
+            }
         }
     }
 
@@ -2498,6 +2511,72 @@ mod tests {
             *counter.lock().unwrap(),
             1,
             "second iteration without queue must NOT re-run"
+        );
+    }
+
+    /// persist-on-demand-audit-queue §5.2 — restart simulation: a queue
+    /// persisted to disk before the daemon restarted is loaded into a fresh
+    /// task handle, runs (bypassing cadence), AND is pruned from BOTH the
+    /// in-memory queue and the durable file once it has run — so a later
+    /// restart does NOT re-run the already-run audit.
+    #[tokio::test]
+    async fn restart_simulation_loads_persisted_queue_runs_and_prunes_durably() {
+        let (_t, ws) = init_workspace();
+        let paths = test_paths();
+        let audit = Arc::new(CountingAudit::new("a_persist"));
+        let counter = audit.invocations.clone();
+        let registry = AuditRegistry::with_audits(vec![audit.clone()]);
+        let cfg = audits_cfg_daily("a_persist");
+        let repo = fixture_repo();
+
+        // Pre-restart state: the operator queued the audit, the enqueue
+        // handler persisted it, but the daemon restarted before it ran.
+        crate::polling_loop::save_pending_audit_runs(
+            paths,
+            &ws,
+            &[crate::polling_loop::QueuedAudit {
+                audit_type: "a_persist".to_string(),
+                origin: None,
+            }],
+        )
+        .unwrap();
+
+        // Spawn-time load restores the queue from disk (load-on-spawn).
+        let basename = ws.file_name().unwrap().to_string_lossy().into_owned();
+        let restored = crate::polling_loop::load_pending_audit_runs(paths, &basename);
+        assert_eq!(restored.len(), 1, "queue must be restored from disk");
+        let queue = std::sync::Mutex::new(restored);
+
+        run_due_audits(
+            paths,
+            &registry,
+            &ws,
+            &repo,
+            Some(&cfg),
+            &HashMap::new(),
+            None,
+            &queue,
+        )
+        .await
+        .unwrap();
+
+        // It ran (cadence bypassed for a queued run) ...
+        assert_eq!(
+            *counter.lock().unwrap(),
+            1,
+            "restored audit must run after restart"
+        );
+        // ... was pruned from the in-memory queue ...
+        assert!(
+            queue.lock().unwrap().is_empty(),
+            "ran audit must be pruned from the in-memory queue"
+        );
+        // ... AND the durable copy no longer contains it, so a later restart
+        // does NOT re-run it.
+        let after = crate::polling_loop::load_pending_audit_runs(paths, &basename);
+        assert!(
+            after.is_empty(),
+            "durable queue must no longer contain the audit after it ran"
         );
     }
 
